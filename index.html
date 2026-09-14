@@ -47,6 +47,9 @@ body>header.app-header{position:sticky;top:0;z-index:20;background:color-mix(in 
 .sort-row{display:flex;gap:.4rem;align-items:center;margin:.5rem 0}
 .sort-row select{flex:1 1 auto;min-width:0;padding:.4rem .45rem;font-size:.82rem}
 .sort-row button{flex:0 0 auto;padding:.4rem .55rem;font-size:.8rem;white-space:nowrap}
+/* 「カードがありません」などの案内は札1枚分の列へ入ると1文字ずつ縦に折り返す。
+   4列まで詰めたことで実際に起きたので、必ず全列を占有させる。 */
+.pseudo-grid>li.empty-state{grid-column:1/-1}
 /* デッキ欄の疑似カードは識別できれば足りるので、検索側より小さく詰める。 */
 #deck-panel .pseudo-grid{grid-template-columns:repeat(auto-fill,minmax(116px,1fr));gap:.4rem}
 #deck-panel .pseudo-card{min-height:8.4rem}
@@ -65,8 +68,10 @@ body[data-workspace="builder"] #search-list,body[data-workspace="builder"] #deck
    入力を1行、絞り込み4つを1行の2段に固定する。 */
 /* 固定ペインでは一度に見える枚数がそのまま使い勝手になるので、検索側の
    疑似カードもページ全体を繰っていた頃より一回り小さくする。 */
-body[data-workspace="builder"] #search-panel .pseudo-grid{grid-template-columns:repeat(auto-fill,minmax(148px,1fr))}
-body[data-workspace="builder"] #search-panel .pseudo-card{min-height:9rem}
+body[data-workspace="builder"] #search-panel .pseudo-grid{grid-template-columns:repeat(auto-fill,minmax(124px,1fr));gap:.4rem}
+body[data-workspace="builder"] #search-panel .pseudo-card{min-height:7.4rem}
+body[data-workspace="builder"] #search-panel .pseudo-title{font-size:.79rem;line-height:1.2}
+body[data-workspace="builder"] #search-panel .pseudo-stats,body[data-workspace="builder"] #search-panel .pseudo-lineage{font-size:.6rem}
 /* 見出しと操作を同じ行に置くと、狭いデッキ欄では操作側が1文字幅まで潰れる。 */
 body[data-workspace="builder"] .workspace-actions{flex:0 0 auto}
 body[data-workspace="builder"] .workspace-actions button{white-space:nowrap}
@@ -97,10 +102,16 @@ body[data-workspace="builder"] .summary{position:static;padding:.3rem .45rem;mar
 body[data-workspace="builder"] .summary strong{font-size:.95rem}
 body[data-workspace="builder"] .search-controls select,body[data-workspace="builder"] .search-controls #search-clear{padding:.34rem .2rem;font-size:.72rem}
 body[data-workspace="builder"] .search-controls #search{padding:.4rem .5rem}
-#search-panel .pseudo-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:.3rem}
-#search-panel .pseudo-card{min-height:5.9rem}
-#deck-panel .pseudo-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:.28rem}
-#deck-panel .pseudo-card{min-height:5.2rem}
+/* 上のPC向け規則は`body[data-workspace="builder"]`付きで特異度が高い。同じ前置きを
+   付けないと、細い画面でもPC側の列幅が勝って2列のまま残る（実測182px×2）。 */
+body[data-workspace="builder"] #search-panel .pseudo-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:.28rem}
+body[data-workspace="builder"] #search-panel .pseudo-card{min-height:5.2rem}
+/* 1枚90px弱になるとBP行・系統・タグchipは読めない幅で折り返すだけなので、
+   タッチ端末と同じく落とす。名称・番号・コスト・枚数だけ残す。 */
+body[data-workspace="builder"] #search-panel .pseudo-stats,body[data-workspace="builder"] #search-panel .pseudo-lineage,body[data-workspace="builder"] #search-panel .pseudo-tags{display:none}
+body[data-workspace="builder"] #search-panel .pseudo-title{font-size:.7rem;line-height:1.18}
+body[data-workspace="builder"] #deck-panel .pseudo-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:.28rem}
+body[data-workspace="builder"] #deck-panel .pseudo-card{min-height:5.2rem}
 /* 枚数操作の行は既定幅(2rem×3＋badge)だと1枚90px弱の札からはみ出す。タッチ端末向けに
    あった圧縮指定を、細い画面ならマウスでも効かせる(はみ出すと押せない位置へ流れる)。 */
 #search-panel .pseudo-actions,#deck-panel .pseudo-actions{justify-content:space-between;gap:.1rem;padding:.2rem .18rem}
