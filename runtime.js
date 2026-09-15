@@ -1903,10 +1903,18 @@
   }
 
   function stateView(state, cards) {
-    const fieldSoul = state.field.find((unit) => unit.soul_core);
-    const soulLocation = state.reserveHasSoul ? "reserve"
-      : state.trashHasSoul ? "trash" : state.lifeHasSoul ? "life"
-        : fieldSoul ? `field:${fieldSoul.uid}` : null;
+    // ソウルコアは1プレイヤーに1個。2箇所に見えたらどこかの移動が元を消し忘れて
+    // いる。Python側(`_soul_core_places`)と同じ境界で同じように落とす。
+    const soulPlaces = [
+      ...(state.reserveHasSoul ? ["reserve"] : []),
+      ...(state.trashHasSoul ? ["trash"] : []),
+      ...(state.lifeHasSoul ? ["life"] : []),
+      ...state.field.filter((unit) => unit.soul_core).map((unit) => `field:${unit.uid}`),
+    ];
+    if (soulPlaces.length > 1) {
+      throw new Error(`soul core exists in more than one place: ${soulPlaces.join(", ")}`);
+    }
+    const soulLocation = soulPlaces[0] ?? null;
     return {
       hand: [...state.hand], deck_count: state.deck.length,
       deck_top_face_up: state.deck.length && state.faceUpTop === state.deck.at(-1)
