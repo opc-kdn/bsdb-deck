@@ -542,8 +542,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v56-v1";
-  const STAGE_VERSION = "v56";
+  const ENGINE_SLICE = "stage4-v63-v1";
+  const STAGE_VERSION = "v63";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -708,12 +708,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v56 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v63 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v56-portable-v6";
+  const RUNTIME_VERSION = "stage4-v63-portable-v12";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -800,6 +800,8 @@
       force_contract_turn1: source.force_contract_turn1 ?? false,
       target_card_nos: [...new Set(source.target_card_nos || [])].sort(),
       initial_hand: initialHand === null ? null : [...initialHand],
+      effect_order_script: Array.isArray(source.effect_order_script)
+        ? [...source.effect_order_script] : [],
       stage5c: Stage5CContract.normalize(source.stage5c ?? null),
     };
   }
@@ -1232,18 +1234,23 @@
     let fired = false;
     for (const source of soulFlashSources(state, cards)) {
       state.fieldFlashUsed.add(`soul:${source.card_no}`);
-      for (const effect of source.effects) {
-        record(state, cards, "effect_start", { card_no: source.card_no, uid: null,
-          effect_kind: effect.kind, window: "soul_flash" });
-        const traceMark = state.events.length;
-        const ok = resolveEffect(state, cards, targets, effect, null);
-        record(state, cards, "effect_complete", { card_no: source.card_no, uid: null,
-          effect_kind: effect.kind, window: "soul_flash", resolved: Boolean(ok) });
-        if (effect.kind === "face_up_top_cycle") {
-          coalesceFaceUpCycleTrace(state, traceMark);
+      beginEffectFrame(state);
+      try {
+        for (const effect of source.effects) {
+          record(state, cards, "effect_start", { card_no: source.card_no, uid: null,
+            effect_kind: effect.kind, window: "soul_flash" });
+          const traceMark = state.events.length;
+          const ok = resolveEffect(state, cards, targets, effect, null);
+          record(state, cards, "effect_complete", { card_no: source.card_no, uid: null,
+            effect_kind: effect.kind, window: "soul_flash", resolved: Boolean(ok) });
+          if (effect.kind === "face_up_top_cycle") {
+            coalesceFaceUpCycleTrace(state, traceMark);
+          }
         }
-        flushCountReactions(state, cards, targets);
+        flushDerivedPlayReactions(state, cards, targets);
         noteLegalCandidates(state, cards, targets);
+      } finally {
+        endEffectFrame(state);
       }
       fired = true;
     }
@@ -1254,25 +1261,30 @@
   function resolveFieldFlash(state, cards, targets, unit) {
     for (const source of fieldFlashSources(state, cards, unit)) {
       state.fieldFlashUsed.add(`${unit.uid}:${source.card_no}`);
-      if (source.cost) {
-        unit.cores -= source.cost;
-        // ボイドへ置いたコアはどのゾーンにも入らない(トラッシュではない)。
-        recordCoreMove(state, cards, { amount: source.cost, source: "field",
-          destination: "void", reason: "contract_technique",
-          source_card_no: unit.card_no, source_uid: unit.uid });
-      }
-      for (const effect of source.effects) {
-        record(state, cards, "effect_start", { card_no: source.card_no, uid: unit.uid,
-          effect_kind: effect.kind, window: "field_flash" });
-        const traceMark = state.events.length;
-        const ok = resolveEffect(state, cards, targets, effect, unit.uid);
-        record(state, cards, "effect_complete", { card_no: source.card_no, uid: unit.uid,
-          effect_kind: effect.kind, window: "field_flash", resolved: Boolean(ok) });
-        if (effect.kind === "face_up_top_cycle") {
-          coalesceFaceUpCycleTrace(state, traceMark);
+      beginEffectFrame(state);
+      try {
+        if (source.cost) {
+          unit.cores -= source.cost;
+          // ボイドへ置いたコアはどのゾーンにも入らない(トラッシュではない)。
+          recordCoreMove(state, cards, { amount: source.cost, source: "field",
+            destination: "void", reason: "contract_technique",
+            source_card_no: unit.card_no, source_uid: unit.uid });
         }
-        flushCountReactions(state, cards, targets);
+        for (const effect of source.effects) {
+          record(state, cards, "effect_start", { card_no: source.card_no, uid: unit.uid,
+            effect_kind: effect.kind, window: "field_flash" });
+          const traceMark = state.events.length;
+          const ok = resolveEffect(state, cards, targets, effect, unit.uid);
+          record(state, cards, "effect_complete", { card_no: source.card_no, uid: unit.uid,
+            effect_kind: effect.kind, window: "field_flash", resolved: Boolean(ok) });
+          if (effect.kind === "face_up_top_cycle") {
+            coalesceFaceUpCycleTrace(state, traceMark);
+          }
+        }
+        flushDerivedPlayReactions(state, cards, targets);
         noteLegalCandidates(state, cards, targets);
+      } finally {
+        endEffectFrame(state);
       }
     }
   }
@@ -1705,8 +1717,13 @@
       state.trashCards.push(...bases);
       if (destination === "hand") state.hand.push(unit.card_no);
       // 山札は下→上なので、トップは末尾。Pythonの``deck.append``/``deck.insert(0, …)``と同じ。
-      else if (destination === "deck_top") state.deck.push(unit.card_no);
-      else state.deck.unshift(unit.card_no);
+      else if (destination === "deck_top") {
+        state.deck.push(unit.card_no);
+        noteDeckPlacement(state, [unit.card_no], "top");
+      } else {
+        state.deck.unshift(unit.card_no);
+        noteDeckPlacement(state, [unit.card_no], "bottom");
+      }
       record(state, cards, "field_left", { card_no: unit.card_no, uid: unit.uid, cause,
         destination, moved_card_nos: [unit.card_no], trash_card_nos: bases,
         cores_returned: unit.cores });
@@ -1917,6 +1934,8 @@
     const soulLocation = soulPlaces[0] ?? null;
     return {
       hand: [...state.hand], deck_count: state.deck.length,
+      known_top_cards: [...state.knownTopCards],
+      known_bottom_cards: [...state.knownBottomCards],
       deck_top_face_up: state.deck.length && state.faceUpTop === state.deck.at(-1)
         ? state.faceUpTop : null,
       trash_cards: [...state.trashCards], side_cards: [...state.sideCards],
@@ -1958,6 +1977,8 @@
       }); }))(staticSymbolBonuses(state, cards, "main")),
       reserve: state.reserve, trash: state.spent, life: state.life,
       soul_location: soulLocation, count: state.count, mirage: state.mirage, burst: state.burst,
+      // 発動して解決中のバースト(表向き)。行き先が決まると空になる。
+      burst_open: state.burstOpen,
       // Pythonの`open_pool_stack`と同じく、入れ子になった公開効果も外側から
       // 順に1本へ畳んで棋譜へ出す。各poolは解決中の実配列そのものなので、
       // 公開時反応で札を取り除いた時点も過去のコピーではなく現在値を写せる。
@@ -2107,6 +2128,7 @@
   // 破壊的。位置で切り取る（Pythonの``del deck[-len(cards):]``）。
   function takeTopSlice(state, amount) {
     clearRemovedFaceUpTop(state, amount);
+    observeTopSliceExit(state, state.deck.slice(topSliceStart(state, amount)));
     return state.deck.splice(topSliceStart(state, amount));
   }
 
@@ -2114,11 +2136,81 @@
     if (amount > 0 && state.faceUpTop === state.deck.at(-1)) state.faceUpTop = null;
   }
 
+  // ---- 山札の「位置まで分かっている端」(Python `_consume_known_top` /
+  // `_observe_deck_exit` / `_place_observed_cards` と同一) ----
+  // 効果で置いた札・場から戻した札は双方が見ているので、順番を覚えているのは
+  // 正当な知識（準公開情報）。未観測の並びは持たず、枚数だけを数える。
+  function consumeKnownTop(state, cardNo, deckSizeBefore) {
+    if (state.knownTopCards.length) {
+      if (state.knownTopCards[0] === cardNo) { state.knownTopCards.shift(); return true; }
+      state.knownTopCards.length = 0;
+    } else if (state.knownBottomCards.length
+        && deckSizeBefore <= state.knownBottomCards.length) {
+      if (state.knownBottomCards.at(-1) === cardNo) {
+        state.knownBottomCards.pop();
+        return true;
+      }
+      state.knownBottomCards.length = 0;
+    }
+    return false;
+  }
+
+  function countDeckCards(deck) {
+    return deck.reduce((counts, cardNo) => {
+      counts[cardNo] = (counts[cardNo] || 0) + 1;
+      return counts;
+    }, {});
+  }
+
+  // 山札から1枚出るたびに呼ぶ（**取り除く前**に、そのときの山札枚数で）。
+  function observeDeckExit(state, cardNo, deckSizeBefore) {
+    const priorTop = state.knownTopCards.length;
+    const priorBottom = state.knownBottomCards.length;
+    const priorTopCards = [...state.knownTopCards];
+    const priorBottomCards = [...state.knownBottomCards];
+    if (consumeKnownTop(state, cardNo, deckSizeBefore)) return;
+    if (priorTop !== state.knownTopCards.length
+        || priorBottom !== state.knownBottomCards.length) {
+      // 既知端の順序が保てない操作。正体は分かったままなので、順不同の袋へ戻す。
+      for (const no of [...priorTopCards, ...priorBottomCards]) {
+        state.unobservedDeckCounts[no] = (state.unobservedDeckCounts[no] || 0) + 1;
+      }
+      state.knownTopCards.length = 0;
+      state.knownBottomCards.length = 0;
+    }
+    if ((state.unobservedDeckCounts[cardNo] || 0) <= 0) {
+      // 位置を保てない旧経路が値で抜いた場合。嘘の既知位置を作らず、表示用の
+      // 観測だけを今の山札から作り直す（Python同一）。
+      state.knownTopCards.length = 0;
+      state.knownBottomCards.length = 0;
+      state.unobservedDeckCounts = countDeckCards(state.deck);
+    }
+    state.unobservedDeckCounts[cardNo] -= 1;
+    if (!state.unobservedDeckCounts[cardNo]) delete state.unobservedDeckCounts[cardNo];
+  }
+
+  // 上からn枚まとめて出るとき。Pythonは**上から順に**、そのたびの枚数で観測する。
+  function observeTopSliceExit(state, slice) {
+    let size = state.deck.length;
+    for (let index = slice.length - 1; index >= 0; index -= 1) {
+      observeDeckExit(state, slice[index], size);
+      size -= 1;
+    }
+  }
+
+  // 山札へ置いた札の位置を覚える。`cards`は下→上の並び（Python `_place_observed_cards`）。
+  function noteDeckPlacement(state, placed, destination) {
+    if (!placed.length) return;
+    if (destination === "top") state.knownTopCards.unshift(...[...placed].reverse());
+    else state.knownBottomCards.unshift(...placed);
+  }
+
   // 表向きトップはカード番号ではなく「現在トップにある物理コピー」の印。
   // 取り出し口を集約し、同番号の次コピーが表向きとして再出現するのを防ぐ。
   function takeTopCard(state) {
     if (!state.deck.length) return null;
     clearRemovedFaceUpTop(state, 1);
+    observeDeckExit(state, state.deck.at(-1), state.deck.length);
     return state.deck.pop();
   }
 
@@ -2175,6 +2267,7 @@
         (a, b) => b.tier - a.tier || b.cost - a.cost || b.index - a.index)[0];
       state.hand.splice(returned.index, 1);
       state.deck.push(returned.cardNo);
+      noteDeckPlacement(state, [returned.cardNo], "top");
       state.faceUpTop = returned.cardNo;
       record(state, cards, "card_moved", { card_no: returned.cardNo, source: "hand",
         destination: "deck_top_face_up", reason: "face_up_top_cycle" });
@@ -2235,12 +2328,14 @@
       // `remaining`は下→上。Pythonの``deck.extend(cards)``と同じで、
       // 末尾のカードが一番上（次に引く札）になる。
       state.deck.push(...remaining);
+      noteDeckPlacement(state, remaining, "top");
       record(state, cards, "cards_returned_to_deck", { cards: remaining,
         destination: "top", order: "bottom_to_top", reason: "search_remainder",
         source_card_no: sourceCardNo });
     } else {
       // Pythonの``deck[0:0] = cards``。先頭のカードが一番下になる。
       state.deck.unshift(...remaining);
+      noteDeckPlacement(state, remaining, "bottom");
       record(state, cards, "cards_returned_to_deck", { cards: remaining,
         destination: "bottom", order: "bottom_to_top", reason: "search_remainder",
         source_card_no: sourceCardNo });
@@ -2255,9 +2350,11 @@
    *   - once_per_turn_card … **そのカード1枚ごとに**1回。同名コピーは区別できないので
    *     デッキの枚数を上限にする
    *   - no_duplicate … 同じ処理の中で重ねない(ターンを跨ぐ制限は掛けない) */
-  function applyTrashReactions(state, cards, landed, sourceCardNo, oracle) {
+  function collectTrashReactions(state, cards, landed, sourceCardNo, oracle) {
     const firedNow = new Set();
-    for (const cardNo of [...landed]) {
+    const collectedNames = new Set();
+    const collected = [];
+    for (const [occurrence, cardNo] of [...landed].entries()) {
       const index = state.trashCards.indexOf(cardNo);
       if (index < 0) continue;
       for (const reaction of cards[cardNo]?.trash_reactions || []) {
@@ -2270,24 +2367,42 @@
         const name = cards[cardNo]?.name;
         const limit = reaction.limit;
         if (limit === "once_per_turn_name" && state.trashReactionNames.has(name)) continue;
+        if (limit === "once_per_turn_name" && collectedNames.has(name)) continue;
         if (limit === "no_duplicate" && firedNow.has(cardNo)) continue;
         if (limit === "once_per_turn_card"
             && (state.trashReactionCardUses[cardNo] || 0)
               >= (state.deckCopies[cardNo] || 0)) continue;
-        state.trashCards.splice(state.trashCards.indexOf(cardNo), 1);
-        state.hand.push(cardNo);
-        state.handGain += 1;
         firedNow.add(cardNo);
-        if (limit === "once_per_turn_name") state.trashReactionNames.add(name);
-        else if (limit === "once_per_turn_card") {
-          state.trashReactionCardUses[cardNo] =
-            (state.trashReactionCardUses[cardNo] || 0) + 1;
-        }
-        record(state, cards, "card_moved", { card_no: cardNo, destination: "hand",
-          reason: "trash_reaction", source_card_no: sourceCardNo });
+        collectedNames.add(name);
+        collected.push({ kind: "trash_reaction", card_no: cardNo,
+          source_card_no: sourceCardNo, reaction, occurrence });
         break;
       }
     }
+    return collected;
+  }
+
+  function resolveTrashReaction(state, cards, effect) {
+    const cardNo = effect.card_no;
+    const index = state.trashCards.indexOf(cardNo);
+    if (index < 0) return false;
+    const name = cards[cardNo]?.name;
+    const limit = effect.reaction.limit;
+    if (limit === "once_per_turn_name" && state.trashReactionNames.has(name)) return false;
+    if (limit === "once_per_turn_card"
+        && (state.trashReactionCardUses[cardNo] || 0)
+          >= (state.deckCopies[cardNo] || 0)) return false;
+    state.trashCards.splice(index, 1);
+    state.hand.push(cardNo);
+    state.handGain += 1;
+    if (limit === "once_per_turn_name") state.trashReactionNames.add(name);
+    else if (limit === "once_per_turn_card") {
+      state.trashReactionCardUses[cardNo] =
+        (state.trashReactionCardUses[cardNo] || 0) + 1;
+    }
+    record(state, cards, "card_moved", { card_no: cardNo, destination: "hand",
+      reason: "trash_reaction", source_card_no: effect.source_card_no });
+    return true;
   }
 
   function openReactionMatches(reaction, sourceCardNo, cards) {
@@ -2688,6 +2803,7 @@
       // Stage version bump changes both runtimes together.
       const pool = peekTopSlice(state, amount);
       clearRemovedFaceUpTop(state, pool.length);
+      observeTopSliceExit(state, pool);
       for (const cardNo of pool) {
         // 下→上なので、``list.remove``が消す「最初の一致」＝一番下のコピーは`indexOf`。
         const index = state.deck.indexOf(cardNo);
@@ -2697,7 +2813,8 @@
       state.oraclePool = [...pool];
       state.trashCards.push(...pool);
       // 落ちたカード自身の「《神託》でトラッシュに置かれたら手札に加えられる」。
-      applyTrashReactions(state, cards, pool, effect.source_card_no, true);
+      state.derivedEffectBuffer.push(...collectTrashReactions(
+        state, cards, pool, effect.source_card_no, true));
       // Python は `if slot and slot.get("alternatives")` で**alternatives形の
       // スロットに限って**数える(神託のコア加算はその形でしか構造化していない)。
       // このガードが無いと、条件付きの普通のスロットでJSだけコアが増える。
@@ -2879,6 +2996,7 @@
     if (effect.kind === "stash_top") {
       const cardsToStash = peekTopSlice(state, amount);
       clearRemovedFaceUpTop(state, cardsToStash.length);
+      observeTopSliceExit(state, cardsToStash);
       for (const cardNo of cardsToStash) {
         // stash_topもPythonは``deck.remove``なので一番下のコピーから消える。
         const index = state.deck.indexOf(cardNo);
@@ -3041,6 +3159,7 @@
           ...returned.map(() => "hand"), ...unpicked.map(() => "open"),
         ];
         state.deck.unshift(...returnedCards);
+        noteDeckPlacement(state, returnedCards, "bottom");
         if (returnedCards.length) {
           record(state, cards, "cards_returned_to_deck", {
             cards: returnedCards, destination: "bottom", order: "bottom_to_top",
@@ -3052,8 +3171,13 @@
         const returnExchangeGroup = (group, destination, reason) => {
           if (!group.length) return;
           if (destination === "trash") state.trashCards.push(...group);
-          else if (destination === "top") state.deck.push(...group);
-          else state.deck.unshift(...group);
+          else if (destination === "top") {
+            state.deck.push(...group);
+            noteDeckPlacement(state, group, "top");
+          } else {
+            state.deck.unshift(...group);
+            noteDeckPlacement(state, group, "bottom");
+          }
           record(state, cards, "cards_returned_to_deck", {
             cards: group, destination, order: "bottom_to_top", reason,
             source_card_no: effect.source_card_no,
@@ -3385,6 +3509,7 @@
       } else if (effect.kind === "burst_return_self_to_hand") {
         // 「その後、このカードを手札に戻す」(BS14-X02)。場へ出ないがトラッシュへも
         // 行かない、3つ目の行き先。
+        state.burstOpen = null;
         state.hand.push(cardNo);
         record(state, cards, "card_moved",
           { card_no: cardNo, destination: "hand", reason: "burst_resolved" });
@@ -3411,6 +3536,7 @@
     // なっていた(掃検が緑だったのは、開いたバーストが自分を召喚する型だったから)。
     // 棋譜へも書く——移動を書かないと詳細モードで追えない。
     if (!selfPlayed && !returnedToHand) {
+      state.burstOpen = null;
       state.trashCards.push(cardNo);
       record(state, cards, "card_moved",
         { card_no: cardNo, destination: "trash", reason: "burst_resolved" });
@@ -3489,6 +3615,7 @@
           row.event === "count_increased" && requirementMet(row, payload.new_count));
         if (reaction) {
           state.burst = null;
+          state.burstOpen = cardNo;
           resolveBurstEffects(state, cards, targets, cardNo);
         }
       }
@@ -3506,6 +3633,21 @@
           allow_sacrifice: false, mode: "hand_reaction" })) {
           if (reaction.name_restriction) state.handReactionNames.add(reaction.name_restriction);
         }
+      }
+    }
+  }
+
+  /** 元効果から派生したカウント反応とプレイ成立時効果を、元効果の外で解く。
+   *
+   * PythonのEffectRuntimeでは、先に予約されたcount_increasedを処理すると、
+   * そこから成立した手札召喚の発揮待ちは、既に予約済みの表向き召喚時効果の
+   * 後ろへ入る。Workerも「現在待っているカウント反応を収集→同じ深度の
+   * プレイ成立時効果を順に解決」を繰り返し、親効果の途中へ割り込ませない。 */
+  function flushDerivedPlayReactions(state, cards, targets) {
+    while (state.pendingCountEvents.length || state.deferredPlayCompletions.length) {
+      flushCountReactions(state, cards, targets);
+      while (state.deferredPlayCompletions.length) {
+        state.deferredPlayCompletions.shift()();
       }
     }
   }
@@ -3587,10 +3729,250 @@
       mode: "soul_paid_free_summon" });
   }
 
+  function groupEffectInstances(cardNo, uid, timing, triggerEventId, effects,
+                                orderOffset = 0) {
+    const grouped = new Map();
+    for (const [index, effect] of effects.entries()) {
+      const blockId = effect.effect_block_id
+        || `${cardNo}:unresolved:${effect.effect_id ?? index}`;
+      if (!grouped.has(blockId)) grouped.set(blockId, []);
+      grouped.get(blockId).push(effect);
+    }
+    return [...grouped.entries()].map(([blockId, clauses], blockIndex) => ({
+      instance_id: `${triggerEventId}:${cardNo}#${uid ?? "null"}:${blockIndex}`,
+      effect_block_id: blockId,
+      source_card_no: cardNo,
+      source_uid: uid ?? null,
+      controller: "self",
+      timing,
+      trigger_event_id: triggerEventId,
+      clauses,
+      effect_tag: clauses.find((clause) => clause.effect_tag)?.effect_tag || null,
+      optional: clauses.some((clause) => Boolean(clause.optional)),
+      dependencies: [...new Set(clauses
+        .map((clause) => clause.requires_effect_block_id).filter(Boolean))],
+      derived_resolution: clauses.find((clause) => clause.derived_resolution)
+        ?.derived_resolution || null,
+      legacy_order: orderOffset + blockIndex,
+      priority_depth: clauses.some((clause) => clause.derived_resolution === "immediate")
+        ? 1 : 0,
+    }));
+  }
+
+  function effectCandidateDetails(instance) {
+    return {
+      instance_id: instance.instance_id,
+      effect_block_id: instance.effect_block_id,
+      source: instance.source_label
+        || `${instance.source_card_no}#${instance.source_uid ?? 1}`,
+      card_no: instance.source_card_no,
+      uid: instance.source_uid,
+      effect_tag: instance.effect_tag,
+      kinds: instance.clauses.map((clause) => clause.kind),
+      optional: instance.optional,
+      priority_depth: instance.priority_depth,
+    };
+  }
+
+  function effectOrderResources(state) {
+    return {
+      count: state.count,
+      reserve: state.reserve,
+      hand: state.hand.length,
+      deck: state.deck.length,
+      life: state.life,
+      field_cores: state.field.filter((unit) => !unit.waiting)
+        .reduce((sum, unit) => sum + unit.cores, 0),
+    };
+  }
+
+  function positiveInt(value) {
+    return Number.isInteger(value) && value > 0 ? value : 0;
+  }
+
+  function publicEffectEstimate(instance, resources, peers) {
+    let countGain = 0;
+    let coreGain = 0;
+    let digGain = 0;
+    let handGain = 0;
+    let boardGain = 0;
+    let opponentRisk = 0;
+    const opponentKinds = new Set(["unit_destroy", "unit_exhaust", "unit_bounce",
+      "unit_core_remove", "unit_heavy_exhaust", "unit_bp_down",
+      "life_core_remove", "field_core_remove"]);
+    for (const clause of instance.clauses) {
+      const amount = positiveInt(clause.amount);
+      if (clause.kind === "count_gain") countGain += amount;
+      if (["coreboost", "self_coreboost", "field_coreboost"].includes(clause.kind)) {
+        coreGain += amount;
+      }
+      if (clause.kind === "draw") {
+        digGain += amount;
+        handGain += amount;
+      } else if (clause.kind === "oracle_mill") digGain += amount;
+      else if (["search", "exchange"].includes(clause.kind)) {
+        digGain += positiveInt(clause.reveal);
+        handGain += amount;
+      } else if (["oracle_pickup", "recover", "self_recover", "side_recover",
+        "trash_reaction"].includes(clause.kind)) handGain += Math.max(1, amount);
+      else if (["token_spawn", "burst_free_play_self"].includes(clause.kind)) {
+        boardGain += Math.max(1, amount);
+      }
+      if (opponentKinds.has(clause.kind)) opponentRisk += 1;
+    }
+    const currentCount = Number(resources.count || 0);
+    const afterCount = currentCount + countGain;
+    let unlocked = 0;
+    for (const peer of peers) {
+      if (peer.instance_id === instance.instance_id) continue;
+      for (const clause of peer.clauses) {
+        for (const requirement of clause.count_requirements || []) {
+          if (requirement.comparison === ">=" && Number.isInteger(requirement.threshold)
+              && currentCount < requirement.threshold && requirement.threshold <= afterCount) {
+            unlocked += 1;
+          }
+        }
+      }
+    }
+    const score = [unlocked, countGain, coreGain, digGain, handGain, boardGain, -opponentRisk];
+    return { instance_id: instance.instance_id,
+      projected_delta: { count: countGain, usable_cores: coreGain, dig: digGain,
+        hand: handGain, board: boardGain, unlocked_effects: unlocked },
+      score, uses_hidden_identity: false };
+  }
+
+  function compareScore(left, right) {
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return left[index] - right[index];
+    }
+    return 0;
+  }
+
+  function chooseNextEffectV1(candidates, resources) {
+    const evaluations = candidates.map((candidate) =>
+      publicEffectEstimate(candidate, resources, candidates));
+    const bestScore = evaluations.reduce((best, row) =>
+      (best === null || compareScore(row.score, best) > 0 ? row.score : best), null);
+    const bestIds = new Set(evaluations.filter((row) =>
+      compareScore(row.score, bestScore) === 0).map((row) => row.instance_id));
+    const selected = candidates.filter((candidate) => bestIds.has(candidate.instance_id))
+      .reduce((best, candidate) =>
+        (!best || candidate.legacy_order < best.legacy_order ? candidate : best), null);
+    return { selected, evaluations,
+      reason: bestIds.size < candidates.length ? "lookahead_resource_gain" : "legacy_tiebreak" };
+  }
+
+  function flushRequiredAfter(clauses, index) {
+    return index + 1 < clauses.length
+      && clauses[index + 1].connector_before === "この効果発揮後";
+  }
+
+  // 印字効果の〔ターンに1回〕キー。同名縛りはカード名、裸はその1枚(uid)ごと。
+  function instanceTurnLimitKeys(instance, cards) {
+    const keys = [];
+    for (const clause of instance.clauses) {
+      const limit = clause.block_turn_limit;
+      const block = clause.effect_block_id;
+      if (!limit || !block) continue;
+      const key = limit === "once_per_turn_name"
+        ? `name\u0000${cards[instance.source_card_no]?.name || instance.source_card_no}\u0000${block}`
+        : `card\u0000${instance.source_uid}\u0000${block}`;
+      if (!keys.includes(key)) keys.push(key);
+    }
+    return keys;
+  }
+
+  function turnLimitAvailable(state, cards, instance) {
+    return instanceTurnLimitKeys(instance, cards)
+      .every((key) => !state.blockTurnUsed.has(key));
+  }
+
+  function resolvePendingEffectWindow(state, cards, targets, instances, resolveInstance,
+                                      candidateLegal = null) {
+    if (!instances.length) return;
+    state.effectWindowSeq += 1;
+    const windowId = `turn${state.turn}:effect-window:${state.effectWindowSeq}`;
+    const completed = new Set();
+    while (completed.size < instances.length) {
+      // 解決のたびに残候補を取り直す。後続で誘発収集を共通化しても、
+      // この選択契約を変えずに候補を追加できる形にしておく。
+      const completedBlocks = new Set(instances
+        .filter((instance) => completed.has(instance.instance_id))
+        .map((instance) => instance.effect_block_id));
+      let candidates = instances.filter((instance) => !completed.has(instance.instance_id)
+        && instance.dependencies.every((dependency) => completedBlocks.has(dependency)));
+      if (!candidates.length) {
+        throw new Error(`effect window has unresolved dependencies: ${windowId}`);
+      }
+      const deepest = Math.max(...candidates.map((instance) => instance.priority_depth));
+      candidates = candidates.filter((instance) => instance.priority_depth === deepest);
+      if (candidateLegal) {
+        const legal = candidates.filter((instance) => candidateLegal(instance));
+        if (!legal.length) {
+          // Exhaust only the unavailable deepest tier, then re-collect.  A
+          // legal peer can first change Count/Lv and make another candidate
+          // available on the following pass.
+          candidates.forEach((instance) => completed.add(instance.instance_id));
+          continue;
+        }
+        candidates = legal;
+      }
+      let selected = null;
+      let policy = "effect-order-legacy-v1";
+      let reason = "legacy_order";
+      let evaluations = [];
+      if (state.effectOrderScript.length) {
+        const selector = state.effectOrderScript[0];
+        selected = candidates.find((instance) => instance.effect_block_id === selector
+          || instance.effect_tag === selector
+          || instance.clauses.some((clause) => clause.kind === selector)) || null;
+        if (selected) {
+          state.effectOrderScript.shift();
+          policy = "effect-order-scripted-v1";
+          reason = "scripted_golden";
+        }
+      }
+      if (!selected) {
+        const choice = chooseNextEffectV1(candidates, effectOrderResources(state));
+        selected = choice.selected;
+        evaluations = choice.evaluations;
+        reason = choice.reason;
+        policy = "effect-order-lookahead-v1";
+      }
+      const choiceEventIndex = candidates.length > 1 && state.trace
+        ? state.events.length : null;
+      if (candidates.length > 1) {
+        record(state, cards, "effect_order_choice", {
+          window_id: windowId,
+          trigger_event_id: instances[0].trigger_event_id,
+          candidates: candidates.map(effectCandidateDetails),
+          selected: effectCandidateDetails(selected),
+          policy,
+          resources_before: effectOrderResources(state),
+          evaluated_candidates: evaluations,
+          burst_risk: null,
+          unevaluated: ["belief_state", "burst_identity", "victory_plan"],
+          reason,
+        });
+      }
+      for (const key of instanceTurnLimitKeys(selected, cards)) state.blockTurnUsed.add(key);
+      const generated = resolveInstance(selected) || [];
+      flushCountReactions(state, cards, targets);
+      if (choiceEventIndex !== null) {
+        const after = effectOrderResources(state);
+        const details = state.events[choiceEventIndex].details;
+        details.resources_after = after;
+        details.resource_delta = Object.fromEntries(Object.keys(details.resources_before)
+          .map((key) => [key, after[key] - details.resources_before[key]]));
+      }
+      completed.add(selected.instance_id);
+      instances.push(...generated);
+    }
+  }
+
   function resolvePlayedEffects(state, cards, targets, card, uid, braveMode,
-                                soulCoreUsedForSummonCost = false) {
-    let predecessor = { resolved: true, changed: true, kind: null };
-    let gatesNext = false;
+                                soulCoreUsedForSummonCost = false,
+                                watcherUnits = []) {
     const opponent = MAIN_STEP_OPPONENTS.get(state) || null;
     for (const effect of card.on_play_opponent_effects || []) {
       if (braveMode === "spirit" && effect.combine_only) continue;
@@ -3627,61 +4009,159 @@
     const active = (card.enablers || []).filter((effect) => effect.mode === "on_play"
       && effect.kind !== replacedEffectKind
       && !(braveMode === "spirit" && effect.combine_only));
-    const processedSimultaneous = new Set();
-    for (const effect of active) {
-      if (effect.simultaneous_group) {
-        if (processedSimultaneous.has(effect.simultaneous_group)) continue;
-        processedSimultaneous.add(effect.simultaneous_group);
-        const members = active.filter((candidate) =>
-          candidate.simultaneous_group === effect.simultaneous_group);
-        record(state, cards, "effect_start", { card_no: card.card_no, uid,
-          effect_kind: "simultaneous", effect_kinds: members.map((row) => row.kind),
-          simultaneous_group: effect.simultaneous_group });
-        const traceMark = state.events.length;
-        const results = members.map((member) =>
-          effectActive(member, state, cards, uid)
-            ? resolveEffect(state, cards, targets, member, uid) : false);
-        record(state, cards, "effect_complete", { card_no: card.card_no, uid,
-          effect_kind: "simultaneous", effect_kinds: members.map((row) => row.kind),
-          simultaneous_group: effect.simultaneous_group,
-          resolved: results.every(Boolean) });
-        if (state.trace) {
-          const finalState = stateView(state, cards);
-          for (const event of state.events.slice(traceMark)) event.state = clone(finalState);
+    const triggerEventId = `turn${state.turn}:play:${card.card_no}#${uid}:`
+      + `${state.effectWindowSeq + 1}`;
+    const watcherInstances = [];
+    for (const watcher of watcherUnits) {
+      if (watcher.waiting || !state.field.includes(watcher)) continue;
+      for (const effect of cards[watcher.card_no]?.enablers || []) {
+        if (effect.kind !== "oracle_watch" || !cardMatchesSlot(card, effect.condition_slot)) {
+          continue;
         }
-        predecessor = { resolved: results.at(-1) || false,
-          changed: results.at(-1) || false, kind: members.at(-1)?.kind || null };
-        gatesNext = false;
-        continue;
+        watcherInstances.push({
+          instance_id: `${triggerEventId}:oracle-watch:${watcher.card_no}#${watcher.uid}`,
+          effect_block_id: effect.effect_block_id || `${watcher.card_no}:keyword:神託`,
+          source_card_no: watcher.card_no,
+          source_uid: watcher.uid,
+          controller: "self",
+          timing: "on_play_watch",
+          trigger_event_id: triggerEventId,
+          clauses: [effect],
+          effect_tag: effect.effect_tag || null,
+          optional: Boolean(effect.optional),
+          dependencies: [],
+          legacy_order: watcherInstances.length,
+          priority_depth: 0,
+          runtime_kind: "oracle_watch",
+          watcher,
+        });
       }
-      if (gatesNext && !predecessor.resolved) { gatesNext = false; continue; }
-      if (effect.requires_predecessor_changed
-          && (predecessor.kind !== effect.requires_predecessor_changed || !predecessor.changed)) continue;
-      if (!effectActive(effect, state, cards, uid)) {
-        predecessor = { resolved: false, changed: false, kind: effect.kind };
-        gatesNext = Boolean(effect.gates_next_effect);
-        continue;
-      }
-      // `effect_id`は載せない——Python `_record("effect_start", ...)`が持たない
-      // フィールドで、載せると**詳細モードだけ**が最初のon_playで割れる(実測)。
-      // 詳細モードは掃検の既定ではないので、この差は長らく見えていなかった。
-      record(state, cards, "effect_start", { card_no: card.card_no, uid,
-        effect_kind: effect.kind });
-      // `changed`はPythonの`EffectResult.changed`と同じ意味＝**その節が実際に
-      // 状態を動かしたか**。以前は「stateViewが1文字でも変わったか」で代用して
-      // いたが、それでは大音楽堂のように「3枚オープンして戻しただけ（交換は
-      // 不成立）」でも真になり、「この効果で入れ替えたとき」のカウント+1が
-      // 誤って発火する。各resolverの戻り値をそのまま使う。
-      const changed = resolveEffect(state, cards, targets, effect, uid);
-      // Python `EffectResult.success(changed)`は、交換が0枚でも「節は解決済み」
-      // (`resolved=true`)とし、後続の「入れ替えたとき」はchangedだけで止める。
-      const resolved = effect.kind === "exchange" ? true : changed;
-      record(state, cards, "effect_complete", { card_no: card.card_no, uid,
-        effect_kind: effect.kind, resolved });
-      predecessor = { resolved, changed, kind: effect.kind };
-      gatesNext = Boolean(effect.gates_next_effect);
-      if (effect.effect_id && resolved) state.completedEffects.add(effect.effect_id);
     }
+    const instances = [...watcherInstances, ...groupEffectInstances(
+      card.card_no, uid, "on_play", triggerEventId, active, watcherInstances.length)];
+    const resolveInstance = (instance) => {
+      state.derivedEffectBuffer = [];
+      if (instance.runtime_kind === "oracle_watch") {
+        const effect = instance.clauses[0];
+        if (instance.watcher.waiting || !state.field.includes(instance.watcher)) return [];
+        record(state, cards, "effect_start", { card_no: instance.source_card_no,
+          uid: instance.source_uid, effect_kind: "oracle_watch",
+          effect_tag: effect.effect_tag || null });
+        instance.watcher.cores += 1;
+        record(state, cards, "effect_complete", { card_no: instance.source_card_no,
+          uid: instance.source_uid, effect_kind: "oracle_watch",
+          effect_tag: effect.effect_tag || null, resolved: true });
+        return [];
+      }
+      if (instance.runtime_kind === "trash_reaction") {
+        const effect = instance.clauses[0];
+        record(state, cards, "effect_start", { card_no: effect.card_no, uid: null,
+          effect_kind: "trash_reaction", source_card_no: effect.source_card_no });
+        const resolved = resolveTrashReaction(state, cards, effect);
+        record(state, cards, "effect_complete", { card_no: effect.card_no, uid: null,
+          effect_kind: "trash_reaction", source_card_no: effect.source_card_no, resolved });
+        return [];
+      }
+      let predecessor = { resolved: true, changed: true, kind: null };
+      let gatesNext = false;
+      const processedSimultaneous = new Set();
+      const takeGenerated = () => {
+        const generated = state.derivedEffectBuffer.map((effect, index) => ({
+          instance_id: `${instance.trigger_event_id}:derived:${instance.instance_id}:${index}`,
+          effect_block_id: `${effect.card_no}:trash-reaction:${effect.occurrence}`,
+          source_card_no: effect.card_no,
+          source_uid: null,
+          controller: "self",
+          timing: "derived",
+          trigger_event_id: instance.trigger_event_id,
+          clauses: [effect],
+          effect_tag: null,
+          optional: false,
+          dependencies: [],
+          derived_resolution: "immediate",
+          legacy_order: instance.legacy_order + 1000 + index,
+          priority_depth: instance.priority_depth + 1,
+          runtime_kind: "trash_reaction",
+          source_label: `${effect.card_no}#trash${effect.occurrence + 1}`,
+        }));
+        state.derivedEffectBuffer = [];
+        return generated;
+      };
+      for (const [clauseIndex, effect] of instance.clauses.entries()) {
+        if (effect.simultaneous_group) {
+          if (processedSimultaneous.has(effect.simultaneous_group)) continue;
+          processedSimultaneous.add(effect.simultaneous_group);
+          const members = instance.clauses.filter((candidate) =>
+            candidate.simultaneous_group === effect.simultaneous_group);
+          record(state, cards, "effect_start", { card_no: card.card_no, uid,
+            effect_kind: "simultaneous", effect_kinds: members.map((row) => row.kind),
+            simultaneous_group: effect.simultaneous_group });
+          const traceMark = state.events.length;
+          const results = members.map((member) =>
+            effectActive(member, state, cards, uid)
+              ? resolveEffect(state, cards, targets, member, uid) : false);
+          record(state, cards, "effect_complete", { card_no: card.card_no, uid,
+            effect_kind: "simultaneous", effect_kinds: members.map((row) => row.kind),
+            simultaneous_group: effect.simultaneous_group,
+            resolved: results.every(Boolean) });
+          if (state.trace) {
+            const finalState = stateView(state, cards);
+            for (const event of state.events.slice(traceMark)) event.state = clone(finalState);
+          }
+          predecessor = { resolved: results.at(-1) || false,
+            changed: results.at(-1) || false, kind: members.at(-1)?.kind || null };
+          gatesNext = false;
+          if (flushRequiredAfter(instance.clauses, clauseIndex)) {
+            const nested = takeGenerated();
+            if (nested.length) {
+              resolvePendingEffectWindow(state, cards, targets, nested,
+                resolveInstance);
+            }
+          }
+          continue;
+        }
+        if (gatesNext && !predecessor.resolved) { gatesNext = false; continue; }
+        if (effect.requires_predecessor_changed
+            && (predecessor.kind !== effect.requires_predecessor_changed
+              || !predecessor.changed)) continue;
+        if (!effectActive(effect, state, cards, uid)) {
+          predecessor = { resolved: false, changed: false, kind: effect.kind };
+          gatesNext = Boolean(effect.gates_next_effect);
+          continue;
+        }
+        // `effect_id`は載せない——Python `_record("effect_start", ...)`が持たない
+        // フィールドで、載せると**詳細モードだけ**が最初のon_playで割れる(実測)。
+        record(state, cards, "effect_start", { card_no: card.card_no, uid,
+          effect_kind: effect.kind, effect_tag: effect.effect_tag || null });
+        const changed = resolveEffect(state, cards, targets, effect, uid);
+        const resolved = effect.kind === "exchange" ? true : changed;
+        record(state, cards, "effect_complete", { card_no: card.card_no, uid,
+          effect_kind: effect.kind, effect_tag: effect.effect_tag || null, resolved });
+        predecessor = { resolved, changed, kind: effect.kind };
+        gatesNext = Boolean(effect.gates_next_effect);
+        if (effect.effect_id && resolved) state.completedEffects.add(effect.effect_id);
+        if (flushRequiredAfter(instance.clauses, clauseIndex)) {
+          const nested = takeGenerated();
+          if (nested.length) {
+            resolvePendingEffectWindow(state, cards, targets, nested,
+              resolveInstance);
+          }
+        }
+      }
+      return takeGenerated();
+    };
+    const candidateLegal = (instance) => {
+      if (instance.runtime_kind === "trash_reaction") {
+        return state.trashCards.includes(instance.clauses[0].card_no);
+      }
+      if (!turnLimitAvailable(state, cards, instance)) return false;
+      if (instance.runtime_kind === "oracle_watch") {
+        return !instance.watcher.waiting && state.field.includes(instance.watcher);
+      }
+      return instance.clauses.some((effect) => effectActive(effect, state, cards, uid));
+    };
+    resolvePendingEffectWindow(
+      state, cards, targets, instances, resolveInstance, candidateLegal);
     const recurring = (card.enablers || []).filter((effect) => effect.mode === "recurring");
     if (recurring.length) state.recurring.push({ uid, effects: recurring });
   }
@@ -3858,6 +4338,9 @@
       traceDetails.creator_uid = candidate.manifestation_creator_uid ?? null;
       traceDetails.brave_mode = candidate.brave_mode;
     }
+    if (mode === "face_up_draw_replacement") {
+      traceDetails.brave_mode = candidate.brave_mode ?? null;
+    }
     if (mode === "free_deploy") {
       traceDetails.source_zone = candidate.source_zone;
       traceDetails.source_host_uid = candidate.source_host_uid ?? null;
@@ -3935,6 +4418,12 @@
         exhausted: false,
         soul_core: soulForUnit, kourin_stack: [] });
     }
+    // バーストから出す枝は、召喚が確定した時点でバーストゾーンを離れる
+    // (Python `burst_open[0] = None` と同じ位置)。
+    if (state.burstOpen === candidate.card_no
+        && ["burst_free_play", "burst_paid_followup"].includes(candidate.mode)) {
+      state.burstOpen = null;
+    }
     record(state, cards, "card_entered", { card_no: candidate.card_no, uid,
       destination: isMagic ? "resolution" : "field",
       ...traceDetails });
@@ -3943,15 +4432,6 @@
     const finishPlay = () => {
       beginEffectFrame(state);
       try {
-        for (const watcher of watcherUnits) {
-          const watcherCard = cards[watcher.card_no];
-          for (const effect of watcherCard.enablers || []) {
-            if (effect.kind === "oracle_watch"
-                && cardMatchesSlot(card, effect.condition_slot)) {
-              watcher.cores += 1;
-            }
-          }
-        }
         // 手札カウント反応で召喚したときの「そうしたとき」節
         // (`hand_reaction_effects`)。Pythonの予約batchと同じく、カード自身の
         // 確定処理の中で解く。
@@ -3961,7 +4441,7 @@
           }
         }
         resolvePlayedEffects(state, cards, targets, { ...card, card_no: candidate.card_no },
-          uid, candidate.brave_mode, soulCoreUsedForSummonCost);
+          uid, candidate.brave_mode, soulCoreUsedForSummonCost, watcherUnits);
         if (isMagic && staysOnField) {
           state.uid += 1;
           uid = state.uid;
@@ -3987,7 +4467,11 @@
         endEffectFrame(state);
       }
     };
-    if (["burst_free_play", "burst_paid_followup"].includes(mode)) {
+    const waitsBehindExistingDerivedPlay = mode === "hand_reaction"
+      && state.effectFrameDepth > 0 && state.deferredPlayCompletions.length > 0;
+    if (["burst_free_play", "burst_paid_followup"].includes(mode)
+        || (mode === "face_up_draw_replacement" && state.effectFrameDepth > 0)
+        || waitsBehindExistingDerivedPlay) {
       state.deferredPlayCompletions.push(finishPlay);
     } else finishPlay();
     return true;
@@ -4667,7 +5151,42 @@
       if (source.waiting) continue;
       for (const effect of cards[source.card_no]?.main_activated_effects || []) {
         const key = `${source.uid}:${effect.kind}`;
-        if (state.mainActivatedUsed.has(key) || effect.kind !== "creator_redeploy") continue;
+        if (state.mainActivatedUsed.has(key)) continue;
+        if (effect.kind === "contract_domain") {
+          const candidates = state.hand.map((cardNo, index) => ({ cardNo, index,
+            tier: accessTier(cardNo, cards, targets) }))
+            .filter((row) => (effect.payment_lineages || []).some(
+                (lineage) => (cards[row.cardNo]?.lineages || []).includes(lineage)))
+            .sort((a, b) => b.tier - a.tier || a.index - b.index);
+          if (!candidates.length) continue;
+          const paid = candidates[0];
+          state.mainActivatedUsed.add(key);
+          record(state, cards, "effect_start", { card_no: source.card_no, uid: source.uid,
+            effect_kind: effect.kind, effect_tag: effect.effect_tag || null, window: "main" });
+          state.hand.splice(paid.index, 1);
+          state.sideCards.push(paid.cardNo);
+          state.sideGain += 1;
+          recordCardSelection(state, cards, { cards: [paid.cardNo], source: "hand",
+            destination: "side", reason: "contract_domain_cost",
+            source_card_no: source.card_no });
+          applyCountGain(state, cards, effect.count_gain || 0, effect.count_cap ?? null,
+            { reason: "contract_domain", source_card_no: source.card_no,
+              source_uid: source.uid });
+          const drawKey = `same_name_draw:${cards[source.card_no]?.name || source.card_no}:${effect.kind}`;
+          let drawn = 0;
+          if (!effect.draw_once_per_turn_same_name || !state.mainActivatedUsed.has(drawKey)) {
+            drawn = draw(state, cards, effect.draw || 0, "contract_domain");
+            if (effect.draw_once_per_turn_same_name) state.mainActivatedUsed.add(drawKey);
+          }
+          record(state, cards, "effect_complete", { card_no: source.card_no, uid: source.uid,
+            effect_kind: effect.kind, effect_tag: effect.effect_tag || null, window: "main",
+            resolved: true, paid_card_no: paid.cardNo, drawn });
+          flushCountReactions(state, cards, targets);
+          noteLegalCandidates(state, cards, targets);
+          changed = true;
+          continue;
+        }
+        if (effect.kind !== "creator_redeploy") continue;
         const creatorCount = state.field.filter((unit) => !unit.waiting
           && (cards[unit.card_no]?.lineages || []).includes("創界神")).length;
         const cost = effect.source_core_cost || 0;
@@ -4980,6 +5499,7 @@
           return null;
         }
         state.burst = null;
+        state.burstOpen = cardNo;
         // 相手の盤面の口(6C-2C)。バーストが開くのは戦闘の途中か相手のターンなので、
         // 破壊・バウンス・コア除去の節を戦闘の窓と同じように撃てる。
         state.combatOpponent = opponent || null;
@@ -5122,7 +5642,7 @@
           ((cards[cardNo] || {})[key] || [])
             .filter((effect) => inWindow(effect)
               && (!contractBaseOnly || effect.works_as_contract_base))
-            .map((effect) => [effect, source]);
+            .map((effect) => [effect, source, cardNo]);
         // [節, 合体限定判定に使う発揮元]の組。解決は**常にホスト**で行う
         // (合体中のブレイヴはコアを持たないので、置かれるコアはホストへ乗る)。
         const rows = windowRows(unit.card_no, unit);
@@ -5134,13 +5654,18 @@
         for (const brave of combinedBraves(state, uid)) {
           rows.push(...windowRows(brave.card_no, brave));
         }
+        // 並べ替えるのは**別の印字効果どうしの既定順**だけ(Python同一)。1つの
+        // 印字効果の中の節順は印字のまま保つ——`rows`を並べ替えて束ねると、
+        // 「その後」で繋がる節の間へ別効果が入る(2026-09-17の利用者裁定)。
+        const policyRank = rows.map((_row, index) => index);
         if (!combatWindowLocked(rows.map(([effect]) => effect))) {
-          rows.sort((left, right) => {
-            const a = combatWindowSortKey(left[0]);
-            const b = combatWindowSortKey(right[0]);
-            return a[0] - b[0] || a[1] - b[1];
+          policyRank.sort((left, right) => {
+            const a = combatWindowSortKey(rows[left][0]);
+            const b = combatWindowSortKey(rows[right][0]);
+            return a[0] - b[0] || a[1] - b[1] || left - right;
           });
         }
+        const blockRank = new Map(policyRank.map((position, order) => [position, order]));
         const resolved = [];
         state.combatOpponent = opponent || null;
         beginEffectFrame(state);
@@ -5148,17 +5673,63 @@
           // ⚠️ **相手の口を結んだ後**に撃つ(Python同一)。印字の盤面条件は
           // ここでしか読めない——先に撃つと条件つきの付与が一度も発火しない。
           if (window === "attack") applyAttackSymbolGrants(state, cards, unit, uid);
-          for (const [effect, source] of rows) {
-            if (source.brave_mode === "spirit" && effect.combine_only) continue;
-            // `effect_id`はPython側に無いので載せない(上と同じ理由)。
-            record(state, cards, "effect_start", { card_no: source.card_no, uid,
-              effect_kind: effect.kind, window });
-            const ok = resolveEffect(state, cards, targets, effect, uid);
-            record(state, cards, "effect_complete", { card_no: source.card_no, uid,
-              effect_kind: effect.kind, window, resolved: ok });
-            resolved.push({ kind: effect.kind, effect_id: effect.effect_id ?? null,
-              resolved: Boolean(ok) });
-          }
+          const triggerEventId = `turn${state.turn}:combat:${window}:${uid}:`
+            + `${state.effectWindowSeq + 1}`;
+          const grouped = new Map();
+          rows.forEach(([effect, source, sourceCardNo], position) => {
+            const blockId = effect.effect_block_id
+              || `${sourceCardNo}:unresolved:${effect.effect_id ?? position}`;
+            const groupKey = `${sourceCardNo}\u0000${source.uid}\u0000${blockId}`;
+            if (!grouped.has(groupKey)) {
+              grouped.set(groupKey, { source, sourceCardNo, blockId,
+                legacyOrder: blockRank.get(position), clauses: [] });
+            } else {
+              const group = grouped.get(groupKey);
+              group.legacyOrder = Math.min(group.legacyOrder, blockRank.get(position));
+            }
+            grouped.get(groupKey).clauses.push(effect);
+          });
+          // 既定順は「その効果の最も早い節の順位」。印字順で束ねてから並べる。
+          const instances = [...grouped.values()]
+            .sort((left, right) => left.legacyOrder - right.legacyOrder)
+            .map((group, blockIndex) => ({
+              instance_id: `${triggerEventId}:${group.sourceCardNo}#${group.source.uid}:${blockIndex}`,
+              effect_block_id: group.blockId,
+              source_card_no: group.sourceCardNo,
+              source_uid: group.source.uid,
+              controller: "self",
+              timing: window,
+              trigger_event_id: triggerEventId,
+              clauses: group.clauses,
+              effect_tag: group.clauses.find((effect) => effect.effect_tag)?.effect_tag || null,
+              optional: group.clauses.some((effect) => Boolean(effect.optional)),
+              dependencies: [],
+              legacy_order: group.legacyOrder,
+              priority_depth: 0,
+              gate_source: group.source,
+            }));
+          const resolveCombatInstance = (instance) => {
+            for (const effect of instance.clauses) {
+              if (instance.gate_source.brave_mode === "spirit" && effect.combine_only) continue;
+              record(state, cards, "effect_start", { card_no: instance.source_card_no, uid,
+                effect_kind: effect.kind, effect_tag: effect.effect_tag || null, window });
+              const ok = resolveEffect(state, cards, targets, effect, uid);
+              record(state, cards, "effect_complete", { card_no: instance.source_card_no, uid,
+                effect_kind: effect.kind, effect_tag: effect.effect_tag || null,
+                window, resolved: ok });
+              resolved.push({ kind: effect.kind, effect_id: effect.effect_id ?? null,
+                resolved: Boolean(ok) });
+            }
+            return [];
+          };
+          const combatCandidateLegal = (instance) => (
+            turnLimitAvailable(state, cards, instance)
+            && instance.clauses.some((effect) =>
+              !(instance.gate_source.brave_mode === "spirit" && effect.combine_only)
+              && effectActive(effect, state, cards, uid)));
+          resolvePendingEffectWindow(
+            state, cards, targets, instances, resolveCombatInstance,
+            combatCandidateLegal);
           // カウント反応など、この窓で増えたぶんの派生を先に流し、待機中の
           // 場離れは`endEffectFrame`で最後に確定する(Python runtime.end同一)。
           flushCountReactions(state, cards, targets);
@@ -5245,6 +5816,9 @@
       // 6C-3の「見送りの価値」。0以外のときは、払った後もこの数だけ原資が残る
       // プレイだけを方針が選ぶ。Python `burst_hold_floor` と同一。
       burstHoldFloor: 0,
+      // 発動したバーストは行き先が決まるまでバーストゾーンで**表向き**
+      // (Python `burst_open` と同一)。裏向きのセットとは別枠。
+      burstOpen: null,
       mirage: null, turn: 0, pendingCountEvents: [], handReactionNames: new Set(),
       openReactionNames: new Set(), trashReactionNames: new Set(),
       // 裸の〔ターンに1回〕は「そのカード1枚ごとに1回」。同名コピーを区別できないので
@@ -5270,6 +5844,16 @@
       resolvedBranchEvents: [],
       branchRngs: {},
       combat: Boolean(options.combat),
+      effectWindowSeq: 0,
+      // 印字効果ごとの〔ターンに1回〕。**発揮タイミングを跨いで共通**に数える
+      // (『煌臨/アタック時』は1つの効果なので合わせてターン1回。Python同一)。
+      blockTurnUsed: new Set(),
+      // 山札の観測（Python `known_top_cards` / `known_bottom_cards` /
+      // `unobserved_deck_counts`）。初手を配った後の山札から数え始める。
+      knownTopCards: [], knownBottomCards: [],
+      unobservedDeckCounts: countDeckCards([...opening.deck_order]),
+      effectOrderScript: [...(options.effect_order_script || [])],
+      derivedEffectBuffer: [],
     };
     if (state.branchSampling) {
       // 分岐は山札のstreamを一切消費しない専用streamから引く。
@@ -5305,17 +5889,31 @@
       // ⓪相手の2値分岐(5C-2Aのみ)。除去は直前の相手ターンを表すので、自分のコア
       // ステップより前に抽選する。5C-2Aでは結果を盤面へ適用しない。
       sampleOpponentBranches(state, cards, options);
+      // ターン開始。公式の並びは ターン開始→スタート→コア→ドロー→リフレッシュ
+      // →メイン→アタック→エンド→ターン終了。各ステップは「開始時→処理→終了時」
+      // なので、`step_*`はどれも**開始**を指す(Python同一)。
+      record(state, cards, "turn_start");
       // ①スタートステップ。公式の7ステップ(page05)は戦闘モードだけ棋譜へ出す。
       if (state.combat) record(state, cards, "step_start");
       // ②コアステップ(先攻1ターン目のみ無し)
       if (!(options.going_first && turn === 1)) {
-        state.reserve += 1;
+        // ⚠️ ステップの記録は**処理より前**(Python同一)。後ろへ置くと棋譜が
+        // 「コアを得た→コアステップ」の順に読め、将来ここへ『自分のコア
+        // ステップ』の効果を足す人がルール処理の後ろへ差し込んでしまう。
         if (state.combat) record(state, cards, "step_core", { gained: 1 });
+        state.reserve += 1;
       }
-      // ③ドローステップ
-      draw(state, cards, 1, "draw_step");
+      // ③ドローステップ。記録はドローの前——『自分のドローステップ』の効果を
+      // 足すときは、この記録と`draw`の**間**で解決する(引いた後では遅い)。
       if (state.combat) record(state, cards, "step_draw", { drawn: 1 });
-      // ④リフレッシュステップ(トラッシュ→リザーブ＋疲労の全回復)
+      draw(state, cards, 1, "draw_step");
+      // ④リフレッシュステップ(トラッシュ→リザーブ＋疲労の全回復)。記録は処理の前。
+      if (state.combat) {
+        record(state, cards, "step_refresh", {
+          recovered_uids: state.field.filter((unit) => unit.exhausted)
+            .map((unit) => unit.uid).sort((left, right) => left - right),
+        });
+      }
       state.reserve += state.spent;
       state.reserveHasSoul = state.reserveHasSoul || state.trashHasSoul;
       state.spent = 0;
@@ -5324,16 +5922,14 @@
         // 回復は**1段ずつ**。裁定「重疲労状態のスピリットは…1回の回復で疲労
         // 状態になり、再度回復すると回復状態になります」。重疲労はここでは
         // 疲労になるだけで立たない。Python側と同型。
-        const recovered = state.field.filter((unit) => unit.exhausted)
-          .map((unit) => unit.uid).sort((left, right) => left - right);
         for (const unit of state.field) {
           if (unit.heavy_exhausted) unit.heavy_exhausted = false;
           else unit.exhausted = false;
         }
-        record(state, cards, "step_refresh", { recovered_uids: recovered });
       }
-      // ⑤メインステップ(turn_start〜turn_endがその開始と終了)
-      record(state, cards, "turn_start");
+      // ⑤メインステップ。開始の記録は他のステップと同じく`step_*`。A-1(戦闘なし)は
+      // ステップを持たないので、その棋譜ではturn_start〜turn_endがメインの範囲になる。
+      if (state.combat) record(state, cards, "step_main");
       // 盤面のフラッシュ効果は**メインステップでも撃てる**(ステップ指定の無い
       // 『フラッシュ』はメインステップのフラッシュタイミングでも使える。Q2508)。
       // メインの手を打つ前に一度試す——カウントを増やすフラッシュ効果は、その
@@ -5443,9 +6039,11 @@
       // ⑦エンドステップ。**〔ターンに1回〕の数え直しはここ**(ユーザー裁定)。
       // ターン開始で消すと、自分のターンに撃った札が相手のターンでも撃てない
       // ままになる。Python `_end_step_reset` と同一。
+      if (state.combat) record(state, cards, "step_end");
       state.fieldFlashUsed.clear();
       state.mainActivatedUsed.clear();
-      if (state.combat) record(state, cards, "step_end");
+      state.blockTurnUsed.clear();
+      // ターン終了。エンドステップの処理まで終わった後(公式の並び)。
       record(state, cards, "turn_end");
       yield { turn, step: "turn_end",
         ...(state.combat ? { board: combatBoard(state, cards, targets) } : {}) };
@@ -5675,9 +6273,9 @@
   const TRACE_FORMAT = "BattleSpiritsDB.stage6-trace";
   const TRACE_FORMAT_VERSION = 1;
   const TRACE_MODE = "stage6a1-alternating-main-v1";
-  const RUNTIME_VERSION = "stage6a1-portable-v3";
+  const RUNTIME_VERSION = "stage6a1-portable-v9";
   const COMBAT_MODE = "stage6b1-combat-v1";
-  const COMBAT_RUNTIME_VERSION = "stage6b1-portable-v4";
+  const COMBAT_RUNTIME_VERSION = "stage6b1-portable-v10";
   // 方針を変えたらここを上げる(棋譜の`policy`がこの版を持つ)。ルールの版
   // `COMBAT_MODE`とは別物。v2(2026-08-22): 削り切りの判定を1体ずつから
   // **アタックステップ合計**へ(`lethalStepPlan`)。Python同一。
@@ -5759,9 +6357,11 @@
     "field_flash_resolved",
   ]);
   const TURN_EVENT_TYPES = new Set(["turn_start", "turn_end"]);
+  // どれも**ステップの開始**を指す(Python `STEP_EVENT_TYPES` と同一)。
   const STEP_EVENT_PHASES = {
     step_start: "start", step_core: "core", step_draw: "draw",
-    step_refresh: "refresh", step_attack: "attack", step_end: "end",
+    step_refresh: "refresh", step_main: "main", step_attack: "attack",
+    step_end: "end",
   };
   // Python側 MAIN_EVENT_TYPES と同一。メインステップの中でStage4が記録する
   // イベントで、`detail`を指定した棋譜だけが載せる。片方に足し忘れると
@@ -5771,7 +6371,7 @@
     "branch_sampled", "burst_replaced", "burst_set", "card_entered", "card_moved",
     "cards_opened", "cards_returned_to_deck", "cards_selected", "core_moved",
     "cost_calculated", "cost_paid", "count_gained", "draw", "effect_complete",
-    "effect_start", "field_leave_queued", "field_left", "level_allocate",
+    "effect_start", "effect_order_choice", "field_leave_queued", "field_left", "level_allocate",
     "mirage_set", "open_reaction_declared", "open_reaction_queued", "opening_hand",
     "play_complete", "play_presented", "deck_top_revealed",
     "card_excluded", "trash_summon_declared", "effect_free_summon_declared",
@@ -5791,7 +6391,7 @@
   ]);
   // 詳細を載せた棋譜だけが名乗る版。既定の棋譜には**キーごと存在しない**
   // （null を1つ足すだけでもfingerprintが動くため）。
-  const DETAIL_LEVEL = "main-events-v3";
+  const DETAIL_LEVEL = "main-events-v4";
   // Stage4のdetailsには解決順を制御する内部作業キーもある。Stage6の公開詳細棋譜へ
   // 写す境界でだけ除外し、nullableキーは必ず載せてPythonと同じ形へ固定する。
   const INTERNAL_DETAIL_KEYS = Object.freeze({
@@ -6967,15 +7567,18 @@
           || (combat && event.type in STEP_EVENT_PHASES)
           || (detail && MAIN_EVENT_TYPES.has(event.type))));
       let spliced = false;
+      // 詳細イベントのphaseは**そのとき踏んでいるステップ**(Python同一)。
+      let currentPhase = "main";
       for (const source of sourceEvents) {
         if (source.type === "step_end") {
           spliceCombat(round, actor);
           spliced = true;
         }
         latest[actor] = canonicalState(source.state);
+        if (source.type in STEP_EVENT_PHASES) currentPhase = STEP_EVENT_PHASES[source.type];
         const main = MAIN_EVENT_TYPES.has(source.type);
-        const phase = main ? "main" : (STEP_EVENT_PHASES[source.type]
-          || (source.type === "turn_start" ? "main_start" : "main_end"));
+        const phase = main ? currentPhase : (STEP_EVENT_PHASES[source.type]
+          || (source.type === "turn_start" ? "turn_start" : "turn_end"));
         events.push({
           seq: events.length + 1,
           round,
