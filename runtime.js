@@ -262,7 +262,8 @@
   async function build(selfPacket, opponentPacket, sourceOptions = {}) {
     const options = sourceOptions ?? {};
     if (!isObject(options)) throw new Error("options must be an object");
-    const allowed = ["first_player", "max_rounds", "trials", "seed", ...PLAYER_IDS];
+    const allowed = ["first_player", "max_rounds", "trials", "seed", "main_policy",
+      ...PLAYER_IDS];
     const unknown = Object.keys(options).filter((key) => !allowed.includes(key)).sort();
     if (unknown.length) throw new Error(`unknown Stage6 options: ${unknown.join(", ")}`);
     await Stage5PortableEngine.validatePacket(selfPacket);
@@ -275,6 +276,11 @@
     if (!PLAYER_IDS.includes(firstPlayer)) {
       throw new Error("options.first_player must be self or opponent");
     }
+    // メインステップの方針(`stage4_policy`)。Python `build_stage6_match_contract`
+    // と同一で、**既定では鍵ごと出さない**——契約のfingerprintは中身全体から
+    // 作るので、既定へnullを1つ足すだけで既存の契約と一致しなくなる。
+    const mainPolicy = Stage5PortableSimulation.validateMainPolicy(
+      options.main_policy ?? null);
     const players = PLAYER_IDS.map((playerId) => {
       const packet = packetRows[playerId];
       const { deck } = normalizeDeck(packet.deck, `${playerId}_packet.deck`);
@@ -301,6 +307,8 @@
       players,
       decision_model: structuredClone(DECISION_MODEL),
       capabilities: structuredClone(CAPABILITIES),
+      ...(mainPolicy === Stage5PortableSimulation.DEFAULT_MAIN_POLICY
+        ? {} : { main_policy: mainPolicy }),
     };
     return { ...basis, fingerprint: await sha256Hex(stableStringify(basis)) };
   }
@@ -308,7 +316,10 @@
   async function validate(value) {
     const topKeys = ["format", "format_version", "mode", "stage4_version", "engine_slice",
       "catalog", "first_player", "max_rounds", "trials", "seed", "players",
-      "decision_model", "capabilities", "fingerprint"];
+      "decision_model", "capabilities", "fingerprint",
+      // 既定以外の方針で作られた契約だけが名乗る(鍵の有無そのものが印)。
+      ...(Object.prototype.hasOwnProperty.call(value, "main_policy")
+        ? ["main_policy"] : [])];
     exactKeys(value, topKeys, "Stage6 match");
     if (value.format !== FORMAT || value.format_version !== FORMAT_VERSION || value.mode !== MODE
         || value.stage4_version !== Stage5PortableEngine.STAGE_VERSION
@@ -542,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v63-v1";
-  const STAGE_VERSION = "v63";
+  const ENGINE_SLICE = "stage4-v64-v1";
+  const STAGE_VERSION = "v64";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -708,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v63 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v64 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v63-portable-v12";
+  const RUNTIME_VERSION = "stage4-v64-portable-v12";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -942,8 +953,68 @@
     return "bottom";
   }
 
+
+  // --- メインステップの方針(`stage4_policy`と同一) -----------------------
+  //
+  // ルールではない。「何を場に出す価値があると見るか」だけ。Python側に同じ表と
+  // 同じ順位付けがあり、片方だけ変えると掃検が割れる(D14)。
+  const MAIN_POLICY_DIG = "stage4-main-dig-v1";
+  const MAIN_POLICY_BOARD = "stage4-main-board-v1";
+  const MAIN_POLICIES = [MAIN_POLICY_DIG, MAIN_POLICY_BOARD];
+  const DEFAULT_MAIN_POLICY = MAIN_POLICY_DIG;
+
+  function validateMainPolicy(policy) {
+    if (policy === null || policy === undefined) return DEFAULT_MAIN_POLICY;
+    if (!MAIN_POLICIES.includes(policy)) {
+      throw new Error(`unknown Stage4 main policy: ${policy}`);
+    }
+    return policy;
+  }
+
+  // Mirrors Python `counts_combat_payoff`. Gated on the combat flag, not on the
+  // opponent handle: that handle is lost by structuredClone during lookahead,
+  // which split the runtimes on 2026-09-20 (coverage deck, 11/24).
+  const countsCombatPayoff = (policy, combat) =>
+    policy === MAIN_POLICY_BOARD && Boolean(combat);
+
+  /** その札が**場に在ること**で戦闘の窓へ持ち込む見返りの粗い点。
+   *  カードだけから決まる表なので、両ランタイムで必ず同じ値になる。
+   *  Python `stage4_policy.board_payoff` と同一。 */
+  function boardPayoff(card) {
+    if (!card) return 0;
+    let attack = Boolean((card.attack_effects || []).length
+      || (card.life_reduced_effects || []).length
+      || (card.blocked_effects || []).length);
+    let block = Boolean((card.block_effects || []).length);
+    if ((card.battle_end_effects || []).length) { attack = true; block = true; }
+    return Number(attack) + Number(block);
+  }
+
+  const fieldBoardPayoff = (state, cards) => state.field
+    .filter((unit) => !unit.waiting)
+    .reduce((total, unit) => total + boardPayoff(cards[unit.card_no]), 0);
+
+  /** 1手の順位。`dig`は従来どおりの4項で、`board`だけが`clock_gain`の次に
+   *  盤面の差を挟む(掘削の上には置かない)。Python `play_rank` と同一。 */
+  function playRank(policy, score, clockGainValue, boardGain, targetPlayable,
+                    policyRank) {
+    if (policy === MAIN_POLICY_BOARD) {
+      return [score, clockGainValue, boardGain, Number(targetPlayable), policyRank];
+    }
+    return [score, clockGainValue, Number(targetPlayable), policyRank];
+  }
+
+  const greedyYieldBonus = (policy, card, combat) =>
+    (countsCombatPayoff(policy, combat) ? boardPayoff(card) : 0);
+
+  const playBoardGain = (policy, combat, before, after) =>
+    (countsCombatPayoff(policy, combat) ? after - before : 0);
+
   function isEngine(card) {
-    return Boolean((card?.enablers || []).length);
+    // 誘発の節も数える。Python `stage4_evaluation.is_engine` と同一——
+    // ここを片方だけにすると、出す札が両ランタイムで割れる。
+    return Boolean((card?.enablers || []).length
+      || (card?.triggered_effects || []).length);
   }
 
   function accessTier(cardNo, cards, targets) {
@@ -2454,7 +2525,7 @@
     return ownUnits > 0;
   }
 
-  function setBurst(state, cards, cardNo, source = "effect") {
+  function setBurst(state, cards, targets, cardNo, source = "effect") {
     if (!(cards[cardNo]?.burst_effects || []).length) return false;
     if (state.burst) {
       const replaced = state.burst;
@@ -2467,6 +2538,7 @@
       });
     } else state.burst = cardNo;
     record(state, cards, "burst_set", { card_no: cardNo, source });
+    resolveEventTriggers(state, cards, targets, "burst_set", { card_no: cardNo });
     return true;
   }
 
@@ -2507,7 +2579,7 @@
       let resolved = false;
       if (reaction.destination === "burst") {
         pool.splice(pool.indexOf(cardNo), 1);
-        resolved = setBurst(state, cards, cardNo, "effect");
+        resolved = setBurst(state, cards, targets, cardNo, "effect");
       } else if (reaction.destination === "hand") {
         if (total) {
           const deficit = total - state.reserve;
@@ -2641,7 +2713,25 @@
     return Math.floor(value / per);
   }
 
+  /** Python `resolve_enabler` の入口と出口に合わせた薄い外側(2026-09-20)。
+   *  ・前節の成立を条件にする節は、ここで確かめて**消費**する
+   *  ・後節が待っている節だけ、成立を記録する(待っていない節まで覚えると
+   *    集合が膨らみ、ターンをまたいで解禁してしまう)
+   *  ⚠️ `reveal_play_remainder`は自前で同じ判定と消費を持つ(B-3の元の組)ので
+   *  二重に食わない。Python側の除外と同じ。 */
   function resolveEffect(state, cards, targets, effect, sourceUid) {
+    if (effect.requires_predecessor_id && effect.kind !== "reveal_play_remainder") {
+      if (!state.completedEffects.has(effect.requires_predecessor_id)) return false;
+      state.completedEffects.delete(effect.requires_predecessor_id);
+    }
+    const resolved = resolveEffectBody(state, cards, targets, effect, sourceUid);
+    if (resolved && effect.b3_followup_id && effect.effect_id) {
+      state.completedEffects.add(effect.effect_id);
+    }
+    return resolved;
+  }
+
+  function resolveEffectBody(state, cards, targets, effect, sourceUid) {
     if (!effectActive(effect, state, cards, sourceUid)) return false;
     // 倍率は`amount`へ掛けてから通常の解決へ渡す(Pythonも`resolve_enabler`の
     // 入口で同じことをする)。0回なら`amount`が0になり、対象を1つも取らない。
@@ -3571,7 +3661,7 @@
       .sort((a, b) => a.tier - b.tier || a.index - b.index)[0];
     if (burst) {
       opened.splice(opened.indexOf(burst.cardNo), 1);
-      setBurst(state, cards, burst.cardNo, "effect");
+      setBurst(state, cards, targets, burst.cardNo, "effect");
     }
     const wanted = new Set(effect.summon_lineages || []);
     const summoned = opened.map((cardNo, index) => ({ cardNo, index,
@@ -3887,6 +3977,58 @@
       .every((key) => !state.blockTurnUsed.has(key));
   }
 
+
+  // 「召喚」で場に出る種別。ネクサスは「配置」、マジックは「使用」なので
+  // 『自分のスピリットが召喚されたとき』の引き金には入らない。
+  // Python `SUMMONABLE_CARD_TYPES` と同一。
+  const SUMMONABLE_CARD_TYPES = new Set(["スピリット", "アルティメット", "ブレイヴ",
+    "契約スピリット", "契約アルティメット", "トークンスピリット"]);
+  const KOURIN_PLAY_SOURCES = new Set(["kourin", "kourin_from_soul"]);
+
+  // 誘発の〔ターンに1回〕キー。制限は`trigger.limit`から読む(印字ブロックの
+  // `block_turn_limit`は見出しの読み違いで付かないことがある)。まとめる単位は
+  // `effect_block_id`なので、1つの印字効果が節へ割れていても回数は1回。
+  // Python `_event_trigger_limit_keys` と同一。
+  function eventTriggerLimitKeys(cards, effect, unit) {
+    const limit = (effect.trigger || {}).limit;
+    const block = effect.effect_block_id;
+    if (!limit || !block) return [];
+    return [limit === "once_per_turn_name"
+      ? `name\u0000${cards[unit.card_no]?.name || unit.card_no}\u0000${block}`
+      : `card\u0000${unit.uid}\u0000${block}`];
+  }
+
+  /** 誘発の窓。場に在るカードが、**別のカードに起きたこと**で撃つ。
+   *  Python `_resolve_event_triggers` と同一。
+   *  ⚠️ 自分自身の召喚では撃たない(発揮元が場に載るのと同じ処理なので、
+   *  素通しにすると「自分が出たこと」で自分の誘発が開く)。 */
+  function resolveEventTriggers(state, cards, targets, event, payload) {
+    for (const unit of [...state.field]) {
+      if (unit.waiting || payload.uid === unit.uid) continue;
+      const card = cards[unit.card_no];
+      const matched = [];
+      for (const effect of (card?.triggered_effects || [])) {
+        const trigger = effect.trigger || {};
+        if (trigger.event !== event) continue;
+        if (event === "ally_summoned") {
+          const played = cards[payload.card_no] || {};
+          if (!SUMMONABLE_CARD_TYPES.has(played.card_type)) continue;
+          if (KOURIN_PLAY_SOURCES.has(payload.source) && !trigger.includes_kourin) continue;
+        }
+        if (trigger.slot && !cardMatchesSlot(cards[payload.card_no], trigger.slot)) continue;
+        matched.push(effect);
+      }
+      const fired = [];
+      for (const effect of matched) {
+        const keys = eventTriggerLimitKeys(cards, effect, unit);
+        if (keys.some((key) => state.blockTurnUsed.has(key))) continue;
+        fired.push(effect);
+        keys.forEach((key) => state.blockTurnUsed.add(key));
+      }
+      for (const effect of fired) resolveEffect(state, cards, targets, effect, unit.uid);
+    }
+  }
+
   function resolvePendingEffectWindow(state, cards, targets, instances, resolveInstance,
                                       candidateLegal = null) {
     if (!instances.length) return;
@@ -4139,7 +4281,10 @@
           effect_kind: effect.kind, effect_tag: effect.effect_tag || null, resolved });
         predecessor = { resolved, changed, kind: effect.kind };
         gatesNext = Boolean(effect.gates_next_effect);
-        if (effect.effect_id && resolved) state.completedEffects.add(effect.effect_id);
+        // 後節が待っている節だけ記録する(Python `resolve_enabler` と同一)。
+        if (effect.b3_followup_id && effect.effect_id && resolved) {
+          state.completedEffects.add(effect.effect_id);
+        }
         if (flushRequiredAfter(instance.clauses, clauseIndex)) {
           const nested = takeGenerated();
           if (nested.length) {
@@ -4208,6 +4353,8 @@
     state.played.add(candidate.card_no);
     state.playCounts[state.turn] = (state.playCounts[state.turn] || 0) + 1;
     beginEffectFrame(state);
+    resolveEventTriggers(state, cards, targets, "ally_summoned",
+      { card_no: candidate.card_no, uid, source: "kourin_from_soul" });
     resolvePlayedEffects(state, cards, targets,
       { ...card, card_no: candidate.card_no }, uid, null);
     record(state, cards, "play_complete", { card_no: candidate.card_no, uid,
@@ -4300,6 +4447,8 @@
     // そのものによる直前のカウント反応は上で既に解決済み。
     if (faraSources) state.countReactionDeferral += 1;
     beginEffectFrame(state);
+    resolveEventTriggers(state, cards, targets, "ally_summoned",
+      { card_no: candidate.card_no, uid: host.uid, source: "kourin" });
     resolvePlayedEffects(state, cards, targets,
       { ...effectCard, card_no: candidate.card_no }, host.uid, null);
     for (let index = 0; index < faraSources; index += 1) {
@@ -4432,6 +4581,10 @@
     const finishPlay = () => {
       beginEffectFrame(state);
       try {
+        // Pythonは`_emit_card_played`で**カード自身の発揮待ちより前に**
+        // 誘発を予約する。順序を合わせるため、ここで先に解く。
+        resolveEventTriggers(state, cards, targets, "ally_summoned",
+          { card_no: candidate.card_no, uid, source: mode });
         // 手札カウント反応で召喚したときの「そうしたとき」節
         // (`hand_reaction_effects`)。Pythonの予約batchと同じく、カード自身の
         // 確定処理の中で解く。
@@ -4489,6 +4642,14 @@
     if (MAIN_STEP_OPPONENTS.has(state)
         && (card.on_play_opponent_effects || []).some((effect) =>
           !(candidate.brave_mode === "spirit" && effect.combine_only))) return true;
+    // 誘発の節を持つ札は、置いた瞬間には何もしないが**場に在ること自体が
+    // 仕事**。Python `collect_playable` と同一。
+    if ((card.triggered_effects || []).length) return true;
+    // 戦闘の窓の見返り(`board`方針)。**戦闘ありの試行でだけ**。
+    // 相手の口(MAIN_STEP_OPPONENTS)で判定しない——先読みのcloneでは消えるので
+    // Pythonと食い違う(2026-09-20に掃検が割れた)。旗なら両方で同じ。
+    if (countsCombatPayoff(state.mainPolicy, state.combat)
+        && boardPayoff(card)) return true;
     if (candidate.card_no === state.flagNo) return true;
     if (card.token_sacrifice_search_bonus) return true;
     return card.token_sacrifice_summon_cost !== null
@@ -4567,7 +4728,8 @@
   const ORACLE_MILL_AMOUNT = 3;
 
   /** 貪欲選択の見積もり。Python `_greedy_play_rest` の yield_amt と同じ数え方。 */
-  function candidateYield(card, braveMode) {
+  function candidateYield(card, braveMode, policy = DEFAULT_MAIN_POLICY,
+                          combat = false) {
     const rows = card.is_brave && braveMode !== "combine"
       ? (card.enablers || []).filter((row) => !row.combine_only)
       : (card.enablers || []);
@@ -4579,14 +4741,18 @@
           : "draw" in row ? row.draw
             : "reveal" in row ? row.reveal : 0;
         return sum + (value === null || value === undefined ? ORACLE_MILL_AMOUNT : value);
-      }, 0);
+      }, 0)
+      // 盤面の見返りは段位とaccess_tierの**後ろ**にしか効かない同点崩し。
+      + greedyYieldBonus(policy, card, combat);
   }
 
   function candidateCompare(state, cards, targets, left, right) {
       const fundingTier = (candidate) => candidate.total <= state.reserve ? 0
         : candidate.total <= reclaimable(state, false, cards) ? 1 : 2;
-      const leftYield = candidateYield(cards[left.card_no], left.brave_mode);
-      const rightYield = candidateYield(cards[right.card_no], right.brave_mode);
+      const leftYield = candidateYield(cards[left.card_no], left.brave_mode,
+        state.mainPolicy, state.combat);
+      const rightYield = candidateYield(cards[right.card_no], right.brave_mode,
+        state.mainPolicy, state.combat);
       return fundingTier(left) - fundingTier(right)
         || accessTier(left.card_no, cards, targets) - accessTier(right.card_no, cards, targets)
         || left.total - right.total || rightYield - leftYield
@@ -4824,6 +4990,8 @@
     // 打点の基準。相手が見えない単独のStage4ではnullのままで、gainは常に0に
     // なる——v56のgoldenはこの変更で動かない(2026-08-23、①)。
     const baselineClock = clockToFinish(state, cards);
+    // 盤面の見返りの基準。`dig`方針では順位に入らない。
+    const baselineBoard = fieldBoardPayoff(state, cards);
     const debugRow = state.choiceDebug ? {
       turn: state.turn, state: choiceState(),
       baseline: { score: baseline, target_playable: baselineTargetPlayable,
@@ -4850,7 +5018,10 @@
       const gain = clockGain(baselineClock, clockToFinish(trial, cards));
       // 打点は掘削の**次**。上に置くとコアが打点へ流れて契約技が撃てなくなる
       // (Python `_search_best_sequence` の但し書きと同じ)。
-      const rank = [score, gain, Number(targetPlayable), policyRank];
+      const rank = playRank(state.mainPolicy, score, gain,
+        playBoardGain(state.mainPolicy, state.combat, baselineBoard,
+          fieldBoardPayoff(trial, cards)),
+        targetPlayable, policyRank);
       if (debugRow) debugRow.candidates.push({
         card_no: candidate.card_no, pay: candidate.pay, total: candidate.total,
         brave_mode: candidate.brave_mode ?? null, setup_only: candidate.setup_only,
@@ -5050,6 +5221,10 @@
     block: "block_effects",
     blocked: "blocked_effects",
     battle_end: "battle_end_effects",
+    // 『このスピリットのアタックによって相手のライフを減らしたとき』。
+    // ライフが実際に減ったかが条件。battle_end はブロックの有無と関係なく
+    // 発揮するので代用できない(Python同一)。
+    life_reduced: "life_reduced_effects",
   };
   const LINKED_KEYS = ["requires_predecessor_changed", "requires_predecessor_id",
     "gates_next_effect", "b3_followup_id", "requires_successful_followup"];
@@ -5844,6 +6019,8 @@
       resolvedBranchEvents: [],
       branchRngs: {},
       combat: Boolean(options.combat),
+      // メインステップの方針。既定は従来どおりの`dig`(Python同一)。
+      mainPolicy: validateMainPolicy(options.main_policy),
       effectWindowSeq: 0,
       // 印字効果ごとの〔ターンに1回〕。**発揮タイミングを跨いで共通**に数える
       // (『煌臨/アタック時』は1つの効果なので合わせてターン1回。Python同一)。
@@ -5979,6 +6156,7 @@
           });
         } else state.burst = cardNo;
         record(state, cards, "burst_set", { card_no: cardNo, source: "rule" });
+        resolveEventTriggers(state, cards, targets, "burst_set", { card_no: cardNo });
         noteLegalCandidates(state, cards, targets);
       }
       resolveMainActivatedEffects(state, cards, targets);
@@ -6261,6 +6439,10 @@
     BURST_OWN_LEFT_FIELD, OBSERVABLE_BURST_CATEGORIES,
     // ⓪の物差し。**正典はここ**で`stage6_sim.js`が引く(2026-08-23、①)。
     turnsToFinish,
+    // Main-step policy ids and table (mirrors Python `stage4_policy`).
+    // Canonical here; the contract builder reads them from this module.
+    MAIN_POLICY_DIG, MAIN_POLICY_BOARD, MAIN_POLICIES, DEFAULT_MAIN_POLICY,
+    validateMainPolicy, boardPayoff,
   };
 })();
 
@@ -6339,6 +6521,7 @@
     "field_flash_resolved",
     "attack_effects_resolved", "block_effects_resolved",
     "blocked_effects_resolved", "battle_end_effects_resolved",
+    "life_reduced_effects_resolved",
     "opponent_end_effect_resolved",
   ]);
   const COMBAT_EVENT_TYPES = new Set([
@@ -6348,6 +6531,9 @@
     "attack_effects_resolved", "block_effects_resolved",
     // 6C: 下位の窓。宣言の窓とは別の時点なので別のイベントで出す。
     "blocked_effects_resolved", "battle_end_effects_resolved",
+    // 『アタックによって相手のライフを減らしたとき』。ライフが実際に減ったかが
+    // 条件なので、battle_end(ブロックの有無と無関係)とは別に出す(Python同一)。
+    "life_reduced_effects_resolved",
     "opponent_end_effect_resolved",
     // 6C-2: セット中バーストを実イベント(いまはライフ減少)で開いた記録。
     "burst_activated",
@@ -6474,6 +6660,9 @@
       stage5c: null,
       combat,
       choice_debug: choiceDebug,
+      // メインステップの方針。契約が既定以外を名乗るときだけ入る
+      // (Python `_start_player` と同一)。
+      main_policy: match.main_policy ?? null,
     }, seeds.deck_shuffle, true);
     return {
       player_id: playerId,
@@ -7313,6 +7502,13 @@
         if (taken) {
           emit("life_damaged", defenderId, { attacker, amount: taken,
             life_before: before, life_after: defenderBoard.life(), reason: "unblocked" });
+          // 『このスピリットのアタックによって相手のライフを減らしたとき』。
+          // **アタックした体だけ**が撃つ(Q23008)。守り手のバーストより先なのは、
+          // **バーストが常に他の派生効果より後に解決される**から——提示は
+          // フラッシュ札と同じ時点だが処理には入らず、誘発を処理した後の盤面で
+          // 依然処理できるなら発動する。Python `_resolve_attack_step` と同一。
+          emitTrigger(emit, attackerBoard, actor, uid, attacker,
+            "life_reduced", defenderBoard);
           burstAfterLifeLoss(emit, defenderId, defenderBoard, attackerBoard);
         }
         emit("battle_resolved", actor, { attacker, blocker: null,
@@ -7623,6 +7819,8 @@
       events,
       // 既定では**キーごと存在しない**。詳細を載せた棋譜だけが名乗る。
       ...(detail ? { detail: DETAIL_LEVEL } : {}),
+      // メインステップの方針も同じ扱い(`policy`＝戦闘の方針とは別の層)。
+      ...(contract.main_policy ? { main_policy: contract.main_policy } : {}),
     };
     return { ...basis, fingerprint: await sha256Hex(basis) };
   }
@@ -7640,6 +7838,8 @@
       "players", "capabilities", "policy", "combat_profiles", "winner", "events",
       "fingerprint",
       ...(detail ? ["detail"] : []),
+      ...(Object.prototype.hasOwnProperty.call(value, "main_policy")
+        ? ["main_policy"] : []),
     ].sort();
     if (stableStringify(Object.keys(value).sort()) !== stableStringify(expected)) {
       throw new Error("Stage6 trace fields are not canonical");
