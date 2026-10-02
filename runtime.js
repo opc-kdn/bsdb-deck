@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v66-v1";
-  const STAGE_VERSION = "v66";
+  const ENGINE_SLICE = "stage4-v67-v1";
+  const STAGE_VERSION = "v67";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v66 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v67 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v66-portable-v14";
+  const RUNTIME_VERSION = "stage4-v67-portable-v15";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -5902,6 +5902,11 @@
       for (const key of RESIST_CONTROLLER_KEYS) {
         if (entry[key] !== undefined) row[key] = entry[key];
       }
+      // 耐性貫通(v67)が見る、耐性の名前と、耐性を与えているカード。
+      if (entry.keyword !== undefined) row.keyword = entry.keyword;
+      const holderCard = cards[holder.card_no] || {};
+      row.granter = { type: holderCard.card_type ?? null,
+        colors: [...(holderCard.colors || [])].sort(), cost: holderCard.cost ?? null };
       if (!active.some((seen) => JSON.stringify(seen) === JSON.stringify(row))) active.push(row);
     }
     return active.length ? { resist: active } : {};
@@ -5973,8 +5978,10 @@
    *  `context`は撃つ側だけが知っていること(v395)。null/undefinedは「分からない」で、
    *  止める側に倒す。 */
   function resistanceBlocks(resistRows, effectKind, sourceType, sourceColors, sourceCost,
-    context = {}) {
+    context = {}, pierces = []) {
     for (const row of resistRows || []) {
+      // 撃つ側の耐性貫通(v67、条件は撃つ側で確かめ済み)。どれかが貫ける行は止めない。
+      if ((pierces || []).some((pierce) => resistancePierced(pierce, row))) continue;
       const kinds = row.kinds;
       if (kinds !== null && kinds !== undefined && !kinds.includes(effectKind)
         && !(effectKind === "unit_bounce" && kinds.includes("unit_bounce_hand")
@@ -6009,6 +6016,42 @@
     return false;
   }
 
+  /** 撃つ側の貫通が、この耐性の行を無視できるか。Python `resistance_pierced`と同一。
+   *  行の`keyword`は耐性の名前、`granter`は耐性を与えているカード。 */
+  function resistancePierced(pierce, row) {
+    const keyword = row.keyword ?? null;
+    if (pierce.except_keywords && pierce.except_keywords.includes(keyword)) return false;
+    if (pierce.keyword_contains !== undefined
+      && !(keyword && keyword.includes(pierce.keyword_contains))) return false;
+    if (pierce.except_keyword_contains !== undefined
+      && keyword && keyword.includes(pierce.except_keyword_contains)) return false;
+    const granter = row.granter || {};
+    if (pierce.granter_colors
+      && !pierce.granter_colors.some((color) => (granter.colors || []).includes(color))) {
+      return false;
+    }
+    if (pierce.granter_types
+      && !pierce.granter_types.some((word) => (granter.type || "").includes(word))) {
+      return false;
+    }
+    if (pierce.granter_cost_max !== undefined
+      && (granter.cost === null || granter.cost === undefined
+        || granter.cost > pierce.granter_cost_max)) return false;
+    return true;
+  }
+
+  /** この効果の耐性貫通のうち、印字の条件を今満たすもの(v67)。Python `_active_pierces`と同一。 */
+  function activePierces(state, cards, effect, sourceUnit) {
+    return (effect.pierce || []).filter((pierce) => {
+      if (pierce.count_min !== undefined && pierce.count_min !== null
+        && state.count < pierce.count_min) return false;
+      if (pierce.state_conditions && pierce.state_conditions.length
+        && !stateConditionsMet(pierce.state_conditions, state, cards,
+          sourceUnit ? sourceUnit.uid : null)) return false;
+      return true;
+    });
+  }
+
   /** 相手の行が、この効果を耐性で受けないか。Python `_resisted`と同一。 */
   function resisted(state, cards, row, effect, sourceUid) {
     if (!row.resist) return false;
@@ -6029,7 +6072,8 @@
     return resistanceBlocks(row.resist, effect.kind,
       source ? (source.card_type ?? null) : null,
       source ? [...(source.colors || [])].sort() : null,
-      source ? (source.cost ?? null) : null, context);
+      source ? (source.cost ?? null) : null, context,
+      activePierces(state, cards, effect, sourceUnit));
   }
 
   /** アタック／ブロックの候補になり得る自分のユニット。Python `_combat_units` と同一。
