@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v67-v1";
-  const STAGE_VERSION = "v67";
+  const ENGINE_SLICE = "stage4-v68-v1";
+  const STAGE_VERSION = "v68";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v67 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v68 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v67-portable-v15";
+  const RUNTIME_VERSION = "stage4-v68-portable-v16";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -751,6 +751,8 @@
     "burst_free_play_self", "burst_return_self_to_hand", "burst_pay_own_effect",
     "unit_destroy", "unit_exhaust", "unit_core_remove", "unit_bounce",
     "unit_heavy_exhaust", "unit_bp_down", "life_core_remove", "field_core_remove",
+    // 【毒刃】(2026-10-02)。
+    "poison_blade", "reserve_core_remove", "soul_core_remove",
   ]);
 
   // Stage 5C-2A opponent branches. Keep every name and rule identical to the
@@ -1403,6 +1405,9 @@
     const board = state.combatOpponent;
     const opponentUnits = (board && typeof board.units === "function")
       ? board.units().length : null;
+    // 相手の体ごとの下のカードの枚数(【毒刃】の参照、公開情報)。Python同一。
+    const opponentUnderCounts = (board && typeof board.units === "function")
+      ? board.units().map((row) => row.under_count || 0) : null;
     return conditions.every((condition) => {
       if (condition.kind === "symbol_present") return (symbols[condition.color] || 0) > 0;
       if (condition.kind === "life_threshold") {
@@ -1412,6 +1417,10 @@
       if (condition.kind === "sealed") return Boolean(state.lifeHasSoul);
       if (condition.kind === "opponent_unit_max") {
         return opponentUnits !== null && opponentUnits <= condition.value;
+      }
+      if (condition.kind === "opponent_under_present") {
+        return opponentUnderCounts !== null
+          && opponentUnderCounts.some((count) => count >= condition.min_cards);
       }
       // 手札の**枚数**は公開情報。相手の枚数は盤面が結ばれていないと読めない。
       // Python `state_conditions_met` の`hand_counts`と同一。
@@ -1485,9 +1494,16 @@
   }
 
   function effectActive(effect, state, cards, sourceUid) {
-    if (effect.required_level !== null && effect.required_level !== undefined) {
+    // 印字のLv(下限`required_level`と見出しの並び`levels`、2026-10-02)。
+    // Python `enabler_level_met` と同一。
+    const hasLevels = Array.isArray(effect.levels) && effect.levels.length;
+    if ((effect.required_level !== null && effect.required_level !== undefined) || hasLevels) {
       const source = state.field.find((unit) => unit.uid === sourceUid);
-      if (!source || levelFor(source, cards) < effect.required_level) return false;
+      if (!source) return false;
+      const level = levelFor(source, cards);
+      if (effect.required_level !== null && effect.required_level !== undefined
+        && level < effect.required_level) return false;
+      if (hasLevels && !effect.levels.includes(level)) return false;
     }
     return countRequirementsMet(effect.count_requirements, state.count)
       // 印字の対価（「〜することで」）。払えない節は撃てない。
@@ -2057,11 +2073,13 @@
     if (kourinWaiverOk(card, state, cards, destination)) {
       return reclaimable(state, false, cards) >= (card.maintenance || 0);
     }
-    if (!(state.reserveHasSoul || (state.lifeHasSoul && destination !== "life"))) {
+    const fromField = !state.reserveHasSoul
+      && !(state.lifeHasSoul && destination !== "life") && Boolean(soulFieldHolder(state));
+    if (!(state.reserveHasSoul || (state.lifeHasSoul && destination !== "life") || fromField)) {
       return false;
     }
     const available = state.reserve - (state.reserveHasSoul ? 1 : 0)
-      + reclaimable(state, false, cards) - state.reserve;
+      + reclaimable(state, false, cards) - state.reserve - (fromField ? 1 : 0);
     return available >= (card.maintenance || 0);
   }
 
@@ -2154,10 +2172,20 @@
     return options;
   }
 
+  /** ソウルコアが乗っている場の体のうち、取り出しても維持コアを割らないもの。
+   *  支払いは場のどのカードのコアからでも盛り込める(2026-10-02)。煌臨先が先。
+   *  Python `_soul_field_holder` と同一。 */
+  function soulFieldHolder(state, prefer = null) {
+    const ordered = [...(prefer ? [prefer] : []),
+      ...[...state.field].sort((left, right) => left.uid - right.uid)];
+    return ordered.find((unit) => unit && unit.soul_core && !unit.waiting
+      && unit.cores > unit.floor) || null;
+  }
+
   function kourinSoulSource(state, host, destination) {
     if (state.reserveHasSoul) return "reserve";
     if (state.lifeHasSoul && destination !== "life") return "life";
-    if (host?.soul_core && !host.waiting && host.cores > host.floor) return "field";
+    if (soulFieldHolder(state, host)) return "field";
     return null;
   }
 
@@ -2213,6 +2241,13 @@
       ? kourinBaseSegment(stack, state.bugNo) : [];
     state.field.splice(state.field.indexOf(unit), 1);
     state.recurring = state.recurring.filter((entry) => entry.uid !== unit.uid);
+    // 【毒刃】で下に置かれたカードは、場を離れるとき破棄する(Python同一)。
+    if ((unit.under_cards || []).length) {
+      const under = [...unit.under_cards];
+      state.trashCards.push(...under);
+      record(state, cards, "under_cards_discarded", { card_no: unit.card_no,
+        uid: unit.uid, cards: under });
+    }
     // 魂状態(ルール)。Python `_finalize_field_leave` と同一——**フィールドを
     // 離れていない**扱いなので行き先へ動かさず、『離れた後』の引き金も起こさない
     // (Q10096・Q10318)。契約煌臨元の置き換えは別ルールなので、その枝では触らない。
@@ -2523,6 +2558,8 @@
           exhausted: Boolean(unit.exhausted),
           heavy_exhausted: Boolean(unit.heavy_exhausted),
         } : {}),
+        // 【毒刃】の下のカードの枚数(あるときだけ、Python同一)。
+        ...((unit.under_cards || []).length ? { under_count: unit.under_cards.length } : {}),
       }); }))(staticSymbolBonuses(state, cards, "main")),
       reserve: state.reserve, trash: state.spent, life: state.life,
       soul_location: soulLocation, count: state.count, mirage: state.mirage, burst: state.burst,
@@ -3481,6 +3518,35 @@
       if (!board) return false;
       return Boolean(board.damage_life(amount, effect.core_destination || "reserve"));
     }
+    if (effect.kind === "reserve_core_remove") {
+      // 相手のリザーブのコアN個(すべて)をトラッシュへ(2026-10-02、Python同一)。
+      const board = state.combatOpponent;
+      if (!board || typeof board.remove_reserve_cores !== "function") return false;
+      return Boolean(board.remove_reserve_cores(effect.amount,
+        effect.core_destination || "trash"));
+    }
+    if (effect.kind === "soul_core_remove") {
+      // 相手の[ソウルコア]を名指しでトラッシュへ(BS50-X02)。体の上なら耐性で止まる。
+      // Python `_resolve_soul_core_remove` と同一。
+      const board = state.combatOpponent;
+      if (!board || typeof board.soul_holder !== "function") return false;
+      const holder = board.soul_holder();
+      if (holder === null || holder === undefined) return false;
+      if (holder !== "reserve") {
+        const row = board.field().find((entry) => entry.uid === holder);
+        if (!row || resisted(state, cards, row, effect, sourceUid)) return false;
+      }
+      return Boolean(board.remove_soul_core(effect.core_destination || "trash"));
+    }
+    if (effect.kind === "poison_blade") {
+      // 【毒刃：N】相手のデッキの上からN枚を裏向きで相手の体1体の下に置く(2026-10-02)。
+      // 置く先は狙える体の並びの先頭。Python `_resolve_poison_blade` と同一。
+      const board = state.combatOpponent;
+      if (!board || typeof board.place_under !== "function") return false;
+      const rows = combatTargetRows(state, cards, effect, sourceUid);
+      if (!rows.length) return false;
+      return board.place_under(rows[0].uid, effect.cards) > 0;
+    }
     if (["unit_destroy", "unit_exhaust", "unit_core_remove", "unit_bounce",
       "unit_heavy_exhaust", "unit_bp_down"].includes(effect.kind)) {
       // 相手盤面への干渉(6B-3)。対象の選び方は**決定論的**でなければ両ランタイムが
@@ -3488,6 +3554,27 @@
       // Python `_combat_pick_targets` と同一。
       const board = state.combatOpponent;
       if (!board) return false;
+      if (effect.kind === "unit_destroy" && effect.move_under_to_other) {
+        // BS27-078(裁定Q2244)。下にカードがある体を対象にし、枚数が足りるときだけ
+        // 破壊する。下のカードは先に他の体へ移す。Python
+        // `_resolve_destroy_and_move_under` と同一。
+        if (typeof board.move_under !== "function") return false;
+        const need = effect.target_under_min || 1;
+        const candidates = combatTargetRows(
+          state, cards, { ...effect, target_under_min: 1 }, sourceUid);
+        if (!candidates.length) return false;
+        candidates.sort((left, right) =>
+          Number((left.under_count || 0) < need) - Number((right.under_count || 0) < need)
+          || (right.under_count || 0) - (left.under_count || 0));
+        const target = candidates[0];
+        const destroy = (target.under_count || 0) >= need;
+        const others = board.units().filter((other) => other.uid !== target.uid
+          && !resisted(state, cards, other, effect, sourceUid))
+          .sort(COMBAT_TARGET_ORDERS.bp_desc);
+        const moved = others.length ? board.move_under(target.uid, others[0].uid) : 0;
+        const destroyed = destroy && Boolean(board.destroy(target.uid, "effect"));
+        return Boolean(moved || destroyed);
+      }
       const rows = combatTargetRows(state, cards, effect, sourceUid);
       if (!rows.length) return false;
       if (effect.kind === "unit_core_remove") {
@@ -4195,8 +4282,9 @@
       state.life -= 1;
       state.lifeHasSoul = false;
     } else if (source === "field") {
-      host.cores -= 1;
-      host.soul_core = false;
+      const holder = soulFieldHolder(state, host);
+      holder.cores -= 1;
+      holder.soul_core = false;
     } else return false;
     if (destination === "life") {
       state.life += 1;
@@ -4595,9 +4683,32 @@
     }
   }
 
+  /** 召喚時効果のLvに届くよう、リザーブの通常コアを置く(2026-10-02)。
+   *  Python `_raise_level_for_on_play` と同一。 */
+  function raiseLevelForOnPlay(state, cards, card, uid) {
+    const unit = state.field.find((row) => row.uid === uid);
+    if (!unit || unit.waiting) return;
+    const thresholds = card.level_thresholds || {};
+    const level = levelFor(unit, cards);
+    const wanted = [
+      ...(card.enablers || []).filter((effect) => effect.mode === "on_play"),
+      ...(card.on_play_opponent_effects || []),
+    ].filter((effect) => Array.isArray(effect.levels) && effect.levels.length
+      && !effect.levels.includes(level) && Math.min(...effect.levels) > level)
+      .map((effect) => Math.min(...effect.levels));
+    if (!wanted.length) return;
+    const need = (thresholds[Math.min(...wanted)] || 0) - unit.cores;
+    if (need <= 0 || state.reserve - Number(state.reserveHasSoul) < need) return;
+    state.reserve -= need;
+    unit.cores += need;
+    recordCoreMove(state, cards, { amount: need, source: "reserve", destination: "field",
+      reason: "on_play_level", target_uid: uid });
+  }
+
   function resolvePlayedEffects(state, cards, targets, card, uid, braveMode,
                                 soulCoreUsedForSummonCost = false,
                                 watcherUnits = []) {
+    raiseLevelForOnPlay(state, cards, card, uid);
     const opponent = MAIN_STEP_OPPONENTS.get(state) || null;
     for (const effect of card.on_play_opponent_effects || []) {
       if (braveMode === "spirit" && effect.combine_only) continue;
@@ -5626,6 +5737,238 @@
   const FIELD_LEAVING_REMOVAL_KINDS = new Set(["unit_destroy", "unit_bounce"]);
   // 残した除去が相手のターンで1体止める見返り(暫定)。Python `REMOVAL_HOLD_VALUE`。
   const REMOVAL_HOLD_VALUE = 2;
+  // ソウルコアの置き場所(2026-10-02)の重み。整数で持つ(浮動小数は棋譜のJSONでPythonと
+  // 割れる)。Python `SOUL_THREAT_WEIGHTS` ほかと同一。
+  const SOUL_THREAT_WEIGHTS = { field: 2, trash: 1 };
+  const SOUL_GUARD_LIFE_WEIGHT = 2;
+  const SOUL_LOSS_WEIGHT = 2;
+  const SOUL_POSITION_THREAT_KINDS = new Set(["unit_destroy", "unit_bounce",
+    "unit_core_remove", "field_core_remove", "reserve_core_remove", "soul_core_remove"]);
+
+  /** 相手の除去(`removal_threats`の1件)がこの体を対象に取れるか。耐性は見ない。
+   *  Python `removal_threat_reaches` と同一。 */
+  function removalThreatReaches(threat, row) {
+    const types = threat.target_types || [];
+    if (types.length && !types.some((word) => (row.card_type || "").endsWith(word))) {
+      return false;
+    }
+    for (const [key, field] of [["target_bp_max", "bp"], ["target_cost_max", "cost"],
+      ["target_symbols_max", "symbol_count"], ["target_cores_max", "cores"]]) {
+      if (threat[key] !== null && threat[key] !== undefined && row[field] > threat[key]) {
+        return false;
+      }
+    }
+    if (threat.target_cores_min !== null && threat.target_cores_min !== undefined
+      && row.cores < threat.target_cores_min) return false;
+    if (threat.target_under_min !== null && threat.target_under_min !== undefined
+      && (row.under_count || 0) < threat.target_under_min) return false;
+    if (threat.target_state === "exhausted" && !row.exhausted) return false;
+    if (threat.target_state === "refreshed" && row.exhausted) return false;
+    if (threat.target_soul_core !== null && threat.target_soul_core !== undefined
+      && Boolean(row.soul_core) !== threat.target_soul_core) return false;
+    return true;
+  }
+
+  /** 相手のターンにこちらへ届きうる公開情報の効果(場＋トラッシュ)。
+   *  Python `_combat_removal_threats` と同一。 */
+  function combatRemovalThreats(state, cards) {
+    const threats = [];
+    const seen = new Set();
+    const add = (effect, source, cardNo, uid) => {
+      if (!SOUL_POSITION_THREAT_KINDS.has(effect.kind)) return;
+      const card = cards[cardNo];
+      const row = { source, card_no: cardNo, kind: effect.kind,
+        amount: effect.amount ?? null,
+        core_destination: effect.core_destination ?? null,
+        source_type: card.card_type ?? null,
+        source_colors: [...(card.colors || [])].sort(),
+        source_cost: card.cost ?? null,
+        bounce_destination: effect.bounce_destination ?? null,
+        pierce: [...(effect.pierce || [])] };
+      for (const key of ["target_types", "target_bp_max", "target_cost_max",
+        "target_symbols_max", "target_cores_min", "target_cores_max",
+        "target_state", "target_soul_core", "target_under_min"]) {
+        row[key] = effect[key] ?? null;
+      }
+      for (const [key, field] of [["target_bp_max", "bp"], ["target_cost_max", "cost"],
+        ["target_symbols_max", "symbol_count"]]) {
+        if (effect[`${key}_ref`] !== "self") continue;
+        const value = combatSelfStat(state, cards, uid, field);
+        if (value === null || value === undefined) return;
+        row[key] = row[key] === null ? value : Math.min(row[key], value);
+      }
+      const key = JSON.stringify(row);
+      if (!seen.has(key)) {
+        seen.add(key);
+        threats.push(row);
+      }
+    };
+    for (const unit of [...state.field].sort((left, right) => left.uid - right.uid)) {
+      if (unit.waiting) continue;
+      const card = cards[unit.card_no] || {};
+      for (const family of ["attack_effects", "field_flash_effects"]) {
+        for (const effect of card[family] || []) add(effect, "field", unit.card_no, unit.uid);
+      }
+    }
+    for (const cardNo of [...new Set(state.trashCards)].sort()) {
+      const card = cards[cardNo];
+      if (!card || !(card.card_type || "").includes("マジック")) continue;
+      for (const effect of card.on_play_opponent_effects || []) {
+        add(effect, "trash", cardNo, null);
+      }
+    }
+    return threats;
+  }
+
+  /** ソウルコアの在りか(公開情報): "reserve"、体のuid、無ければnull。
+   *  Python `_combat_soul_holder` と同一。 */
+  function soulHolder(state) {
+    if (state.reserveHasSoul) return "reserve";
+    const unit = [...state.field].sort((left, right) => left.uid - right.uid)
+      .find((row) => row.soul_core && !row.waiting);
+    return unit ? unit.uid : null;
+  }
+
+  /** ソウルコアをtargetへ動かす(メインステップ)。体の上からはリザーブの通常コアと
+   *  入れ替えて体のコア数を保つ。Python `_move_soul_to` と同一。 */
+  function moveSoulTo(state, target) {
+    const holder = soulHolder(state);
+    if (holder === null || holder === target) return null;
+    const moves = [];
+    if (holder === "reserve") {
+      state.reserve -= 1;
+      state.reserveHasSoul = false;
+    } else {
+      const unit = state.field.find((row) => row.uid === holder);
+      if (state.reserve - Number(state.reserveHasSoul) > 0) {
+        state.reserve -= 1;
+        moves.push(["reserve", "field", null, holder, "soul_position_swap"]);
+      } else if (unit.cores - 1 < unit.floor) {
+        return null;
+      } else {
+        unit.cores -= 1;
+      }
+      unit.soul_core = false;
+    }
+    if (target === "reserve") {
+      state.reserve += 1;
+      state.reserveHasSoul = true;
+      moves.push(["field", "reserve", holder, null, "soul_position"]);
+    } else {
+      const unit = state.field.find((row) => row.uid === target);
+      unit.cores += 1;
+      unit.soul_core = true;
+      moves.push([holder === "reserve" ? "reserve" : "field", "field",
+        holder === "reserve" ? null : holder, target, "soul_position"]);
+    }
+    return moves;
+  }
+
+  /** ソウルコアをどこに置いてターンを終えるか(2026-10-02、利用者指摘「攻防の要」)。
+   *  Python `_soul_position_plan` と同一。 */
+  function soulPositionPlan(state, cards, attackStep) {
+    const board = MAIN_STEP_OPPONENTS.get(state);
+    if (!board || !board.removal_threats) return null;
+    const current = soulHolder(state);
+    if (current === null) return null;
+    const threats = board.removal_threats();
+    const opponentTurnUse = flashKourinOptions(state, cards, "opponent")
+      .some((option) => option.payment === "soul_core");
+    const blockers = board.units().filter((row) => !row.exhausted).length;
+    const opponentLife = board.life();
+    const through = (trial) => {
+      if (!attackStep) return 0;
+      return combatUnits(trial, cards)
+        .filter((row) => row.can_attack !== false && !row.exhausted)
+        .map((row) => row.symbol_count).sort((left, right) => right - left)
+        .slice(blockers).reduce((sum, value) => sum + value, 0);
+    };
+    const context = (threat) => ({ own_turn: true,
+      bounce_to_hand: threat.kind === "unit_bounce"
+        ? (threat.bounce_destination || "hand") === "hand" : null });
+    const blocked = (row, threat) => resistanceBlocks(row.resist, threat.kind,
+      threat.source_type, threat.source_colors, threat.source_cost, context(threat),
+      threat.pierce);
+    const candidates = ["reserve", ...[...state.field]
+      .filter((unit) => !unit.waiting).sort((left, right) => left.uid - right.uid)
+      .map((unit) => unit.uid)];
+    const measured = new Map();
+    for (const target of candidates) {
+      const trial = clone(state);
+      trial.trace = false;
+      trial.events = [];
+      if (target !== current && moveSoulTo(trial, target) === null) continue;
+      measured.set(target, {
+        through: through(trial),
+        rows: new Map(combatFieldRows(trial, cards).map((row) => [row.uid, row])),
+        ordinaryReserve: trial.reserve - Number(trial.reserveHasSoul),
+      });
+    }
+    if (!measured.has(current)) return null;
+    const base = measured.get("reserve") || measured.get(current);
+    const plans = [];
+    for (const [target, trial] of measured) {
+      let guard = 0;
+      let risk = 0;
+      const stopped = [];
+      const risky = [];
+      const row = target !== "reserve" ? trial.rows.get(target) : null;
+      const before = target !== "reserve" ? base.rows.get(target) : null;
+      for (const threat of threats) {
+        const weight = SOUL_THREAT_WEIGHTS[threat.source];
+        const kind = threat.kind;
+        if (row && FIELD_LEAVING_REMOVAL_KINDS.has(kind)) {
+          if (before && removalThreatReaches(threat, row) && blocked(row, threat)
+            && !blocked(before, threat)) {
+            stopped.push(threat.card_no);
+            guard = Math.max(guard, row.symbol_count * weight);
+          }
+          continue;
+        }
+        let takesSoul = false;
+        if (kind === "soul_core_remove") {
+          takesSoul = !row || !blocked(row, threat);
+        } else if (target === "reserve" && kind === "reserve_core_remove") {
+          takesSoul = threat.amount === "all" || threat.amount > trial.ordinaryReserve;
+        } else if (row && (kind === "unit_core_remove" || kind === "field_core_remove")) {
+          const reaches = kind === "field_core_remove" || removalThreatReaches(threat, row);
+          takesSoul = reaches && threat.core_destination === "trash"
+            && !blocked(row, threat) && (threat.amount || 0) > row.cores - 1;
+        }
+        if (takesSoul) {
+          risky.push(threat.card_no);
+          risk = Math.max(risk, weight * SOUL_LOSS_WEIGHT);
+        }
+      }
+      if (!opponentTurnUse) risk = 0;
+      const loss = Math.max(0, base.through - trial.through) * SOUL_GUARD_LIFE_WEIGHT;
+      const lethal = base.through >= opponentLife && opponentLife > trial.through;
+      plans.push({ target,
+        card_no: target !== "reserve"
+          ? state.field.find((unit) => unit.uid === target).card_no : null,
+        score: lethal ? null : guard - loss - risk,
+        guard_value: guard, loss, risk,
+        threats: [...new Set([...stopped, ...risky])].sort() });
+    }
+    const here = plans.find((plan) => plan.target === current);
+    let best = here;
+    for (const plan of plans) {
+      if (plan.score !== null && (best.score === null || plan.score > best.score)) best = plan;
+    }
+    if (!plans.some((plan) => plan.guard_value || plan.risk || plan.loss
+      || (plan.target !== current && plan === best))) return null;
+    return { ...best, from: current, moved: best.target !== current,
+      reason: best.target === current ? "stay" : (best.guard_value ? "guard" : "safety") };
+  }
+
+  /** 選んだ場所へ実際に動かし、`core_moved`を書く。Python `_apply_soul_position` と同一。 */
+  function applySoulPosition(state, cards, plan) {
+    for (const [source, destination, sourceUid, targetUid, reason]
+      of moveSoulTo(state, plan.target) || []) {
+      recordCoreMove(state, cards, { amount: 1, source, destination, reason,
+        source_uid: sourceUid, target_uid: targetUid });
+    }
+  }
 
   /** フラッシュの除去を相手のターン用に残すか。Python `_removal_hold_plan` と同一。
    *  全焼きできる・今撃たないと負けるなら今撃つ(`reason`が`hold`以外)。 */
@@ -5776,6 +6119,8 @@
           ban.levels.includes(levelFor(unit, cards))
           && stateConditionsMet(ban.state_conditions, state, cards, unit.uid)))
         ? { can_attack: false } : {}),
+      // 【毒刃】の下のカードの枚数(公開情報、あるときだけ。Python同一)。
+      ...((unit.under_cards || []).length ? { under_count: unit.under_cards.length } : {}),
     };
   }
 
@@ -5790,6 +6135,10 @@
     "unit_destroy", "unit_exhaust", "unit_core_remove",
     "unit_bounce", "unit_heavy_exhaust", "unit_bp_down",
     "life_core_remove", "field_core_remove",
+    // 【毒刃】(2026-10-02、Python同一)。
+    "poison_blade",
+    // 相手のリザーブのコア・ソウルコアの名指しをトラッシュへ(2026-10-02、Python同一)。
+    "reserve_core_remove", "soul_core_remove",
   ]);
   // 戦闘の窓と、そのIRの置き場所。Python `stage4_conditions.COMBAT_WINDOW_KEYS`
   // と**同じ表**でなければならない(片側にだけ窓を足すと、その窓の節を一方だけが
@@ -5860,6 +6209,8 @@
           floor: unit.floor,
           // 今効いている耐性(v66、Python `_active_resistances`)。耐性があるカードだけ。
           ...activeResistances(state, cards, unit),
+          // 【毒刃】の下のカードの枚数(公開情報、あるときだけ)。
+          ...((unit.under_cards || []).length ? { under_count: unit.under_cards.length } : {}),
         };
       });
   }
@@ -5956,6 +6307,9 @@
       const coresMax = effect.target_cores_max;
       if (coresMin !== null && coresMin !== undefined && row.cores < coresMin) return false;
       if (coresMax !== null && coresMax !== undefined && row.cores > coresMax) return false;
+      // 「カードが(N枚以上、)下にある相手の〜」(【毒刃】)。Python同一。
+      if (effect.target_under_min !== null && effect.target_under_min !== undefined
+        && (row.under_count || 0) < effect.target_under_min) return false;
       // 疲労は既に疲労しているものを対象にしない。
       if (effect.kind === "unit_exhaust" && row.exhausted) return false;
       // コア除去はコアを持たないものを対象にしない。
@@ -6294,9 +6648,11 @@
       remove_cores: (uid, amount, destination) => {
         const unit = state.field.find((row) => row.uid === uid);
         if (!unit || amount <= 0) return 0;
-        const taken = Math.min(amount, unit.cores);
-        if (taken <= 0) return 0;
         const ordinary = unit.cores - Number(Boolean(unit.soul_core));
+        // ソウルコアは効果でボイドに置かれない(Python同一)。
+        const taken = destination === "void"
+          ? Math.min(amount, unit.cores, ordinary) : Math.min(amount, unit.cores);
+        if (taken <= 0) return 0;
         if (unit.soul_core && taken > ordinary) {
           unit.soul_core = false;
           if (destination === "reserve") state.reserveHasSoul = true;
@@ -6405,10 +6761,84 @@
       // 戻り値は**カードがトラッシュに置かれたか**("trash"/"other")。バーストの
       // 「消滅/破壊後」はトラッシュに置かれたときだけ発動できる(SD52-012・
       // CB24-X06の裁定)。Python `_combat_destroy` と同一。
+      // 相手の効果で自分のリザーブのコアを取られる。どれを出すかは取られる側が選ぶ
+      // ので通常コアから出す。Python `_combat_remove_reserve_cores` と同一。
+      remove_reserve_cores: (amount, destination = "trash") => {
+        const ordinary = state.reserve - Number(state.reserveHasSoul);
+        let wanted = amount === "all" ? state.reserve : Math.min(Number(amount), state.reserve);
+        if (destination === "void") wanted = Math.min(wanted, ordinary);
+        if (wanted <= 0) return 0;
+        if (state.reserveHasSoul && wanted > ordinary) {
+          state.reserveHasSoul = false;
+          if (destination === "trash") state.trashHasSoul = true;
+        }
+        state.reserve -= wanted;
+        if (destination === "trash") state.spent += wanted;
+        recordCoreMove(state, cards, { amount: wanted, source: "reserve", destination,
+          reason: "reserve_core_remove" });
+        return wanted;
+      },
+      // ソウルコアの在りか(公開情報)。Python `_combat_soul_holder` と同一。
+      soul_holder: () => soulHolder(state),
+      remove_soul_core: (destination = "trash") => {
+        const holder = soulHolder(state);
+        if (holder === null || destination === "void") return false;
+        let unit = null;
+        if (holder === "reserve") {
+          state.reserve -= 1;
+          state.reserveHasSoul = false;
+        } else {
+          unit = state.field.find((row) => row.uid === holder);
+          unit.cores -= 1;
+          unit.soul_core = false;
+        }
+        if (destination === "trash") {
+          state.spent += 1;
+          state.trashHasSoul = true;
+        } else {
+          state.reserve += 1;
+          state.reserveHasSoul = true;
+        }
+        recordCoreMove(state, cards, { amount: 1,
+          source: holder === "reserve" ? "reserve" : "field", destination,
+          reason: "soul_core_remove", source_uid: holder === "reserve" ? null : holder });
+        if (unit && unit.cores < unit.floor) board.destroy(unit.uid, "effect");
+        return true;
+      },
+      removal_threats: () => combatRemovalThreats(state, cards),
+      // 【毒刃】: 自分のデッキの上から裏向きで自分の体の下へ置く／下のカードを
+      // 別の体へ移す。Python `_combat_place_under`／`_combat_move_under` と同一。
+      place_under: (uid, count) => {
+        const unit = state.field.find((row) => row.uid === uid);
+        if (!unit || unit.waiting) return 0;
+        const placed = [];
+        for (let index = 0; index < count && state.deck.length; index += 1) {
+          observeDeckExit(state, state.deck.at(-1), state.deck.length);
+          placed.push(state.deck.pop());
+        }
+        if (placed.length) {
+          unit.under_cards = [...(unit.under_cards || []), ...placed];
+          record(state, cards, "under_cards_placed", { card_no: unit.card_no, uid,
+            count: placed.length });
+        }
+        return placed.length;
+      },
+      move_under: (fromUid, toUid) => {
+        const source = state.field.find((row) => row.uid === fromUid);
+        const target = state.field.find((row) => row.uid === toUid);
+        if (!source || !target || !(source.under_cards || []).length) return 0;
+        const moved = source.under_cards;
+        delete source.under_cards;
+        target.under_cards = [...(target.under_cards || []), ...moved];
+        record(state, cards, "under_cards_moved", { card_no: source.card_no, uid: fromUid,
+          target_uid: toUid, count: moved.length });
+        return moved.length;
+      },
       destroy: (uid, cause) => {
         const unit = state.field.find((row) => row.uid === uid);
         if (!unit) return null;
-        const before = state.trashCards.length;
+        // 【毒刃】の下のカードも場を離れるとき破棄されるので数えない(Python同一)。
+        const before = state.trashCards.length + (unit.under_cards || []).length;
         // 場を離れる境界へ委譲する。以前はここに独自実装を置いていたが、
         // **契約煌臨元の置き換えを通らない**ぶんPython(`_finalize_field_leave`へ
         // 委譲)と食い違っていた。破壊が効果から撃てるようになって初めて届く
@@ -6429,9 +6859,12 @@
         // 自傷と違い**ライフ0まで削れる**(そこが勝敗の分かれ目そのもの)。
         const protectedAmount = lifeDamageAfterProtection(
           state, Math.max(amount, 0), attacker);
-        const taken = Math.min(Math.max(protectedAmount, 0), state.life);
-        if (taken <= 0) return 0;
         const ordinary = state.life - Number(Boolean(state.lifeHasSoul));
+        // ソウルコアは効果でボイドに置かれない(Python同一)。
+        const taken = destination === "void"
+          ? Math.min(Math.max(protectedAmount, 0), state.life, ordinary)
+          : Math.min(Math.max(protectedAmount, 0), state.life);
+        if (taken <= 0) return 0;
         if (state.lifeHasSoul && taken > ordinary) {
           state.lifeHasSoul = false;
           // ボイドへ行った魂コアはどちらの追跡フラグも立てない(コア除去と同じ規則)。
@@ -7098,6 +7531,23 @@
         playOutMainStep(state, cards, targets, (held ? holdPlan.cost : 0) + removalFloor,
           heldCards);
       }
+      // メインステップの最後にLvを上げる(2026-10-02、Python同一)。アタック時効果の
+      // Lvはここで揃える。
+      if (state.combat && !(options.going_first && turn === 1)) {
+        allocateEndTurnLevelCores(state, cards, targets);
+      }
+      // ソウルコアの置き場所(2026-10-02、Python同一)。アタックステップの前に決める。
+      const position = state.combat
+        ? soulPositionPlan(state, cards, !(options.going_first && turn === 1)) : null;
+      if (position) {
+        record(state, cards, "soul_position", {
+          from: position.from, to: position.target, card_no: position.card_no,
+          moved: position.moved, reason: position.reason,
+          guard_value: position.guard_value, loss: position.loss, risk: position.risk,
+          threats: position.threats,
+        });
+        if (position.moved) applySoulPosition(state, cards, position);
+      }
       // ⑥アタックステップ。先攻1ターン目には存在しない(公式 page05)。解決は
       // Stage6が行う——相手の盤面が要るのでこの試行の中では決められない。
       // 位置はPython側と同じ「メインの後・ターン末のrecurringより前」。
@@ -7379,7 +7829,7 @@
   // v8: 宣言する前に「宣言したら誰が退くか」を一度解いて巻き戻し、その事実を
   // 見積もり3箇所(attackReason/attackOrder/stepDamageThrough)へ配る。相手にも
   // 同じ先読みを与える。相手の伏せたバーストは開かない(Python同一)。
-  const COMBAT_POLICY = "combat-victory-plan-v10";
+  const COMBAT_POLICY = "combat-victory-plan-v11";
   const PLAYER_IDS = ["self", "opponent"];
   const CAPABILITIES = Object.freeze({
     dual_deck_execution: true,
@@ -7490,6 +7940,9 @@
     "burst_hold",
     // フラッシュの除去を相手のターン用に残すかの判断(2026-10-01、Python同一)。
     "removal_hold",
+    "soul_position",
+    // 【毒刃】の下のカード(2026-10-02): 置いた・移した・場を離れて破棄した。
+    "under_cards_placed", "under_cards_moved", "under_cards_discarded",
     // 印字の対価（「〜することで」）を払った記録。Python同一。
     "payment",
   ]);
