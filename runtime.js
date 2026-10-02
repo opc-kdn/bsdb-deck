@@ -3488,61 +3488,8 @@
       // Python `_combat_pick_targets` と同一。
       const board = state.combatOpponent;
       if (!board) return false;
-      const types = effect.target_types || [];
-      // 自己参照の閾値はここで束縛する。literalと併記されたら**厳しいほう**を採り、
-      // 発揮元が場から消えていて値が取れないなら緩めるのではなく撃たない。
-      // Python `_combat_pick_targets` と同一。
-      const tighten = (literal, refKey, statKey) => {
-        if (effect[refKey] !== "self") return literal;
-        const value = combatSelfStat(state, cards, sourceUid, statKey);
-        if (value === null || value === undefined) return NaN;
-        return (literal === null || literal === undefined)
-          ? value : Math.min(literal, value);
-      };
-      const bpMax = tighten(effect.target_bp_max, "target_bp_max_ref", "bp");
-      const costMax = tighten(effect.target_cost_max, "target_cost_max_ref", "cost");
-      const symbolsMax = tighten(
-        effect.target_symbols_max, "target_symbols_max_ref", "symbol_count");
-      if (Number.isNaN(bpMax) || Number.isNaN(costMax) || Number.isNaN(symbolsMax)) {
-        return false;
-      }
-      const rows = board.field().filter((row) => {
-        if (resisted(state, cards, row, effect, sourceUid)) return false;
-        if (types.length && !types.some((word) => (row.card_type || "").endsWith(word))) {
-          return false;
-        }
-        if (bpMax !== null && bpMax !== undefined && row.bp > bpMax) return false;
-        if (costMax !== null && costMax !== undefined && row.cost > costMax) return false;
-        // 「回復状態の」は疲労も重疲労もしていないもの。「疲労状態の」は重疲労を
-        // **含む**(重疲労は疲労を含む状態なのでexhaustedも立つ)。
-        if (effect.target_state === "exhausted" && !row.exhausted) return false;
-        if (effect.target_state === "refreshed" && row.exhausted) return false;
-        // 「[ソウルコア]が置かれている相手のスピリット」「置かれていない〜」。
-        // 印字が言っていなければ不問(null)。Python `target_soul_core` と同一。
-        if (effect.target_soul_core !== null && effect.target_soul_core !== undefined
-            && Boolean(row.soul_core) !== effect.target_soul_core) return false;
-        if (symbolsMax !== null && symbolsMax !== undefined
-            && row.symbol_count > symbolsMax) return false;
-        const coresMin = effect.target_cores_min;
-        const coresMax = effect.target_cores_max;
-        if (coresMin !== null && coresMin !== undefined && row.cores < coresMin) return false;
-        if (coresMax !== null && coresMax !== undefined && row.cores > coresMax) return false;
-        // 疲労は既に疲労しているものを対象にしない。
-        if (effect.kind === "unit_exhaust" && row.exhausted) return false;
-        // コア除去はコアを持たないものを対象にしない。
-        if (effect.kind === "unit_core_remove" && !(row.cores > 0)) return false;
-        // 重疲労は既に重疲労のものを対象にしない(疲労しているだけなら有効)。
-        if (effect.kind === "unit_heavy_exhaust" && row.heavy_exhausted) return false;
-        return true;
-      });
+      const rows = combatTargetRows(state, cards, effect, sourceUid);
       if (!rows.length) return false;
-      rows.sort(COMBAT_TARGET_ORDERS[effect.target_order || "bp_desc"]);
-      // 手順2・4のフラッシュの除去で先に狙う体(2026-10-01、Python `preferred_targets`)。
-      const preferred = state.preferredTargets || [];
-      if (preferred.length) {
-        rows.sort((left, right) => Number(!preferred.includes(left.uid))
-          - Number(!preferred.includes(right.uid)));
-      }
       if (effect.kind === "unit_core_remove") {
         // amountは**1体あたりのコア数**なので、対象は1体だけ選ぶ。
         return Boolean(board.remove_cores(
@@ -5228,6 +5175,8 @@
       // 6C-3: 残す方針のときは、払った後の原資がその額を割るプレイを候補から
       // 外す。**合法性ではなく方針**なので`legalCandidates`は動かさない。
       if (state.burstHoldFloor && !leavesBurstHold(state, cards, candidate.total)) return [];
+      // 相手のターン用に残すと決めたフラッシュの除去は出さない(Python同一)。
+      if ((state.heldRemoval || []).includes(candidate.card_no)) return [];
       const card = cards[candidate.card_no];
       const active = hasActiveEffect(card, candidate, state);
       if (active) return [{ ...candidate, setup_only: false }];
@@ -5655,8 +5604,9 @@
 
   /** メインステップのプレイを最後まで進める。`floor`は6C-3の残す額。
    *  Python `_play_out_main_step` と同一。 */
-  function playOutMainStep(state, cards, targets, floor) {
+  function playOutMainStep(state, cards, targets, floor, held = []) {
     state.burstHoldFloor = floor;
+    state.heldRemoval = held;
     try {
       while (true) {
         const candidate = chooseCandidate(state, cards, targets);
@@ -5667,7 +5617,63 @@
       }
     } finally {
       state.burstHoldFloor = 0;
+      state.heldRemoval = [];
     }
+  }
+
+  // フラッシュの除去のうち相手の体を場から退かせる種類。Python
+  // `FIELD_LEAVING_REMOVAL_KINDS` と同一。
+  const FIELD_LEAVING_REMOVAL_KINDS = new Set(["unit_destroy", "unit_bounce"]);
+  // 残した除去が相手のターンで1体止める見返り(暫定)。Python `REMOVAL_HOLD_VALUE`。
+  const REMOVAL_HOLD_VALUE = 2;
+
+  /** フラッシュの除去を相手のターン用に残すか。Python `_removal_hold_plan` と同一。
+   *  全焼きできる・今撃たないと負けるなら今撃つ(`reason`が`hold`以外)。 */
+  function removalHoldPlan(state, cards) {
+    const board = MAIN_STEP_OPPONENTS.get(state);
+    if (!board) return null;
+    // 場に残るマジックも他の除去と同じく比べる(■の効果は未実装、Python同一)。
+    const options = flashRemovalOptions(state, cards);
+    if (!options.length) return null;
+    const cardNos = [...new Set(options.map((row) => row.card_no))].sort();
+    const cost = Math.min(...options.map((row) => row.cost));
+    const previous = state.combatOpponent || null;
+    state.combatOpponent = board;
+    const covers = [];
+    const reachable = new Set();
+    try {
+      for (const cardNo of cardNos) {
+        const removed = new Set();
+        for (const effect of cards[cardNo].on_play_opponent_effects || []) {
+          if (!FIELD_LEAVING_REMOVAL_KINDS.has(effect.kind)) continue;
+          const every = combatTargetRows(state, cards, effect, null);
+          every.slice(0, effect.amount).forEach((row) => removed.add(row.uid));
+          every.forEach((row) => reachable.add(row.uid));
+        }
+        covers.push(removed);
+      }
+    } finally {
+      state.combatOpponent = previous;
+    }
+    const units = board.units();
+    if (units.length && covers.some((removed) => units.every((row) => removed.has(row.uid)))) {
+      return { cards: cardNos, cost, reason: "wipe" };
+    }
+    const attackers = units.filter((row) => row.can_attack !== false);
+    const blockers = combatUnits(state, cards).length;
+    const threat = (rows) => rows.map((row) => row.symbol_count)
+      .sort((left, right) => right - left).slice(blockers)
+      .reduce((sum, value) => sum + value, 0);
+    const stoppable = attackers.filter((row) => reachable.has(row.uid))
+      .sort((left, right) => right.symbol_count - left.symbol_count || left.uid - right.uid);
+    const heldThreat = threat(attackers.filter(
+      (row) => !stoppable.length || row.uid !== stoppable[0].uid));
+    const spentThreat = Math.min(...covers.map(
+      (removed) => threat(attackers.filter((row) => !removed.has(row.uid)))));
+    if (heldThreat >= state.life && state.life > spentThreat) {
+      return { cards: cardNos, cost, reason: "lethal_now" };
+    }
+    return { cards: cardNos, cost, reason: "hold" };
   }
 
   function allocateEndTurnLevelCores(state, cards, targets) {
@@ -5899,6 +5905,68 @@
       if (!active.some((seen) => JSON.stringify(seen) === JSON.stringify(row))) active.push(row);
     }
     return active.length ? { resist: active } : {};
+  }
+
+  /** 相手の場から、この効果の対象になる体を決定論的に並べる(読むだけ)。
+   *  Python `_combat_pick_targets(limit=False)` と同一。撃てないときは空。 */
+  function combatTargetRows(state, cards, effect, sourceUid) {
+    const board = state.combatOpponent;
+    if (!board) return [];
+    const types = effect.target_types || [];
+    // 自己参照の閾値はここで束縛する。literalと併記されたら**厳しいほう**を採り、
+    // 発揮元が場から消えていて値が取れないなら緩めるのではなく撃たない。
+    // Python `_combat_pick_targets` と同一。
+    const tighten = (literal, refKey, statKey) => {
+      if (effect[refKey] !== "self") return literal;
+      const value = combatSelfStat(state, cards, sourceUid, statKey);
+      if (value === null || value === undefined) return NaN;
+      return (literal === null || literal === undefined)
+        ? value : Math.min(literal, value);
+    };
+    const bpMax = tighten(effect.target_bp_max, "target_bp_max_ref", "bp");
+    const costMax = tighten(effect.target_cost_max, "target_cost_max_ref", "cost");
+    const symbolsMax = tighten(
+      effect.target_symbols_max, "target_symbols_max_ref", "symbol_count");
+    if (Number.isNaN(bpMax) || Number.isNaN(costMax) || Number.isNaN(symbolsMax)) {
+      return [];
+    }
+    const rows = board.field().filter((row) => {
+      if (resisted(state, cards, row, effect, sourceUid)) return false;
+      if (types.length && !types.some((word) => (row.card_type || "").endsWith(word))) {
+        return false;
+      }
+      if (bpMax !== null && bpMax !== undefined && row.bp > bpMax) return false;
+      if (costMax !== null && costMax !== undefined && row.cost > costMax) return false;
+      // 「回復状態の」は疲労も重疲労もしていないもの。「疲労状態の」は重疲労を
+      // **含む**(重疲労は疲労を含む状態なのでexhaustedも立つ)。
+      if (effect.target_state === "exhausted" && !row.exhausted) return false;
+      if (effect.target_state === "refreshed" && row.exhausted) return false;
+      // 「[ソウルコア]が置かれている相手のスピリット」「置かれていない〜」。
+      // 印字が言っていなければ不問(null)。Python `target_soul_core` と同一。
+      if (effect.target_soul_core !== null && effect.target_soul_core !== undefined
+          && Boolean(row.soul_core) !== effect.target_soul_core) return false;
+      if (symbolsMax !== null && symbolsMax !== undefined
+          && row.symbol_count > symbolsMax) return false;
+      const coresMin = effect.target_cores_min;
+      const coresMax = effect.target_cores_max;
+      if (coresMin !== null && coresMin !== undefined && row.cores < coresMin) return false;
+      if (coresMax !== null && coresMax !== undefined && row.cores > coresMax) return false;
+      // 疲労は既に疲労しているものを対象にしない。
+      if (effect.kind === "unit_exhaust" && row.exhausted) return false;
+      // コア除去はコアを持たないものを対象にしない。
+      if (effect.kind === "unit_core_remove" && !(row.cores > 0)) return false;
+      // 重疲労は既に重疲労のものを対象にしない(疲労しているだけなら有効)。
+      if (effect.kind === "unit_heavy_exhaust" && row.heavy_exhausted) return false;
+      return true;
+    });
+    rows.sort(COMBAT_TARGET_ORDERS[effect.target_order || "bp_desc"]);
+    // 手順2・4のフラッシュの除去で先に狙う体(2026-10-01、Python `preferred_targets`)。
+    const preferred = state.preferredTargets || [];
+    if (preferred.length) {
+      rows.sort((left, right) => Number(!preferred.includes(left.uid))
+        - Number(!preferred.includes(right.uid)));
+    }
+    return rows;
   }
 
   /** 相手の効果(種類・出どころ)が耐性に止められるか。Python `resistance_blocks`と同一。
@@ -6740,6 +6808,8 @@
       // 6C-3の「見送りの価値」。0以外のときは、払った後もこの数だけ原資が残る
       // プレイだけを方針が選ぶ。Python `burst_hold_floor` と同一。
       burstHoldFloor: 0,
+      // 相手のターン用に残すフラッシュの除去。Python `held_removal`。
+      heldRemoval: [],
       // 発動したバーストは行き先が決まるまでバーストゾーンで**表向き**
       // (Python `burst_open` と同一)。裏向きのセットとは別枠。
       burstOpen: null,
@@ -6929,19 +6999,51 @@
       // 相手が踏まなければ0点のままで、その二値は近似でしかない。
       // Python `_burst_hold_candidate` 以下と同一。
       const holdPlan = burstHoldCandidate(state, cards);
+      // フラッシュの除去を相手のターン用に残すか(2026-10-01、Python同一)。
+      const removalPlan = state.combat ? removalHoldPlan(state, cards) : null;
+      let heldCards = [];
+      let removalFloor = 0;
+      if (removalPlan) {
+        let held = false;
+        let spendScore = null;
+        let holdScore = null;
+        if (removalPlan.reason === "hold") {
+          const spendTrial = clone(state);
+          spendTrial.trace = false;
+          spendTrial.events = [];
+          playOutMainStep(spendTrial, cards, targets, 0);
+          spendScore = spendTrial.dig + spendTrial.handGain;
+          const holdTrial = clone(state);
+          holdTrial.trace = false;
+          holdTrial.events = [];
+          playOutMainStep(holdTrial, cards, targets, removalPlan.cost, removalPlan.cards);
+          holdScore = holdTrial.dig + holdTrial.handGain;
+          held = spendScore - holdScore < REMOVAL_HOLD_VALUE;
+        }
+        record(state, cards, "removal_hold", {
+          cards: removalPlan.cards, cost: removalPlan.cost, held,
+          reason: removalPlan.reason !== "hold" ? removalPlan.reason
+            : (held ? "hold" : "tempo"),
+          spend_score: spendScore, hold_score: holdScore,
+        });
+        if (held) {
+          heldCards = removalPlan.cards;
+          removalFloor = removalPlan.cost;
+        }
+      }
       if (!holdPlan) {
-        playOutMainStep(state, cards, targets, 0);
+        playOutMainStep(state, cards, targets, removalFloor, heldCards);
       } else {
         const spendTrial = clone(state);
         spendTrial.trace = false;
         spendTrial.events = [];
-        playOutMainStep(spendTrial, cards, targets, 0);
+        playOutMainStep(spendTrial, cards, targets, removalFloor, heldCards);
         const spendScore = spendTrial.dig + spendTrial.handGain
           + burstFollowupGain(spendTrial, cards, targets, holdPlan);
         const holdTrial = clone(state);
         holdTrial.trace = false;
         holdTrial.events = [];
-        playOutMainStep(holdTrial, cards, targets, holdPlan.cost);
+        playOutMainStep(holdTrial, cards, targets, holdPlan.cost + removalFloor, heldCards);
         const holdScore = holdTrial.dig + holdTrial.handGain
           + burstFollowupGain(holdTrial, cards, targets, holdPlan);
         const held = holdScore > spendScore;
@@ -6949,7 +7051,8 @@
           card_no: holdPlan.card_no, cost: holdPlan.cost, held,
           spend_score: spendScore, hold_score: holdScore,
         });
-        playOutMainStep(state, cards, targets, held ? holdPlan.cost : 0);
+        playOutMainStep(state, cards, targets, (held ? holdPlan.cost : 0) + removalFloor,
+          heldCards);
       }
       // ⑥アタックステップ。先攻1ターン目には存在しない(公式 page05)。解決は
       // Stage6が行う——相手の盤面が要るのでこの試行の中では決められない。
@@ -7232,7 +7335,7 @@
   // v8: 宣言する前に「宣言したら誰が退くか」を一度解いて巻き戻し、その事実を
   // 見積もり3箇所(attackReason/attackOrder/stepDamageThrough)へ配る。相手にも
   // 同じ先読みを与える。相手の伏せたバーストは開かない(Python同一)。
-  const COMBAT_POLICY = "combat-victory-plan-v9";
+  const COMBAT_POLICY = "combat-victory-plan-v10";
   const PLAYER_IDS = ["self", "opponent"];
   const CAPABILITIES = Object.freeze({
     dual_deck_execution: true,
@@ -7341,6 +7444,8 @@
     // 書く**——「方針が働いて出し切りを選んだ」のと「判断の入口にすら来ていない」
     // のは別の話で、後者は何も出ない。
     "burst_hold",
+    // フラッシュの除去を相手のターン用に残すかの判断(2026-10-01、Python同一)。
+    "removal_hold",
     // 印字の対価（「〜することで」）を払った記録。Python同一。
     "payment",
   ]);
