@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v71-v1";
-  const STAGE_VERSION = "v71";
+  const ENGINE_SLICE = "stage4-v72-v1";
+  const STAGE_VERSION = "v72";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v71 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v72 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v71-portable-v19";
+  const RUNTIME_VERSION = "stage4-v72-portable-v20";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -743,6 +743,8 @@
     "hand_filter", "core_to_trash", "life_core_move", "token_spawn",
     "creator_core_transfer", "driving_force", "zone_summon",
     "exchange", "reveal_play_remainder", "face_up_top_cycle",
+    // 自己反応の続き(「そうしたとき、…」、2026-10-03)。
+    "creator_core_gain", "hand_to_deck_bottom",
   ]);
   // Python `resolve_burst_effects`が実際に解ける語彙と同一。以前は資源系だけを
   // 列挙していたため、実行系には実装済みの相手盤面干渉でも共有HTMLが入口で拒否した。
@@ -835,6 +837,13 @@
       for (const effect of card.enablers || []) {
         if (!SUPPORTED_EFFECTS.has(effect.kind)) {
           unsupported.push(`${definition.card_no}:${effect.kind}`);
+        }
+      }
+      for (const reaction of [...(card.trash_reactions || []), ...(card.open_reactions || [])]) {
+        for (const effect of reaction.followups || []) {
+          if (!SUPPORTED_EFFECTS.has(effect.kind)) {
+            unsupported.push(`${definition.card_no}:followup-${effect.kind}`);
+          }
         }
       }
     }
@@ -2999,7 +3008,7 @@
     return collected;
   }
 
-  function resolveTrashReaction(state, cards, effect) {
+  function resolveTrashReaction(state, cards, targets, effect) {
     const cardNo = effect.card_no;
     const index = state.trashCards.indexOf(cardNo);
     if (index < 0) return false;
@@ -3009,17 +3018,59 @@
     if (limit === "once_per_turn_card"
         && (state.trashReactionCardUses[cardNo] || 0)
           >= (state.deckCopies[cardNo] || 0)) return false;
-    state.trashCards.splice(index, 1);
-    state.hand.push(cardNo);
-    state.handGain += 1;
     if (limit === "once_per_turn_name") state.trashReactionNames.add(name);
     else if (limit === "once_per_turn_card") {
       state.trashReactionCardUses[cardNo] =
         (state.trashReactionCardUses[cardNo] || 0) + 1;
     }
-    record(state, cards, "card_moved", { card_no: cardNo, destination: "hand",
-      reason: "trash_reaction", source_card_no: effect.source_card_no });
+    // 手札に加えず続きだけを解く形(BS74-086、Python同一)。
+    if (effect.reaction.destination !== "stay") {
+      state.trashCards.splice(index, 1);
+      state.hand.push(cardNo);
+      state.handGain += 1;
+      record(state, cards, "card_moved", { card_no: cardNo, destination: "hand",
+        reason: "trash_reaction", source_card_no: effect.source_card_no });
+    }
+    resolveReactionFollowups(state, cards, targets, effect.reaction);
     return true;
+  }
+
+  /** 自己反応の続き(「そうしたとき、…」)。Python `_resolve_reaction_followups`と同一。 */
+  function resolveReactionFollowups(state, cards, targets, reaction) {
+    for (const clause of reaction.followups || []) resolveEffect(state, cards, targets, clause, null);
+  }
+
+  function creatorCoreRoom(state, cards, unit) {
+    const cap = (cards[unit.card_no]?.enablers || [])
+      .map((effect) => effect.core_cap).find((value) => value !== null && value !== undefined);
+    return cap === undefined ? Infinity : Math.max(0, cap - unit.cores);
+  }
+
+  /** 「自分の(赤1色の)創界神ネクサス1つにコア+N」。1個ずつ置ける最小uidへ。
+   *  Python `_resolve_creator_core_gain`と同一。 */
+  function resolveCreatorCoreGain(state, cards, effect) {
+    const slot = effect.slot || {};
+    let placed = 0;
+    for (let index = 0; index < (effect.amount || 0); index += 1) {
+      const target = [...state.field].sort((left, right) => left.uid - right.uid).find((unit) => {
+        const card = cards[unit.card_no] || {};
+        const colors = card.colors || [];
+        return !unit.waiting && unit.creator_core && (card.card_type || "").includes("ネクサス")
+          && (!(slot.color_any || []).length
+            || slot.color_any.some((color) => colors.includes(color)))
+          && (!(slot.color_exact || []).length
+            || (slot.color_exact.length === colors.length
+              && slot.color_exact.every((color) => colors.includes(color))))
+          && creatorCoreRoom(state, cards, unit) > 0;
+      });
+      if (!target) break;
+      target.cores += 1;
+      placed += 1;
+      recordCoreMove(state, cards, { amount: 1, source: "void", destination: "field",
+        reason: "creator_core_gain", source_card_no: effect.source_card_no,
+        target_uid: target.uid });
+    }
+    return placed > 0;
   }
 
   function openReactionMatches(reaction, sourceCardNo, cards) {
@@ -3028,8 +3079,14 @@
     if (reaction.source_color && !(source.colors || []).includes(reaction.source_color)) return false;
     if ((reaction.source_lineages || []).length
         && !reaction.source_lineages.some((value) => (source.lineages || []).includes(value))) return false;
-    return !reaction.source_name_contains
-      || (source.name || "").includes(reaction.source_name_contains);
+    if (reaction.source_name_contains
+        && !(source.name || "").includes(reaction.source_name_contains)) return false;
+    // 「系統：「A」/「B」と「C」を持つ」は組ごと、「スピリットの効果」「創界神ネクサスの
+    // 「X」の効果」は種類も絞る(Python `open_reaction_source_matches`と同一)。
+    if ((reaction.source_lineage_groups || []).some((group) =>
+      !group.some((value) => (source.lineages || []).includes(value)))) return false;
+    return !reaction.source_card_type
+      || (source.card_type || "").includes(reaction.source_card_type);
   }
 
   /** ルール行動でセットする1枚を数える節。Python `burst_effect_is_useful` と同一。
@@ -3138,6 +3195,7 @@
         state.hand.push(cardNo);
         state.seen.add(cardNo);
         state.handGain += 1;
+        resolveReactionFollowups(state, cards, targets, reaction);
         resolved = true;
       } else if (reaction.destination === "field") {
         if (total) {
@@ -3705,6 +3763,22 @@
       if (!effect.draw_first) draw(state, cards, effect.draw || 0, "hand_filter");
       if (effect.draw_per_discard) draw(state, cards, ordered.length * effect.draw_per_discard, "hand_filter");
       return true;
+    }
+    if (effect.kind === "creator_core_gain") return resolveCreatorCoreGain(state, cards, effect);
+    if (effect.kind === "hand_to_deck_bottom") {
+      // 戻す札は手札破棄と同じ選び方(Python `_resolve_hand_to_deck_bottom`と同一)。
+      if (!state.hand.length) return false;
+      const chosen = chooseHandDiscards(
+        state, cards, targets, Math.min(effect.amount || 0, state.hand.length), false);
+      for (const cardNo of chosen) state.hand.splice(state.hand.indexOf(cardNo), 1);
+      state.deck.unshift(...chosen);
+      noteDeckPlacement(state, chosen, "bottom");
+      if (chosen.length) {
+        record(state, cards, "cards_returned_to_deck", { cards: chosen,
+          destination: "bottom", order: "bottom_to_top", reason: "hand_to_deck_bottom",
+          source_card_no: effect.source_card_no });
+      }
+      return chosen.length > 0;
     }
     if (effect.kind === "core_to_trash") {
       state.spent += amount;
@@ -5043,7 +5117,7 @@
         const effect = instance.clauses[0];
         record(state, cards, "effect_start", { card_no: effect.card_no, uid: null,
           effect_kind: "trash_reaction", source_card_no: effect.source_card_no });
-        const resolved = resolveTrashReaction(state, cards, effect);
+        const resolved = resolveTrashReaction(state, cards, targets, effect);
         record(state, cards, "effect_complete", { card_no: effect.card_no, uid: null,
           effect_kind: "trash_reaction", source_card_no: effect.source_card_no, resolved });
         return [];
