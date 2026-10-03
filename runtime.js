@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v68-v1";
-  const STAGE_VERSION = "v68";
+  const ENGINE_SLICE = "stage4-v69-v1";
+  const STAGE_VERSION = "v69";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v68 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v69 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v68-portable-v16";
+  const RUNTIME_VERSION = "stage4-v69-portable-v17";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1054,19 +1054,21 @@
    *
    *  `discardAll`は手札の**並び順そのまま**返す(段で並べ替えない)。捨てる集合は
    *  同じでも、トラッシュに積まれる順が変わると以降の回収がずれる。 */
-  function chooseHandDiscards(state, cards, targets, amount, discardAll) {
-    return chooseDiscardsFromPool(cards, targets, state.hand, amount, discardAll);
+  function chooseHandDiscards(state, cards, targets, amount, discardAll, prefer = null) {
+    return chooseDiscardsFromPool(cards, targets, state.hand, amount, discardAll, prefer);
   }
 
   /** Python `choose_hand_discards` と同一。**手札そのものとは限らない**
    *  ——印字の対価（「自分の手札にある紫のカード1枚を破棄することで」）は
    *  絞り込み済みの候補から選ぶので、同じ順位付けを共有できるよう
-   *  プール側を引数にしてある。 */
-  function chooseDiscardsFromPool(cards, targets, pool, amount, discardAll) {
+   *  プール側を引数にしてある。`prefer`は破棄されると出られる札
+   *  （`discard_summons`、2026-10-03）で、手札に残すより先に捨てる。 */
+  function chooseDiscardsFromPool(cards, targets, pool, amount, discardAll, prefer = null) {
     if (discardAll) return [...pool];
-    const keepRank = (cardNo) => (targets.has(cardNo) ? 0
-      : accessTier(cardNo, cards, targets) <= 1 ? 1
-        : (cards[cardNo] || {}).is_free_defense ? 2 : 3);
+    const keepRank = (cardNo) => (prefer?.has(cardNo) ? 4
+      : targets.has(cardNo) ? 0
+        : accessTier(cardNo, cards, targets) <= 1 ? 1
+          : (cards[cardNo] || {}).is_free_defense ? 2 : 3);
     return pool
       .map((cardNo, index) => ({ cardNo, index, rank: keepRank(cardNo) }))
       .sort((left, right) => right.rank - left.rank || right.index - left.index)
@@ -1679,7 +1681,10 @@
       const count = paymentCount(payment, candidates.length);
       if (count === null || (kind === "hand_set_burst" && count < 1)) return null;
       return { cards: chooseDiscardsFromPool(
-        cards, targets, candidates, count, payment.amount === "all") };
+        cards, targets, candidates, count, payment.amount === "all",
+        kind === "hand_discard"
+          ? discardSummonReady(state, cards, discardSourceCardNo(state, effect, sourceUid))
+          : null) };
     }
     if (kind === "self_core_trash") {
       const amount = Number(payment.amount || 1);
@@ -1761,9 +1766,10 @@
     const reason = `payment_${kind}`;
     state.lastPaymentCount = (plan.cards || []).length;
     for (const cardNo of plan.cards || []) {
+      // 破棄は記録の後にまとめて（割り込んで出る札があるため。Python同一）。
+      if (kind === "hand_discard") continue;
       state.hand.splice(state.hand.indexOf(cardNo), 1);
-      if (kind === "hand_discard") state.trashCards.push(cardNo);
-      else if (kind === "hand_to_side") {
+      if (kind === "hand_to_side") {
         state.sideCards.push(cardNo);
         if (payment.side_playable) state.sidePlayable.push(cardNo);
       } else if (!setBurst(state, cards, targets, cardNo, "effect")) {
@@ -1774,6 +1780,10 @@
     if ((plan.cards || []).length) {
       record(state, cards, "payment", { kind, cards: [...plan.cards],
         source_card_no: effect.source_card_no, source_uid: sourceUid ?? null });
+    }
+    if (kind === "hand_discard") {
+      discardHandCards(state, cards, targets, plan.cards || [],
+        discardSourceCardNo(state, effect, sourceUid));
     }
     if (plan.donor) {
       plan.donor.cores -= plan.amount;
@@ -3673,11 +3683,9 @@
       if (effect.draw_first) draw(state, cards, effect.draw || 0, "hand_filter");
       const discard = effect.discard_all ? state.hand.length : Math.min(effect.discard || 0, state.hand.length);
       const ordered = chooseHandDiscards(
-        state, cards, targets, discard, Boolean(effect.discard_all));
-      for (const cardNo of ordered) {
-        state.hand.splice(state.hand.indexOf(cardNo), 1);
-        state.trashCards.push(cardNo);
-      }
+        state, cards, targets, discard, Boolean(effect.discard_all),
+        discardSummonReady(state, cards, effect.source_card_no));
+      discardHandCards(state, cards, targets, ordered, effect.source_card_no);
       if (!effect.draw_first) draw(state, cards, effect.draw || 0, "hand_filter");
       if (effect.draw_per_discard) draw(state, cards, ordered.length * effect.draw_per_discard, "hand_filter");
       return true;
@@ -4228,6 +4236,13 @@
 
   function flushCountReactions(state, cards, targets) {
     if (state.countReactionDeferral > 0) return;
+    // 「破棄されたとき」(`discard_summons`)。Pythonでは同じ`runtime.reserve`の列に
+    // 乗る。元効果の中では破棄がカウント増より先に起きる(「破棄したとき、
+    // カウント+1」)ので、こちらを先に流す。
+    while (state.pendingDiscardSummons.length) {
+      const pending = state.pendingDiscardSummons.shift();
+      resolveDiscardSummonAfter(state, cards, targets, pending.card_no, pending.entry);
+    }
     while (state.pendingCountEvents.length) {
       const payload = state.pendingCountEvents.shift();
       if (state.burst) {
@@ -4265,7 +4280,8 @@
    * 後ろへ入る。Workerも「現在待っているカウント反応を収集→同じ深度の
    * プレイ成立時効果を順に解決」を繰り返し、親効果の途中へ割り込ませない。 */
   function flushDerivedPlayReactions(state, cards, targets) {
-    while (state.pendingCountEvents.length || state.deferredPlayCompletions.length) {
+    while (state.pendingCountEvents.length || state.pendingDiscardSummons.length
+           || state.deferredPlayCompletions.length) {
       flushCountReactions(state, cards, targets);
       while (state.deferredPlayCompletions.length) {
         state.deferredPlayCompletions.shift()();
@@ -4327,33 +4343,125 @@
         zones[zoneName].forEach((cardNo, index) => {
           const candidate = cards[cardNo];
           if (!candidate || cardMatchesSlot(candidate, effect.slot) !== true) return;
-          if (!summonConditionsMet(candidate, state, cards)) return;
-          const mode = braveMode(candidate, state, cards);
           const pay = Number(effect.pay || 0);
-          const total = mode === "combine" ? pay : pay + (candidate.maintenance || 0);
-          // 自分の場を壊してまでは出さない(Python同一)。
-          if (total > reclaimable(state, false, cards)) return;
-          choices.push({ cardNo, zoneName, zoneRank, index, mode, pay, total,
-            tier: accessTier(cardNo, cards, targets), cost: candidate.cost || 0 });
+          const plan = effectSummonPlan(state, cards, cardNo, pay);
+          if (!plan) return;
+          choices.push({ cardNo, zoneName, zoneRank, index, mode: plan.mode, pay,
+            total: plan.total, tier: accessTier(cardNo, cards, targets),
+            cost: candidate.cost || 0 });
         });
       });
       if (!choices.length) break;
       choices.sort((left, right) => left.tier - right.tier || right.cost - left.cost
         || left.zoneRank - right.zoneRank || left.index - right.index);
       const selected = choices[0];
-      record(state, cards, "effect_free_summon_declared", { card_no: selected.cardNo,
-        source: selected.zoneName, source_card_no: effect.source_card_no,
-        brave_mode: selected.mode, printed_cost_waived: selected.pay === 0,
-        pay: selected.pay });
-      play(state, cards, targets, { card_no: selected.cardNo, pay: selected.pay,
-        total: selected.total, maintenance: cards[selected.cardNo].maintenance || 0,
-        brave_mode: selected.mode, allow_sacrifice: false, mode: "normal",
-        manifestation_creator_uid: null, source_zone_name: selected.zoneName,
-        derived_play: true });
+      effectSummon(state, cards, targets, selected.cardNo, selected.zoneName,
+        selected.pay, selected.mode, selected.total, effect.source_card_no);
       summoned += 1;
       if (effect.amount !== "any" || summoned >= 10) break;
     }
     return summoned > 0;
+  }
+
+  /** 効果で出す1枚の {mode, total}。出せなければ null。Python `_effect_summon_plan`と同一
+   *  （`zone_summon`と`discard_summons`で共有）。 */
+  function effectSummonPlan(state, cards, cardNo, pay) {
+    const candidate = cards[cardNo];
+    if (!candidate || !summonConditionsMet(candidate, state, cards)) return null;
+    const mode = braveMode(candidate, state, cards);
+    const total = mode === "combine" ? pay : pay + (candidate.maintenance || 0);
+    // 自分の場を壊してまでは出さない(Python同一)。
+    if (total > reclaimable(state, false, cards)) return null;
+    return { mode, total };
+  }
+
+  /** 効果で1枚出す。Python `_effect_summon`と同一。召喚時効果は親の窓の後
+   *  （`derived_play`）。`trigger`は破棄から出たときだけ棋譜へ足す。 */
+  function effectSummon(state, cards, targets, cardNo, zoneName, pay, mode, total,
+                        sourceCardNo, trigger = null) {
+    record(state, cards, "effect_free_summon_declared", { card_no: cardNo,
+      source: zoneName, source_card_no: sourceCardNo,
+      brave_mode: mode, printed_cost_waived: pay === 0, pay,
+      ...(trigger ? { trigger } : {}) });
+    return play(state, cards, targets, { card_no: cardNo, pay, total,
+      maintenance: cards[cardNo].maintenance || 0,
+      brave_mode: mode, allow_sacrifice: false, mode: "normal",
+      manifestation_creator_uid: null, source_zone_name: zoneName,
+      derived_play: true });
+  }
+
+  /** 破棄した効果の出どころ。節が持たなければ発揮元のカード。
+   *  Python `_discard_source_card_no`と同一。 */
+  function discardSourceCardNo(state, effect, sourceUid) {
+    if (effect.source_card_no) return effect.source_card_no;
+    const unit = state.field.find((row) => row.uid === sourceUid);
+    return unit ? unit.card_no : null;
+  }
+
+  /** 手札の札が、この破棄で出られるなら`discard_summons`の項目。
+   *  Python `_discard_summon_entry`と同一。 */
+  function discardSummonEntry(state, cards, cardNo, sourceCardNo, window) {
+    return (cards[cardNo]?.discard_summons || []).find((entry) =>
+      entry.window === window
+      && openReactionMatches(entry, sourceCardNo, cards)
+      && discardSummonConditionsMet(state, cards, entry)) || null;
+  }
+
+  /** カウント条件と「自分の◯◯があれば」（場のユニット。魂状態は数えない）。
+   *  Python `_discard_summon_conditions_met`と同一。 */
+  function discardSummonConditionsMet(state, cards, entry) {
+    if (!countRequirementsMet(entry.count_requirements, state.count)) return false;
+    return (entry.own_present_slots || []).every((slot) => state.field.some((unit) =>
+      !unit.waiting && cardMatchesSlot(cards[unit.card_no], slot) === true));
+  }
+
+  /** この破棄で出られる手札の札。Python `_discard_summon_ready`と同一。 */
+  function discardSummonReady(state, cards, sourceCardNo) {
+    const ready = new Set();
+    for (const cardNo of state.hand) {
+      for (const window of ["replace", "after"]) {
+        const entry = discardSummonEntry(state, cards, cardNo, sourceCardNo, window);
+        if (entry && effectSummonPlan(state, cards, cardNo, entry.pay)) ready.add(cardNo);
+      }
+    }
+    return ready;
+  }
+
+  /** 手札の札を破棄する。Python `_discard_hand_cards`と同一。
+   *  「破棄されるとき、トラッシュに置くかわりに」は割り込んで手札から出る。
+   *  「破棄されたとき」はトラッシュへ置き、元効果の後
+   *  （`flushCountReactions`、Pythonの`runtime.reserve`と同じ境界）に出す。
+   *  〔重複不可〕は同じ処理の中で同名1回。 */
+  function discardHandCards(state, cards, targets, cardNos, sourceCardNo) {
+    const firedNames = new Set();
+    const usable = (cardNo, entry) => entry
+      && !(entry.limit === "no_duplicate" && firedNames.has(cards[cardNo].name));
+    for (const cardNo of cardNos) {
+      let entry = discardSummonEntry(state, cards, cardNo, sourceCardNo, "replace");
+      const plan = usable(cardNo, entry) ? effectSummonPlan(state, cards, cardNo, entry.pay) : null;
+      if (plan) {
+        firedNames.add(cards[cardNo].name);
+        effectSummon(state, cards, targets, cardNo, "hand", entry.pay, plan.mode,
+          plan.total, cardNo, "discard_replacement");
+        continue;
+      }
+      state.hand.splice(state.hand.indexOf(cardNo), 1);
+      state.trashCards.push(cardNo);
+      entry = discardSummonEntry(state, cards, cardNo, sourceCardNo, "after");
+      if (!usable(cardNo, entry)) continue;
+      firedNames.add(cards[cardNo].name);
+      state.pendingDiscardSummons.push({ card_no: cardNo, entry });
+    }
+  }
+
+  /** 「破棄されたとき」をトラッシュから解く。Python `_resolve_discard_summon_after`と同一。 */
+  function resolveDiscardSummonAfter(state, cards, targets, cardNo, entry) {
+    if (!state.trashCards.includes(cardNo)) return;
+    if (!discardSummonConditionsMet(state, cards, entry)) return;
+    const plan = effectSummonPlan(state, cards, cardNo, entry.pay);
+    if (!plan) return;
+    effectSummon(state, cards, targets, cardNo, "trash", entry.pay, plan.mode,
+      plan.total, cardNo, "discarded");
   }
 
   function resolveSoulPaidBraveFreeSummon(state, cards, targets, sourceCardNo) {
@@ -7291,6 +7399,8 @@
       // (Python `burst_open` と同一)。裏向きのセットとは別枠。
       burstOpen: null,
       mirage: null, turn: 0, pendingCountEvents: [], handReactionNames: new Set(),
+      // 「破棄されたとき」の発揮待ち(`discard_summons`)。Python `runtime.reserve`。
+      pendingDiscardSummons: [],
       openReactionNames: new Set(), trashReactionNames: new Set(),
       // 裸の〔ターンに1回〕は「そのカード1枚ごとに1回」。同名コピーを区別できないので
       // デッキの枚数(`deckCopies`)を上限に、使った回数を数える。
