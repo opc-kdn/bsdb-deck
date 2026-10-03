@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v73-v1";
-  const STAGE_VERSION = "v73";
+  const ENGINE_SLICE = "stage4-v74-v1";
+  const STAGE_VERSION = "v74";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v73 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v74 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v73-portable-v21";
+  const RUNTIME_VERSION = "stage4-v74-portable-v22";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1478,6 +1478,28 @@
       if (condition.kind === "source_summoned_from_side") {
         const source = state.field.find((unit) => unit.uid === sourceUid);
         return Boolean(source && source.summoned_from === "side");
+      }
+      // 「魂状態/煌臨元を含む自分の白の契約スピリットがいる間」(2026-10-04)。
+      // Python `own_contract_colors`と同一。場は常に、他のゾーンは印字どおり。
+      if (condition.kind === "own_contract_spirit_present") {
+        const zoneCards = state.field.filter((unit) => !unit.waiting)
+          .map((unit) => unit.card_no);
+        for (const zone of condition.zones || []) {
+          if (zone === "soul") zoneCards.push(...state.soulCards);
+          if (zone === "side") zoneCards.push(...state.sideCards);
+          if (zone === "kourin") {
+            for (const unit of state.field) {
+              if (unit.waiting) continue;
+              zoneCards.push(...(unit.kourin_stack || []));
+            }
+          }
+        }
+        return zoneCards.some((cardNo) => {
+          const card = cards[cardNo];
+          return Boolean(card && card.is_contract
+            && String(card.card_type || "").includes("スピリット")
+            && (condition.color == null || (card.colors || []).includes(condition.color)));
+        });
       }
       if (condition.kind === "own_named_card_present") {
         const nameOf = (cardNo) => (cards[cardNo] || {}).name || "";
@@ -4844,6 +4866,8 @@
       }
       const fired = [];
       for (const effect of matched) {
+        // 発揮できない誘発は回数を消費しない(D29、Python同一)。
+        if (!effectActive(effect, state, cards, unit.uid)) continue;
         const keys = eventTriggerLimitKeys(cards, effect, unit);
         if (keys.some((key) => state.blockTurnUsed.has(key))) continue;
         fired.push(effect);
