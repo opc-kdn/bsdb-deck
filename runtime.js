@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v72-v1";
-  const STAGE_VERSION = "v72";
+  const ENGINE_SLICE = "stage4-v73-v1";
+  const STAGE_VERSION = "v73";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v72 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v73 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v72-portable-v20";
+  const RUNTIME_VERSION = "stage4-v73-portable-v21";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -2944,26 +2944,27 @@
     return { picked, remaining: work, picked_slots: pickedSlots };
   }
 
-  function putRemainder(state, cards, remaining, destination, sourceCardNo) {
+  function putRemainder(state, cards, remaining, destination, sourceCardNo,
+    reason = "search_remainder") {
     if (!remaining.length) return;
     if (destination === "trash") {
       state.trashCards.push(...remaining);
       recordCardSelection(state, cards, { cards: remaining, source: "open",
-        destination: "trash", reason: "search_remainder", source_card_no: sourceCardNo });
+        destination: "trash", reason, source_card_no: sourceCardNo });
     } else if (destination === "top") {
       // `remaining`は下→上。Pythonの``deck.extend(cards)``と同じで、
       // 末尾のカードが一番上（次に引く札）になる。
       state.deck.push(...remaining);
       noteDeckPlacement(state, remaining, "top");
       record(state, cards, "cards_returned_to_deck", { cards: remaining,
-        destination: "top", order: "bottom_to_top", reason: "search_remainder",
+        destination: "top", order: "bottom_to_top", reason,
         source_card_no: sourceCardNo });
     } else {
       // Pythonの``deck[0:0] = cards``。先頭のカードが一番下になる。
       state.deck.unshift(...remaining);
       noteDeckPlacement(state, remaining, "bottom");
       record(state, cards, "cards_returned_to_deck", { cards: remaining,
-        destination: "bottom", order: "bottom_to_top", reason: "search_remainder",
+        destination: "bottom", order: "bottom_to_top", reason,
         source_card_no: sourceCardNo });
     }
   }
@@ -3932,6 +3933,11 @@
       // 1回にする(裁定2955)ので、窓がカードごとのWorkerは組で数える。
       const previousGroup = state.summonGroup;
       state.summonGroup = { fired: [] };
+      // 出した札の召喚時効果と完了は、残りを送った**後**に解く。Pythonは
+      // `deferred_batch`へ積んで`resolve_remainder_and_close`の後に流す
+      // (接続語なし／「その後」)。先に解くと、残りを山札の上へ戻す札
+      // (BS52-072)で召喚時のドローが戻した札を引くかどうかが割れる。
+      const completions = [];
       try {
         for (const cardNo of selection.picked) {
           const index = remaining.indexOf(cardNo);
@@ -3942,22 +3948,43 @@
           state.hand.push(cardNo);
           play(state, cards, targets, { card_no: cardNo, pay: 0, total: maintenance,
             maintenance, brave_mode: braveMode(cards[cardNo], state, cards),
-            allow_sacrifice: true, mode: "normal" });
+            allow_sacrifice: true, mode: "normal", completion_sink: completions });
+        }
+        const resolveRemainder = () => {
+          let remainderDestination = effect.remainder_destination;
+          if (remainderDestination === "top_or_bottom") {
+            remainderDestination = chooseTopOrBottom(remaining, state.hand, cards);
+          }
+          if (remainderDestination === "hand") {
+            state.hand.push(...remaining);
+            state.handGain += remaining.length;
+          } else if (remainderDestination === "side") {
+            state.sideCards.push(...remaining);
+            state.sideGain += remaining.length;
+          } else {
+            // デッキの上/下とトラッシュ（2026-10-03）。Python `resolve_remainder_and_close`。
+            putRemainder(state, cards, remaining, remainderDestination || "trash",
+              effect.source_card_no, "open_play_remainder");
+          }
+          if (state.openPoolStack.at(-1) !== pool) {
+            throw new Error("open pool resolution order mismatch");
+          }
+          state.openPoolStack.pop();
+        };
+        const resolveDerived = () => {
+          for (const finish of completions.splice(0)) finish();
+        };
+        // Python `_resolve_connected_boundary`: 「この効果発揮後」だけが派生を先に解く。
+        if (effect.connector_before_remainder === "この効果発揮後") {
+          resolveDerived();
+          resolveRemainder();
+        } else {
+          resolveRemainder();
+          resolveDerived();
         }
       } finally {
         state.summonGroup = previousGroup;
       }
-      if (effect.remainder_destination === "hand") {
-        state.hand.push(...remaining);
-        state.handGain += remaining.length;
-      } else if (effect.remainder_destination === "side") {
-        state.sideCards.push(...remaining);
-        state.sideGain += remaining.length;
-      } else state.trashCards.push(...remaining);
-      if (state.openPoolStack.at(-1) !== pool) {
-        throw new Error("open pool resolution order mismatch");
-      }
-      state.openPoolStack.pop();
       return true;
     }
     if (effect.kind === "token_spawn") {
@@ -4228,9 +4255,12 @@
       if (choiceGroup !== null && choiceGroup !== undefined
           && resolvedChoiceGroups.has(choiceGroup)) continue;
       if (effect.kind === "burst_free_play_self") {
+        // 直接合体は維持コアが要らない（裁定3616、Python同一）。以前は合体させても
+        // 維持コアぶんをリザーブから払い、どこにも置かずに消していた。
+        const mode = braveMode(card, state, cards);
         selfPlayed = play(state, cards, targets, {
-          card_no: cardNo, pay: 0, total: card.maintenance || 0,
-          maintenance: card.maintenance || 0, brave_mode: braveMode(card, state, cards),
+          card_no: cardNo, pay: 0, total: mode === "combine" ? 0 : card.maintenance || 0,
+          maintenance: card.maintenance || 0, brave_mode: mode,
           allow_sacrifice: true, mode: "burst_free_play",
         });
       } else if (effect.kind === "burst_return_self_to_hand") {
@@ -5591,6 +5621,10 @@
         || (mode === "face_up_draw_replacement" && state.effectFrameDepth > 0)
         || waitsBehindExistingDerivedPlay) {
       state.deferredPlayCompletions.push(finishPlay);
+    } else if (Array.isArray(candidate.completion_sink)) {
+      // 呼び出し元が残りの処理の後で解く(`reveal_play_remainder`。Pythonの
+      // `deferred_batch`と同じ位置)。
+      candidate.completion_sink.push(finishPlay);
     } else finishPlay();
     return true;
   }
