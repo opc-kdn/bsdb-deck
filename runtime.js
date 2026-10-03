@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v69-v1";
-  const STAGE_VERSION = "v69";
+  const ENGINE_SLICE = "stage4-v70-v1";
+  const STAGE_VERSION = "v70";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v69 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v70 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v69-portable-v17";
+  const RUNTIME_VERSION = "stage4-v70-portable-v18";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1495,7 +1495,21 @@
     });
   }
 
+  /** 配置時の神託を発揮できるか。Python `_oracle_mill_declarable`と同一。
+   *  《神託》は同じカード名の自分の創界神ネクサスが他にあれば発揮できない
+   *  (裁定267・6727)。名前で比べる。《真・神託》の〔ターンに1回：同名〕は
+   *  `block_turn_limit`が見る。発揮できない効果は候補にも棋譜にも出さない。 */
+  function oracleMillDeclarable(effect, state, cards, sourceUid) {
+    if (!state.field.some((unit) => unit.uid === sourceUid)) return false;
+    if (effect.same_name_policy !== "none_existing") return true;
+    const name = cards[effect.source_card_no]?.name;
+    return !state.field.some((unit) => unit.uid !== sourceUid
+      && cards[unit.card_no]?.name === name);
+  }
+
   function effectActive(effect, state, cards, sourceUid) {
+    if (effect.kind === "oracle_mill"
+        && !oracleMillDeclarable(effect, state, cards, sourceUid)) return false;
     // 印字のLv(下限`required_level`と見出しの並び`levels`、2026-10-02)。
     // Python `enabler_level_met` と同一。
     const hasLevels = Array.isArray(effect.levels) && effect.levels.length;
@@ -3413,15 +3427,8 @@
       return true;
     }
     if (effect.kind === "oracle_mill") {
+      if (!oracleMillDeclarable(effect, state, cards, sourceUid)) return false;
       const sourceUnit = state.field.find((unit) => unit.uid === sourceUid);
-      if (!sourceUnit) return false;
-      if (effect.same_name_policy === "none_existing"
-          && state.field.some((unit) => unit.uid !== sourceUid
-            && unit.card_no === effect.source_card_no)) return false;
-      if (effect.same_name_policy === "once_per_turn") {
-        if (state.oracleNameUsed.has(effect.source_card_no)) return false;
-        state.oracleNameUsed.add(effect.source_card_no);
-      }
       // Python v56 removes oracle cards by value rather than by top-slice
       // position.  Duplicate card numbers therefore consume the lowest
       // matching copy first.  Preserve that observable v56 behavior until a
@@ -3447,10 +3454,9 @@
         sourceUnit.cores += pool.filter((cardNo) =>
           Boolean(cardMatchesSlot(cards[cardNo], effect.condition_slot))).length;
       }
-      // Pythonは有効な《神託》の窓へ到達した時点を解決済みとし、山札0枚でも
-      // `oracle_name_used`等の内部状態が動けば`resolved=true`になる。山札枚数だけで
-      // 判定すると、デッキ切れ直前の詳細棋譜でWorkerだけfalseになる。
-      return true;
+      // 山札0枚なら何も置けない空振り。発揮はしたので〔ターンに1回：同名〕は
+      // 宣言時に消費済み(Python `resolve_oracle_mill`同一、2026-10-03 利用者裁定)。
+      return pool.length > 0;
     }
     if (effect.kind === "oracle_pickup") {
       const slots = effect.condition_slots || [effect.condition_slot];
@@ -3838,16 +3844,24 @@
       pool.forEach((cardNo) => state.seen.add(cardNo));
       const selection = chooseFromPool(pool, effect.condition_slots || [], cards, targets);
       const remaining = [...pool];
-      for (const cardNo of selection.picked) {
-        const index = remaining.indexOf(cardNo);
-        if (index < 0 || !summonConditionsMet(cards[cardNo], state, cards)) continue;
-        const maintenance = cards[cardNo].maintenance || 0;
-        if (maintenance > reclaimable(state, true, cards)) continue;
-        remaining.splice(index, 1);
-        state.hand.push(cardNo);
-        play(state, cards, targets, { card_no: cardNo, pay: 0, total: maintenance,
-          maintenance, brave_mode: braveMode(cards[cardNo], state, cards),
-          allow_sacrifice: true, mode: "normal" });
+      // 公開から出す札は同じ効果の同時召喚。Pythonは1つの予約にまとめて神託を
+      // 1回にする(裁定2955)ので、窓がカードごとのWorkerは組で数える。
+      const previousGroup = state.summonGroup;
+      state.summonGroup = { fired: [] };
+      try {
+        for (const cardNo of selection.picked) {
+          const index = remaining.indexOf(cardNo);
+          if (index < 0 || !summonConditionsMet(cards[cardNo], state, cards)) continue;
+          const maintenance = cards[cardNo].maintenance || 0;
+          if (maintenance > reclaimable(state, true, cards)) continue;
+          remaining.splice(index, 1);
+          state.hand.push(cardNo);
+          play(state, cards, targets, { card_no: cardNo, pay: 0, total: maintenance,
+            maintenance, brave_mode: braveMode(cards[cardNo], state, cards),
+            allow_sacrifice: true, mode: "normal" });
+        }
+      } finally {
+        state.summonGroup = previousGroup;
       }
       if (effect.remainder_destination === "hand") {
         state.hand.push(...remaining);
@@ -4434,6 +4448,9 @@
    *  〔重複不可〕は同じ処理の中で同名1回。 */
   function discardHandCards(state, cards, targets, cardNos, sourceCardNo) {
     const firedNames = new Set();
+    // 割り込んで手札から出す札は、別々の効果でも破棄と同時の召喚(裁定3947)。
+    // 召喚時の神託は組で1回(Python同一)。
+    const group = { fired: [] };
     const usable = (cardNo, entry) => entry
       && !(entry.limit === "no_duplicate" && firedNames.has(cards[cardNo].name));
     for (const cardNo of cardNos) {
@@ -4441,8 +4458,14 @@
       const plan = usable(cardNo, entry) ? effectSummonPlan(state, cards, cardNo, entry.pay) : null;
       if (plan) {
         firedNames.add(cards[cardNo].name);
-        effectSummon(state, cards, targets, cardNo, "hand", entry.pay, plan.mode,
-          plan.total, cardNo, "discard_replacement");
+        const previousGroup = state.summonGroup;
+        state.summonGroup = group;
+        try {
+          effectSummon(state, cards, targets, cardNo, "hand", entry.pay, plan.mode,
+            plan.total, cardNo, "discard_replacement");
+        } finally {
+          state.summonGroup = previousGroup;
+        }
         continue;
       }
       state.hand.splice(state.hand.indexOf(cardNo), 1);
@@ -4636,6 +4659,13 @@
       && clauses[index + 1].connector_before === "この効果発揮後";
   }
 
+  // 同名縛りの効果の単位。キーワード効果はカード番号をまたいで1つ(裁定3270)。
+  // Python `_name_limited_block`と同一。
+  function nameLimitedBlock(block) {
+    const rest = block.slice(block.indexOf(":") + 1);
+    return rest.startsWith("keyword:") ? rest : block;
+  }
+
   // 印字効果の〔ターンに1回〕キー。同名縛りはカード名、裸はその1枚(uid)ごと。
   function instanceTurnLimitKeys(instance, cards) {
     const keys = [];
@@ -4644,7 +4674,8 @@
       const block = clause.effect_block_id;
       if (!limit || !block) continue;
       const key = limit === "once_per_turn_name"
-        ? `name\u0000${cards[instance.source_card_no]?.name || instance.source_card_no}\u0000${block}`
+        ? `name\u0000${cards[instance.source_card_no]?.name || instance.source_card_no}`
+          + `\u0000${nameLimitedBlock(block)}`
         : `card\u0000${instance.source_uid}\u0000${block}`;
       if (!keys.includes(key)) keys.push(key);
     }
@@ -4813,9 +4844,23 @@
       reason: "on_play_level", target_uid: uid });
   }
 
+  /** 場に出た札が召喚時の神託のどの引き金か。Python `_watch_event`と同一。
+   *  マジックは「使用」だけ——バーストの発動や、使用を経ずに効果だけを発揮する
+   *  経路では神託しない(裁定5657・6627)。 */
+  function watchEvent(card, mode) {
+    if (mode === "kourin" || mode === "kourin_from_soul") return "kourin";
+    const cardType = card.card_type || "";
+    if (cardType.includes("マジック")) {
+      return mode === "normal" || mode === "flash" ? "magic_use" : null;
+    }
+    if (cardType.includes("ネクサス")) return "place";
+    return "summon";
+  }
+
   function resolvePlayedEffects(state, cards, targets, card, uid, braveMode,
                                 soulCoreUsedForSummonCost = false,
-                                watcherUnits = []) {
+                                watcherUnits = [], watchEventKind = null,
+                                summonGroup = null) {
     raiseLevelForOnPlay(state, cards, card, uid);
     const opponent = MAIN_STEP_OPPONENTS.get(state) || null;
     for (const effect of card.on_play_opponent_effects || []) {
@@ -4858,10 +4903,15 @@
     const watcherInstances = [];
     for (const watcher of watcherUnits) {
       if (watcher.waiting || !state.field.includes(watcher)) continue;
+      // 同時に召喚した扱いの組では創界神ごとに1回(Python `collect_oracle_watch_instances`)。
+      if (summonGroup && summonGroup.fired.includes(watcher.uid)) continue;
       for (const effect of cards[watcher.card_no]?.enablers || []) {
-        if (effect.kind !== "oracle_watch" || !cardMatchesSlot(card, effect.condition_slot)) {
+        if (effect.kind !== "oracle_watch"
+            || !(effect.trigger_events || []).includes(watchEventKind)
+            || !cardMatchesSlot(card, effect.condition_slot)) {
           continue;
         }
+        if (summonGroup) summonGroup.fired.push(watcher.uid);
         watcherInstances.push({
           instance_id: `${triggerEventId}:oracle-watch:${watcher.card_no}#${watcher.uid}`,
           effect_block_id: effect.effect_block_id || `${watcher.card_no}:keyword:神託`,
@@ -4888,13 +4938,15 @@
       if (instance.runtime_kind === "oracle_watch") {
         const effect = instance.clauses[0];
         if (instance.watcher.waiting || !state.field.includes(instance.watcher)) return [];
+        // どの札の召喚/煌臨/配置/使用に反応したか(Python同一)。
         record(state, cards, "effect_start", { card_no: instance.source_card_no,
           uid: instance.source_uid, effect_kind: "oracle_watch",
-          effect_tag: effect.effect_tag || null });
+          effect_tag: effect.effect_tag || null, trigger_card_no: card.card_no });
         instance.watcher.cores += 1;
         record(state, cards, "effect_complete", { card_no: instance.source_card_no,
           uid: instance.source_uid, effect_kind: "oracle_watch",
-          effect_tag: effect.effect_tag || null, resolved: true });
+          effect_tag: effect.effect_tag || null, trigger_card_no: card.card_no,
+          resolved: true });
         return [];
       }
       if (instance.runtime_kind === "trash_reaction") {
@@ -5021,6 +5073,8 @@
    *  置く」——置くのはLv1を保てる最小限(`maintenance`)だけ。 */
   function playKourinFromSoul(state, cards, targets, candidate) {
     const card = cards[candidate.card_no];
+    // 召喚時の神託のうち「煌臨したとき」を持つ創界神(Python `preexisting_uids`)。
+    const watcherUnits = [...state.field];
     const soulCardNo = candidate.kourin_soul_card_no;
     if (!state.soulCards.includes(soulCardNo)) return false;
     const destination = isSealedKourin(card) ? "life" : "trash";
@@ -5060,7 +5114,8 @@
     resolveEventTriggers(state, cards, targets, "ally_summoned",
       { card_no: candidate.card_no, uid, source: "kourin_from_soul" });
     resolvePlayedEffects(state, cards, targets,
-      { ...card, card_no: candidate.card_no }, uid, null);
+      { ...card, card_no: candidate.card_no }, uid, null, false, watcherUnits, "kourin",
+      state.summonGroup || null);
     record(state, cards, "play_complete", { card_no: candidate.card_no, uid,
       ...traceDetails });
     if (state.effectFrameDepth === 1) flushCountReactions(state, cards, targets);
@@ -5070,6 +5125,7 @@
 
   function playKourin(state, cards, targets, candidate) {
     const card = cards[candidate.card_no];
+    const watcherUnits = [...state.field];
     const host = state.field.find((unit) => unit.uid === candidate.kourin_host_uid);
     if (!host) return false;
     const destination = isSealedKourin(card) ? "life" : "trash";
@@ -5155,7 +5211,8 @@
     resolveEventTriggers(state, cards, targets, "ally_summoned",
       { card_no: candidate.card_no, uid: host.uid, source: "kourin" });
     resolvePlayedEffects(state, cards, targets,
-      { ...effectCard, card_no: candidate.card_no }, host.uid, null);
+      { ...effectCard, card_no: candidate.card_no }, host.uid, null, false, watcherUnits,
+      "kourin", state.summonGroup || null);
     for (let index = 0; index < faraSources; index += 1) {
       if (!consumePlatinumBug(state, cards)) break;
     }
@@ -5186,6 +5243,7 @@
       if (!consumePlatinumBug(state, cards)) return false;
     }
     const watcherUnits = [...state.field];
+    const summonGroup = state.summonGroup || null;
     const mode = candidate.mode || "normal";
     const traceDetails = { mode, pay: candidate.pay, total: candidate.total };
     if (["normal", "manifestation"].includes(mode)) {
@@ -5312,7 +5370,8 @@
           }
         }
         resolvePlayedEffects(state, cards, targets, { ...card, card_no: candidate.card_no },
-          uid, candidate.brave_mode, soulCoreUsedForSummonCost, watcherUnits);
+          uid, candidate.brave_mode, soulCoreUsedForSummonCost, watcherUnits,
+          watchEvent(card, mode), summonGroup);
         if (isMagic && staysOnField) {
           state.uid += 1;
           uid = state.uid;
@@ -7413,7 +7472,9 @@
       // 出さない。Python `choice_debug` と同じ構造を返す。
       choiceDebug: Array.isArray(options.choice_debug) ? options.choice_debug : null,
       countReactionDeferral: 0,
-      oracleNameUsed: new Set(), bugCoreSupplyUsed: new Set(),
+      bugCoreSupplyUsed: new Set(),
+      // 同時に召喚した扱いの組(`discardHandCards`等が立てる、Python `current_summon_group`)。
+      summonGroup: null,
       // 「場を離れるとき契約煌臨元になるトークン」を1度だけ解決する
       // (Python `contract_base_token_no`と同じ、ROADMAP②)。
       bugNo: contractBaseTokenNo(cards),
@@ -7475,7 +7536,6 @@
       state.trashReactionNames.clear();
       state.trashReactionCardUses = {};
       state.sealedKourinNames.clear();
-      state.oracleNameUsed.clear();
       state.bugCoreSupplyUsed.clear();
       // ⓪相手の2値分岐(5C-2Aのみ)。除去は直前の相手ターンを表すので、自分のコア
       // ステップより前に抽選する。5C-2Aでは結果を盤面へ適用しない。
