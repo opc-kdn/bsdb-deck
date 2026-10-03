@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v70-v1";
-  const STAGE_VERSION = "v70";
+  const ENGINE_SLICE = "stage4-v71-v1";
+  const STAGE_VERSION = "v71";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v70 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v71 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v70-portable-v18";
+  const RUNTIME_VERSION = "stage4-v71-portable-v19";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1505,6 +1505,13 @@
     const name = cards[effect.source_card_no]?.name;
     return !state.field.some((unit) => unit.uid !== sourceUid
       && cards[unit.card_no]?.name === name);
+  }
+
+  /** 神託でまだ置けるコアの数。Python `_oracle_core_room`と同一。 */
+  function oracleCoreRoom(effect, unit) {
+    const cap = effect.core_cap;
+    if (cap === null || cap === undefined) return Infinity;
+    return Math.max(0, cap - unit.cores);
   }
 
   function effectActive(effect, state, cards, sourceUid) {
@@ -3141,6 +3148,8 @@
         const soulCore = total ? payFromReserve(state, cost, card.maintenance || 0) : false;
         state.reserve -= total;
         state.spent += cost;
+        // 召喚時の神託は場に先にいた創界神(Python `watch=(watchers, ...)`、2026-10-03)。
+        const watcherUnits = [...state.field];
         state.uid += 1;
         const uid = state.uid;
         state.field.push({ uid, card_no: cardNo, cores: card.maintenance || 0,
@@ -3153,7 +3162,8 @@
         state.playCounts[state.turn] = (state.playCounts[state.turn] || 0) + 1;
         record(state, cards, "card_entered", { card_no: cardNo, uid,
           destination: "field", mode: "opened_reaction", source_card_no: sourceCardNo });
-        resolvePlayedEffects(state, cards, targets, { ...card, card_no: cardNo }, uid, null);
+        resolvePlayedEffects(state, cards, targets, { ...card, card_no: cardNo }, uid, null,
+          false, watcherUnits, watchEvent(card, "opened_reaction"));
         resolved = true;
       }
       if (resolved && reaction.same_name_policy === "once_per_turn") {
@@ -3451,8 +3461,8 @@
       // スロットに限って**数える(神託のコア加算はその形でしか構造化していない)。
       // このガードが無いと、条件付きの普通のスロットでJSだけコアが増える。
       if (sourceUnit && (effect.condition_slot?.alternatives || []).length) {
-        sourceUnit.cores += pool.filter((cardNo) =>
-          Boolean(cardMatchesSlot(cards[cardNo], effect.condition_slot))).length;
+        sourceUnit.cores += Math.min(oracleCoreRoom(effect, sourceUnit), pool.filter((cardNo) =>
+          Boolean(cardMatchesSlot(cards[cardNo], effect.condition_slot))).length);
       }
       // 山札0枚なら何も置けない空振り。発揮はしたので〔ターンに1回：同名〕は
       // 宣言時に消費済み(Python `resolve_oracle_mill`同一、2026-10-03 利用者裁定)。
@@ -4740,8 +4750,15 @@
   }
 
   function resolvePendingEffectWindow(state, cards, targets, instances, resolveInstance,
-                                      candidateLegal = null) {
+                                      candidateLegal = null, options = {}) {
     if (!instances.length) return;
+    // 選んだ効果が出した札の召喚時効果と「破棄されたとき」の配置を、1段深い候補として
+    // 取り込む(裁定5967・D27、Python `collect_derived`と同一、2026-10-03 利用者決定)。
+    // 窓を開く前から積まれていた分は外側のものなので触らない。
+    const mergeDerived = Boolean(options.mergeDerived);
+    const playMark = state.deferredDerivedPlays.length;
+    const discardMark = state.pendingDiscardSummons.length;
+    const drainedPosts = [];
     state.effectWindowSeq += 1;
     const windowId = `turn${state.turn}:effect-window:${state.effectWindowSeq}`;
     const completed = new Set();
@@ -4759,7 +4776,7 @@
       const deepest = Math.max(...candidates.map((instance) => instance.priority_depth));
       candidates = candidates.filter((instance) => instance.priority_depth === deepest);
       if (candidateLegal) {
-        const legal = candidates.filter((instance) => candidateLegal(instance));
+        const legal = candidates.filter((instance) => (instance.legal || candidateLegal)(instance));
         if (!legal.length) {
           // Exhaust only the unavailable deepest tier, then re-collect.  A
           // legal peer can first change Count/Lv and make another candidate
@@ -4808,8 +4825,60 @@
         });
       }
       for (const key of instanceTurnLimitKeys(selected, cards)) state.blockTurnUsed.add(key);
-      const generated = resolveInstance(selected) || [];
+      const generated = [...((selected.run || resolveInstance)(selected) || [])];
+      const discards = mergeDerived ? state.pendingDiscardSummons.splice(discardMark) : [];
       flushCountReactions(state, cards, targets);
+      if (mergeDerived) {
+        const depth = selected.priority_depth + 1;
+        const derived = [];
+        for (const play of state.deferredDerivedPlays.splice(playMark)) {
+          if (!play.build) { play(); continue; }
+          play.pre();
+          const built = play.build();
+          drainedPosts.push(() => { built.finish(); play.post(); });
+          for (const instance of built.instances) {
+            derived.push({ ...instance, priority_depth: depth,
+              legacy_order: selected.legacy_order + 2000 + derived.length });
+          }
+        }
+        for (const pending of discards) {
+          const cardNo = pending.card_no;
+          derived.push({
+            instance_id: `${selected.instance_id}:discard-after:${derived.length}`,
+            effect_block_id: `${cardNo}:discard-summon`,
+            source_card_no: cardNo,
+            source_uid: null,
+            controller: "self",
+            timing: "derived",
+            trigger_event_id: selected.trigger_event_id,
+            clauses: [{ kind: "discard_summon_after", card_no: cardNo }],
+            effect_tag: null,
+            optional: false,
+            dependencies: [],
+            legacy_order: selected.legacy_order + 2000 + derived.length,
+            priority_depth: depth,
+            runtime_kind: "discard_summon_after",
+            source_label: `${cardNo}#trash`,
+            legal: () => state.trashCards.includes(cardNo),
+            run: () => {
+              resolveDiscardSummonAfter(state, cards, targets, cardNo, pending.entry);
+              return [];
+            },
+          });
+        }
+        if (derived.length) {
+          // 選んだ効果の続き(「そうしたとき」が見出しの読み違いで別ブロックに割れ、
+          // 依存で繋いだ節。BS37-027)は、取り込んだ派生より先に解く(Python同一)。
+          const continuationDepth = depth + 1;
+          for (const instance of instances) {
+            if (!completed.has(instance.instance_id)
+                && instance.dependencies.includes(selected.effect_block_id)) {
+              instance.priority_depth = continuationDepth;
+            }
+          }
+        }
+        generated.push(...derived);
+      }
       if (choiceEventIndex !== null) {
         const after = effectOrderResources(state);
         const details = state.events[choiceEventIndex].details;
@@ -4820,6 +4889,8 @@
       completed.add(selected.instance_id);
       instances.push(...generated);
     }
+    // 取り込んだ札の召喚の完了は窓の後(Python `drained`の`_finalize_play_trace`)。
+    for (const post of drainedPosts) post();
   }
 
   /** 召喚時効果のLvに届くよう、リザーブの通常コアを置く(2026-10-02)。
@@ -4861,6 +4932,23 @@
                                 soulCoreUsedForSummonCost = false,
                                 watcherUnits = [], watchEventKind = null,
                                 summonGroup = null) {
+    const built = buildPlayedEffects(state, cards, targets, card, uid, braveMode,
+      soulCoreUsedForSummonCost, watcherUnits, watchEventKind, summonGroup);
+    resolvePendingEffectWindow(state, cards, targets, built.instances,
+      built.resolveInstance, built.candidateLegal, { mergeDerived: true });
+    while (state.deferredDerivedPlays.length) {
+      const play = state.deferredDerivedPlays.shift();
+      if (play.run) play.run(); else play();
+    }
+    built.finish();
+  }
+
+  /** 召喚/配置/使用したカードの発揮待ちを作る(召喚時の神託を含む)。窓は呼び出し側。
+   *  効果の途中で出した札は、親の窓がこれで候補を取り込む(`mergeDerived`)。 */
+  function buildPlayedEffects(state, cards, targets, card, uid, braveMode,
+                              soulCoreUsedForSummonCost = false,
+                              watcherUnits = [], watchEventKind = null,
+                              summonGroup = null) {
     raiseLevelForOnPlay(state, cards, card, uid);
     const opponent = MAIN_STEP_OPPONENTS.get(state) || null;
     for (const effect of card.on_play_opponent_effects || []) {
@@ -4942,11 +5030,13 @@
         record(state, cards, "effect_start", { card_no: instance.source_card_no,
           uid: instance.source_uid, effect_kind: "oracle_watch",
           effect_tag: effect.effect_tag || null, trigger_card_no: card.card_no });
-        instance.watcher.cores += 1;
+        // 置けるコアの上限に届いていれば空振り(Python同一)。
+        const placed = Math.min(1, oracleCoreRoom(effect, instance.watcher));
+        instance.watcher.cores += placed;
         record(state, cards, "effect_complete", { card_no: instance.source_card_no,
           uid: instance.source_uid, effect_kind: "oracle_watch",
           effect_tag: effect.effect_tag || null, trigger_card_no: card.card_no,
-          resolved: true });
+          resolved: placed > 0 });
         return [];
       }
       if (instance.runtime_kind === "trash_reaction") {
@@ -5059,11 +5149,16 @@
       }
       return instance.clauses.some((effect) => effectActive(effect, state, cards, uid));
     };
-    resolvePendingEffectWindow(
-      state, cards, targets, instances, resolveInstance, candidateLegal);
-    while (state.deferredDerivedPlays.length) state.deferredDerivedPlays.shift()();
-    const recurring = (card.enablers || []).filter((effect) => effect.mode === "recurring");
-    if (recurring.length) state.recurring.push({ uid, effects: recurring });
+    // 親の窓へ取り込まれても、このカードの解決と可否で動くように持たせる。
+    for (const instance of instances) {
+      instance.run = resolveInstance;
+      instance.legal = candidateLegal;
+    }
+    const finish = () => {
+      const recurring = (card.enablers || []).filter((effect) => effect.mode === "recurring");
+      if (recurring.length) state.recurring.push({ uid, effects: recurring });
+    };
+    return { instances, resolveInstance, candidateLegal, finish };
   }
 
   /** 魂状態からの復帰。Python `play_card`の`kourin_soul_card_no`枝と同一。
@@ -5354,24 +5449,24 @@
       ...traceDetails });
     state.played.add(candidate.card_no);
     state.playCounts[state.turn] = (state.playCounts[state.turn] || 0) + 1;
-    const finishPlay = () => {
-      beginEffectFrame(state);
-      try {
-        // Pythonは`_emit_card_played`で**カード自身の発揮待ちより前に**
-        // 誘発を予約する。順序を合わせるため、ここで先に解く。
-        resolveEventTriggers(state, cards, targets, "ally_summoned",
-          { card_no: candidate.card_no, uid, source: mode });
-        // 手札カウント反応で召喚したときの「そうしたとき」節
-        // (`hand_reaction_effects`)。Pythonの予約batchと同じく、カード自身の
-        // 確定処理の中で解く。
-        if (mode === "hand_reaction") {
-          for (const effect of card.hand_reaction_effects || []) {
-            resolveEffect(state, cards, targets, effect, uid);
-          }
+    const preBody = () => {
+      // Pythonは`_emit_card_played`で**カード自身の発揮待ちより前に**
+      // 誘発を予約する。順序を合わせるため、ここで先に解く。
+      resolveEventTriggers(state, cards, targets, "ally_summoned",
+        { card_no: candidate.card_no, uid, source: mode });
+      // 手札カウント反応で召喚したときの「そうしたとき」節
+      // (`hand_reaction_effects`)。Pythonの予約batchと同じく、カード自身の
+      // 確定処理の中で解く。
+      if (mode === "hand_reaction") {
+        for (const effect of card.hand_reaction_effects || []) {
+          resolveEffect(state, cards, targets, effect, uid);
         }
-        resolvePlayedEffects(state, cards, targets, { ...card, card_no: candidate.card_no },
-          uid, candidate.brave_mode, soulCoreUsedForSummonCost, watcherUnits,
-          watchEvent(card, mode), summonGroup);
+      }
+    };
+    const playedArgs = () => [state, cards, targets, { ...card, card_no: candidate.card_no },
+      uid, candidate.brave_mode, soulCoreUsedForSummonCost, watcherUnits,
+      watchEvent(card, mode), summonGroup];
+    const postBody = () => {
         if (isMagic && staysOnField) {
           state.uid += 1;
           uid = state.uid;
@@ -5393,10 +5488,16 @@
         // Python runtimeは予約した派生（カウント反応など）をplay_complete後、
         // 待機中の場離れをさらにその後で確定する。
         if (state.effectFrameDepth === 1) flushCountReactions(state, cards, targets);
-      } finally {
-        endEffectFrame(state);
-      }
     };
+    const inFrame = (body) => () => {
+      beginEffectFrame(state);
+      try { body(); } finally { endEffectFrame(state); }
+    };
+    const finishPlay = inFrame(() => {
+      preBody();
+      resolvePlayedEffects(...playedArgs());
+      postBody();
+    });
     const waitsBehindExistingDerivedPlay = mode === "hand_reaction"
       && state.effectFrameDepth > 0 && state.deferredPlayCompletions.length > 0;
     // 効果の途中で出した召喚(`zone_summon`、v66)は、召喚時効果と完了を親の
@@ -5404,7 +5505,14 @@
     // 専用の待ち行列にして、窓の直後に同期的に空にする——先読みの複製に
     // 関数を残さないため。
     if (candidate.derived_play && state.effectFrameDepth > 0) {
-      state.deferredDerivedPlays.push(finishPlay);
+      // 親の窓が`mergeDerived`なら召喚時効果を派生の候補として取り込み、完了は
+      // 窓の後(`post`)。取り込まれなければ`run`で従来どおりまとめて解く。
+      state.deferredDerivedPlays.push({
+        run: finishPlay,
+        pre: inFrame(preBody),
+        build: () => buildPlayedEffects(...playedArgs()),
+        post: inFrame(postBody),
+      });
     } else if (["burst_free_play", "burst_paid_followup"].includes(mode)
         || (mode === "face_up_draw_replacement" && state.effectFrameDepth > 0)
         || waitsBehindExistingDerivedPlay) {
