@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v75-v1";
-  const STAGE_VERSION = "v75";
+  const ENGINE_SLICE = "stage4-v76-v1";
+  const STAGE_VERSION = "v76";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v75 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v76 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v75-portable-v23";
+  const RUNTIME_VERSION = "stage4-v76-portable-v24";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -6651,7 +6651,9 @@
           ...(targetGuardSource(state, cards, unit) !== null ? { target_guard: true } : {}),
           // 創界神ネクサス(公開情報)。Python `_combat_field_rows` と同一。
           ...(isCreatorNexus(cards, unit)
-            ? { creator_nexus: true, core_thresholds: creatorCoreThresholds(card) } : {}),
+            ? { creator_nexus: true, core_thresholds: creatorCoreThresholds(card),
+              // 系統(公開情報)。起幻の除外が読む。Python同一。
+              lineages: [...(card.lineages || [])].sort() } : {}),
         };
       });
   }
@@ -6891,6 +6893,11 @@
       // Python `_combat_pick_targets` と同一。
       if (effect.target_creator_only && (row.card_type || "").endsWith("ネクサス")
         && !row.creator_nexus) return false;
+      // 「系統『起幻』を持たない相手の創界神ネクサス」(2026-10-08)。Python同一。
+      if ((effect.target_exclude_lineages || []).length && row.creator_nexus
+        && (row.lineages || []).some((name) => effect.target_exclude_lineages.includes(name))) {
+        return false;
+      }
       // 疲労は既に疲労しているものを対象にしない。
       if (effect.kind === "unit_exhaust" && row.exhausted) return false;
       // コア除去はコアを持たないものを対象にしない。
