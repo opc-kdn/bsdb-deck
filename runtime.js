@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v74-v1";
-  const STAGE_VERSION = "v74";
+  const ENGINE_SLICE = "stage4-v75-v1";
+  const STAGE_VERSION = "v75";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v74 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v75 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v74-portable-v22";
+  const RUNTIME_VERSION = "stage4-v75-portable-v23";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -755,6 +755,8 @@
     "unit_heavy_exhaust", "unit_bp_down", "life_core_remove", "field_core_remove",
     // 【毒刃】(2026-10-02)。
     "poison_blade", "reserve_core_remove", "soul_core_remove",
+    // 相手の創界神ネクサスのコアをボイドへ(2026-10-08)。
+    "creator_core_remove",
   ]);
 
   // Stage 5C-2A opponent branches. Keep every name and rule identical to the
@@ -3580,6 +3582,25 @@
         destination: "hand", reason: "recover", source_card_no: effect.source_card_no });
       return result.picked.length > 0;
     }
+    if (effect.kind === "creator_core_remove") {
+      // 相手の創界神ネクサスのコアをボイドへ(2026-10-08)。取り方は
+      // `planCreatorCoreRemoval`、対象ごとに相手は■で守れる。Python
+      // `_resolve_creator_core_remove` と同一。
+      const board = state.combatOpponent;
+      if (!board) return false;
+      const rows = board.field().filter((row) => row.creator_nexus && row.cores > 0
+        && !resisted(state, cards, row, effect, sourceUid));
+      const plan = planCreatorCoreRemoval(rows, effect.amount ?? null, effect.scope || "one");
+      if (!plan.length) return false;
+      const byUid = new Map(rows.map((row) => [row.uid, row]));
+      const kept = new Set(unguardedTargets(board, plan.map(([uid]) => byUid.get(uid)), effect,
+        new Map(plan)).map((row) => row.uid));
+      let removed = 0;
+      for (const [uid, count] of plan) {
+        if (kept.has(uid)) removed += board.remove_cores(uid, count, effect.core_destination || "void") || 0;
+      }
+      return removed > 0;
+    }
     if (effect.kind === "field_core_remove") {
       // 相手の場全体からコアをamount個。**基準は脅威度ではなく「落とせるか」**
       // ——2個しか取れないならコア3個の大物は落とせないので、脅威度で劣っても
@@ -3686,8 +3707,10 @@
       if (!rows.length) return false;
       if (effect.kind === "unit_core_remove") {
         // amountは**1体あたりのコア数**なので、対象は1体だけ選ぶ。
+        const target = unguardedTargets(board, rows.slice(0, 1), effect);
+        if (!target.length) return false;
         return Boolean(board.remove_cores(
-          rows[0].uid, amount, effect.core_destination || "reserve"));
+          target[0].uid, amount, effect.core_destination || "reserve"));
       }
       // 印字が「最もBPの高い」等と順を固定していないバウンスは、現在ステップの
       // 詰み、勝利/敗北期限、手札へ返す再使用リスクで複数対象を組として選ぶ。
@@ -3703,20 +3726,21 @@
           reuseRisk: typeof board.bounce_reuse_risk === "function"
             ? (row) => board.bounce_reuse_risk(row) : null,
         }) : rows.slice(0, amount);
+      const targets = unguardedTargets(board, picked, effect);
       let applied;
       if (effect.kind === "unit_destroy") {
-        applied = picked.filter((row) => board.destroy(row.uid, "effect"));
+        applied = targets.filter((row) => board.destroy(row.uid, "effect"));
       } else if (effect.kind === "unit_bounce") {
         const where = effect.bounce_destination || "hand";
-        applied = picked.filter((row) => board.bounce(row.uid, where));
+        applied = targets.filter((row) => board.bounce(row.uid, where));
       } else if (effect.kind === "unit_heavy_exhaust") {
-        applied = picked.filter((row) => board.heavy_exhaust(row.uid));
+        applied = targets.filter((row) => board.heavy_exhaust(row.uid));
       } else if (effect.kind === "unit_bp_down") {
-        applied = picked.filter((row) => board.bp_down(
+        applied = targets.filter((row) => board.bp_down(
           row.uid, effect.bp_amount, effect.bp_scope || "battle",
           Boolean(effect.destroy_at_zero)));
       } else {
-        applied = picked.filter((row) => board.exhaust(row.uid));
+        applied = targets.filter((row) => board.exhaust(row.uid));
       }
       return applied.length > 0;
     }
@@ -6296,8 +6320,10 @@
     const blocked = (row, threat) => resistanceBlocks(row.resist, threat.kind,
       threat.source_type, threat.source_colors, threat.source_cost, context(threat),
       threat.pierce);
+    // 創界神ネクサスはソウルコアの置き場所にしない(2026-10-08、Python同一)。
     const candidates = ["reserve", ...[...state.field]
-      .filter((unit) => !unit.waiting).sort((left, right) => left.uid - right.uid)
+      .filter((unit) => !unit.waiting && !isCreatorNexus(cards, unit))
+      .sort((left, right) => left.uid - right.uid)
       .map((unit) => unit.uid)];
     const measured = new Map();
     for (const target of candidates) {
@@ -6544,6 +6570,8 @@
     "life_core_remove", "field_core_remove",
     // 【毒刃】(2026-10-02、Python同一)。
     "poison_blade",
+    // 相手の創界神ネクサスのコアをボイドへ(2026-10-08、Python同一)。
+    "creator_core_remove",
     // 相手のリザーブのコア・ソウルコアの名指しをトラッシュへ(2026-10-02、Python同一)。
     "reserve_core_remove", "soul_core_remove",
   ]);
@@ -6618,8 +6646,150 @@
           ...activeResistances(state, cards, unit),
           // 【毒刃】の下のカードの枚数(公開情報、あるときだけ)。
           ...((unit.under_cards || []).length ? { under_count: unit.under_cards.length } : {}),
+          // 場に残るマジックの■で守れる(2026-10-08、BS72-084)。守れるときだけ。
+          // Python `_combat_field_rows` と同一。
+          ...(targetGuardSource(state, cards, unit) !== null ? { target_guard: true } : {}),
+          // 創界神ネクサス(公開情報)。Python `_combat_field_rows` と同一。
+          ...(isCreatorNexus(cards, unit)
+            ? { creator_nexus: true, core_thresholds: creatorCoreThresholds(card) } : {}),
         };
       });
+  }
+
+  // 場に残るマジックの■で創界神ネクサスを守る価値がある効果(2026-10-08)。
+  // Python `TARGET_GUARD_WORTHY_KINDS` と同一。
+  const TARGET_GUARD_WORTHY_KINDS = new Set([
+    "unit_destroy", "unit_bounce", "unit_core_remove", "creator_core_remove"]);
+
+  /** 相手の創界神ネクサスのコアをどこから何個取るか(2026-10-08、利用者裁定)。
+   *  `[[uid, 個数]]`を取る個数の多い順で返す。Python `plan_creator_core_removal` と同一。 */
+  function planCreatorCoreRemoval(rows, amount, scope) {
+    const live = rows.filter((row) => row.cores > 0).sort((a, b) => a.uid - b.uid);
+    if (!live.length) return [];
+    const crossed = (row, taken) => {
+      const after = row.cores - taken;
+      return (row.core_thresholds || []).filter((t) => after < t && t <= row.cores).length;
+    };
+    let plan;
+    if (scope === "each") {
+      plan = live.map((row) => [row.uid, Math.min(amount, row.cores)]);
+    } else if (scope === "one") {
+      const take = (row) => (amount === null || amount === undefined
+        ? row.cores : Math.min(amount, row.cores));
+      let best = null;
+      for (const row of live) {
+        const key = [crossed(row, take(row)), take(row), -row.uid];
+        if (!best || key[0] > best.key[0] || (key[0] === best.key[0]
+          && (key[1] > best.key[1] || (key[1] === best.key[1] && key[2] > best.key[2])))) {
+          best = { row, key };
+        }
+      }
+      plan = [[best.row.uid, take(best.row)]];
+    } else {
+      const left = new Map(live.map((row) => [row.uid, row.cores]));
+      const taken = new Map(live.map((row) => [row.uid, 0]));
+      let budget = amount;
+      while (budget > 0) {
+        let pick = null;
+        for (const row of live) {
+          const current = left.get(row.uid);
+          const usable = (row.core_thresholds || []).filter((t) => t > 0 && t <= current);
+          if (!usable.length) continue;
+          const nextT = Math.max(...usable);
+          const option = [current - nextT + 1, -nextT, row.uid];
+          if (option[0] > budget) continue;
+          if (!pick || option[0] < pick[0] || (option[0] === pick[0]
+            && (option[1] < pick[1] || (option[1] === pick[1] && option[2] < pick[2])))) {
+            pick = option;
+          }
+        }
+        if (!pick) break;
+        const [cost, , uid] = pick;
+        left.set(uid, left.get(uid) - cost);
+        taken.set(uid, taken.get(uid) + cost);
+        budget -= cost;
+      }
+      while (budget > 0) {
+        let uid = null;
+        for (const [candidate, count] of left) {
+          if (count <= 0) continue;
+          if (uid === null || count > left.get(uid) || (count === left.get(uid) && candidate < uid)) {
+            uid = candidate;
+          }
+        }
+        if (uid === null) break;
+        const step = Math.min(budget, left.get(uid));
+        left.set(uid, left.get(uid) - step);
+        taken.set(uid, taken.get(uid) + step);
+        budget -= step;
+      }
+      plan = [...taken.entries()].filter(([, count]) => count > 0);
+    }
+    return plan.sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+  }
+
+  /** 創界神ネクサスの「コアがこの数を下回ると何かを失う」境目。Python
+   *  `_creator_core_thresholds` と同一。 */
+  function creatorCoreThresholds(card) {
+    const found = new Set(Object.values(card.level_thresholds || {}).filter((v) => v > 0));
+    for (const effect of card.field_flash_effects || []) {
+      if ((effect.flash_cost_cores || 0) > 0) found.add(effect.flash_cost_cores);
+    }
+    return [...found].sort((a, b) => a - b);
+  }
+
+  /** この札を■で守れる場の札。守れなければnull。Python `_target_guard_source` と同一。
+   *  守れるのは自分の創界神ネクサスだけ。守る札はuidの小さい順に1枚。 */
+  /** 系統「創界神」を持つネクサス(契約神を含む)。Python `_is_creator_nexus` と同一。 */
+  function isCreatorNexus(cards, unit) {
+    const card = cards[unit.card_no] || {};
+    return String(card.card_type || "").endsWith("ネクサス") && Boolean(unit.creator_core);
+  }
+
+  function targetGuardSource(state, cards, unit) {
+    if (!isCreatorNexus(cards, unit)) return null;
+    const guard = [...state.field]
+      .filter((other) => !other.waiting
+        && (cards[other.card_no]?.target_guard || {}).protect === "creator_nexus")
+      .sort((left, right) => left.uid - right.uid)[0];
+    return guard || null;
+  }
+
+  /** 相手の効果がこの札を対象に指定した瞬間に、■で守るか。守ったら守りの札を
+   *  破棄してtrue。方針: 場を離れる・コアを失う効果のときだけ使う。
+   *  Python `_combat_target_guard` と同一。 */
+  function combatTargetGuard(state, cards, uid, effectKind, amount = null) {
+    const unit = state.field.find((row) => row.uid === uid);
+    if (!unit || !TARGET_GUARD_WORTHY_KINDS.has(effectKind)) return false;
+    const guard = targetGuardSource(state, cards, unit);
+    if (!guard) return false;
+    // コアを取られる効果は、境目(Lv・契約技に要るコア)を下回るときだけ守る。Python同一。
+    if ((effectKind === "unit_core_remove" || effectKind === "creator_core_remove")
+      && amount !== null && amount !== undefined) {
+      const after = unit.cores - Math.min(amount, unit.cores);
+      const thresholds = creatorCoreThresholds(cards[unit.card_no] || {});
+      if (!thresholds.some((t) => after < t && t <= unit.cores)) return false;
+    }
+    record(state, cards, "target_guard", {
+      card_no: guard.card_no, uid: guard.uid, protected: unit.card_no,
+      protected_uid: uid, effect_kind: effectKind,
+    });
+    finalizeFieldLeave(state, cards, guard, "own_effect");
+    return true;
+  }
+
+  /** 対象に指定した行のうち、相手が■で守らなかったもの(2026-10-08)。選び終えた直後・
+   *  効果を当てる前に、守りの印が付いた行についてだけ問い合わせる。対象の数は
+   *  消費したまま選び直さない。Python `_unguarded` と同一。 */
+  function unguardedTargets(board, rows, effect, counts = null) {
+    if (!board || typeof board.target_guard !== "function") return rows;
+    // 対象ごとに取る個数(コアを取る効果だけ)。Python `_unguarded` と同一。
+    const amountOf = (row) => (counts ? (counts.get(row.uid) ?? null)
+      : (effect.kind === "unit_core_remove" ? (effect.amount ?? null) : null));
+    // 守りの札1枚で対象1つ。対象ごとに1回だけ問う(複数の対象なら札を対象ごとに使える)。
+    // Python `_unguarded` と同一。
+    return rows.filter((row) => !(row.target_guard
+      && board.target_guard(row.uid, effect.kind, amountOf(row))));
   }
 
   // 耐性の行のうち、撃つ側でしか決まらないので行へそのまま渡す鍵(v395)。
@@ -6717,6 +6887,10 @@
       // 「カードが(N枚以上、)下にある相手の〜」(【毒刃】)。Python同一。
       if (effect.target_under_min !== null && effect.target_under_min !== undefined
         && (row.under_count || 0) < effect.target_under_min) return false;
+      // 「創界神ネクサス」だけを名指しする形は、創界神でないネクサスを対象にしない。
+      // Python `_combat_pick_targets` と同一。
+      if (effect.target_creator_only && (row.card_type || "").endsWith("ネクサス")
+        && !row.creator_nexus) return false;
       // 疲労は既に疲労しているものを対象にしない。
       if (effect.kind === "unit_exhaust" && row.exhausted) return false;
       // コア除去はコアを持たないものを対象にしない。
@@ -6815,6 +6989,9 @@
 
   /** 相手の行が、この効果を耐性で受けないか。Python `_resisted`と同一。 */
   function resisted(state, cards, row, effect, sourceUid) {
+    // 創界神ネクサスは創界神ネクサスを名指しする効果しか受けない(2026-10-08、カード
+    // 共通のテキスト。裁定Q10438ほか)。Python `_resisted` と同一。
+    if (row.creator_nexus && !effect.target_creator) return true;
     if (!row.resist) return false;
     const sourceNo = effect.source_card_no
       || state.field.find((unit) => unit.uid === sourceUid)?.card_no || null;
@@ -7241,6 +7418,10 @@
           target_uid: toUid, count: moved.length });
         return moved.length;
       },
+      // 場に残るマジックの■(2026-10-08): 相手の効果が対象を指定した瞬間に、守りの札を
+      // 破棄して守るか。Python `_combat_board` の`target_guard`と同一。
+      target_guard: (uid, effectKind, amount = null) =>
+        combatTargetGuard(state, cards, uid, effectKind, amount),
       destroy: (uid, cause) => {
         const unit = state.field.find((row) => row.uid === uid);
         if (!unit) return null;
@@ -8355,6 +8536,8 @@
     "under_cards_placed", "under_cards_moved", "under_cards_discarded",
     // 印字の対価（「〜することで」）を払った記録。Python同一。
     "payment",
+    // 場に残るマジックの■で創界神ネクサスを守った記録(2026-10-08、Python同一)。
+    "target_guard",
   ]);
   // 詳細を載せた棋譜だけが名乗る版。既定の棋譜には**キーごと存在しない**
   // （null を1つ足すだけでもfingerprintが動くため）。
