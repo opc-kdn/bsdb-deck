@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v76-v1";
-  const STAGE_VERSION = "v76";
+  const ENGINE_SLICE = "stage4-v77-v1";
+  const STAGE_VERSION = "v77";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v76 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v77 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v76-portable-v24";
+  const RUNTIME_VERSION = "stage4-v77-portable-v25";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1387,16 +1387,74 @@
    *  Python `_life_damage_after_protection` と同一。
    *
    *  `attacker`はアタックによる減少なら`{cost}`、効果による減少なら`null`。
-   *  アタック限定の保護は効果によるライフ減少を止めない。 */
+   *  アタック限定の保護は効果によるライフ減少を止めない。
+   *  `cap`は減るたびにNまで、`total_cap`は発揮してから減った合計がNまで
+   *  (`taken`は`damage_life`が控える)。 */
   function lifeDamageAfterProtection(state, amount, attacker) {
-    for (const row of state.lifeProtections) {
-      if (row.source_kind === "attack" && !attacker) continue;
-      if (row.attacker_cost_min !== null && row.attacker_cost_min !== undefined
-          && (!attacker || (attacker.cost || 0) < row.attacker_cost_min)) continue;
+    for (const row of applicableLifeProtections(state, attacker)) {
       if (row.protection === "none") return 0;
-      amount = Math.min(amount, row.amount);
+      if (row.protection === "total_cap") {
+        amount = Math.min(amount, Math.max(0, row.amount - (row.taken || 0)));
+      } else {
+        amount = Math.min(amount, row.amount);
+      }
     }
     return amount;
+  }
+
+  /** この減少に効く保護の行。Python `_applicable_life_protections` と同一。 */
+  function applicableLifeProtections(state, attacker) {
+    return state.lifeProtections.filter((row) => {
+      if (row.source_kind === "attack" && !attacker) return false;
+      if (row.attacker_cost_min !== null && row.attacker_cost_min !== undefined
+          && (!attacker || (attacker.cost || 0) < row.attacker_cost_min)) return false;
+      return true;
+    });
+  }
+
+  /** 『ライフ保護』を1つ効かせる(6C-2B)。期限は`scope`。
+   *  Python `_combat_protect_life` と同一。 */
+  function protectLife(state, cards, protection) {
+    state.lifeProtections.push({ ...protection });
+    record(state, cards, "life_protected", {
+      protection: protection.protection, amount: protection.amount,
+      scope: protection.scope, attacker_cost_min: protection.attacker_cost_min,
+      source_kind: protection.source_kind });
+    return true;
+  }
+
+  /** 自分のエンドステップで「次の自分のエンドステップまで」の保護を捨てる。
+   *  自分のエンドステップが来なければ残り続ける(裁定Q29589)。
+   *  Python `_expire_own_end_step_protections` と同一。 */
+  function expireOwnEndStepProtections(state) {
+    state.lifeProtections = state.lifeProtections.filter(
+      (row) => row.scope !== "own_end_step");
+  }
+
+  /** トラッシュから使えるフラッシュを並べる(2026-10-08、BSC45-099)。
+   *  戻すトラッシュのコア(`state.spent`)も含めて盤面を壊さずに払えるものだけ
+   *  (Q27694・Q27695)。撃てるのは`flash_life_protection`だけ。
+   *  Python `_combat_trash_flash_options` と同一。 */
+  function trashFlashOptions(state, cards, event = "life_reduced_by_opponent") {
+    const options = [];
+    if (state.spent <= 0) return options;
+    for (const cardNo of [...new Set(state.trashCards)]) {
+      const card = cards[cardNo] || {};
+      const route = card.trash_flash_use;
+      if (!route || route.event !== event) continue;
+      if (route.once_per_game_same_name && state.trashFlashNamesUsed.has(card.name)) continue;
+      const cost = paymentForState(state, cards, card);
+      if (cost.total - state.spent > reclaimable(state, false, cards)) continue;
+      for (const effect of card.flash_effects || []) {
+        if (effect.kind !== "flash_life_protection") continue;
+        options.push({ card_no: cardNo, kind: effect.kind,
+          protection: effect.protection ?? null,
+          amount: effect.amount ?? null,
+          attacker_cost_min: effect.attacker_cost_min ?? null,
+          effect_id: effect.effect_id ?? null, cost: cost.total });
+      }
+    }
+    return options;
   }
 
   function countRequirementsMet(requirements, count) {
@@ -7291,24 +7349,21 @@
         state.lifeProtections = state.lifeProtections.filter(
           (row) => row.scope !== "battle");
       },
+      // 「次の自分のエンドステップまで」の保護(`own_end_step`)は残す。Stage6は
+      // どちらの手番の終わりでも両方の盤面を叩くので、消すのは自分のエンドステップ
+      // (`expireOwnEndStepProtections`)。Python `_combat_end_turn_modifiers` と同一。
       end_turn_modifiers: () => {
         for (const unit of state.field) {
           if (unit.bp_penalties) unit.bp_penalties = [];
           if (unit.timed_symbol_grants) unit.timed_symbol_grants = [];
         }
-        state.lifeProtections = [];
+        state.lifeProtections = state.lifeProtections.filter(
+          (row) => row.scope === "own_end_step");
       },
       // 『ライフ保護』を1つ効かせる(6C-2B)。期限は`scope`。保護は**盤面の状態**で
       // ユニットには紐づかないので、発揮元が場を離れても切れない。
       // Python `_combat_protect_life` と同一。
-      protect_life: (protection) => {
-        state.lifeProtections.push({ ...protection });
-        record(state, cards, "life_protected", {
-          protection: protection.protection, amount: protection.amount,
-          scope: protection.scope, attacker_cost_min: protection.attacker_cost_min,
-          source_kind: protection.source_kind });
-        return true;
-      },
+      protect_life: (protection) => protectLife(state, cards, protection),
       // 相手のユニットを重疲労させる。重疲労は疲労を**含む**状態(裁定「疲労状態と
       // 同様にアタックやブロックはできず」)なので`exhausted`も立てる。
       // Python `_combat_heavy_exhaust` と同一。
@@ -7468,6 +7523,10 @@
         }
         state.life -= taken;
         if (destination === "reserve") state.reserve += taken;
+        // 合計で数える保護(`total_cap`)へ、実際に減った量を控える(Python同一)。
+        for (const row of applicableLifeProtections(state, attacker)) {
+          if (row.protection === "total_cap") row.taken = (row.taken || 0) + taken;
+        }
         return taken;
       },
       // 印字の『アタック時』『ブロック時』の窓(6B-1②)と、その下位の窓
@@ -7593,6 +7652,61 @@
           scope: effect.scope ?? null,
           attacker_cost_min: effect.attacker_cost_min ?? null,
           source_kind: effect.source_kind ?? null,
+          effect_id: effect.effect_id ?? null };
+      },
+      // トラッシュから「ライフが減ったとき」に使うフラッシュ(2026-10-08)。列挙と
+      // 実行だけで、使うかの方針はStage6が持つ。順は印字どおり: 対価(トラッシュの
+      // コアすべてをリザーブへ)→支払い→『ライフ保護』→除外。〔ゲームに1回〕は
+      // 宣言で消費(Q27951)。Python `_combat_trash_flash_options` /
+      // `_combat_play_trash_flash` と同一。
+      trash_flash_options: (event = "life_reduced_by_opponent") =>
+        trashFlashOptions(state, cards, event),
+      play_trash_flash: (cardNo, effectId) => {
+        const option = trashFlashOptions(state, cards).find(
+          (row) => row.card_no === cardNo && row.effect_id === effectId);
+        if (!option) return null;
+        const card = cards[cardNo] || {};
+        const route = card.trash_flash_use;
+        const effect = (card.flash_effects || []).find(
+          (row) => (row.effect_id ?? null) === effectId);
+        if (route.once_per_game_same_name) state.trashFlashNamesUsed.add(card.name);
+        record(state, cards, "trash_flash_declared", { card_no: cardNo,
+          once_per_game_same_name: Boolean(route.once_per_game_same_name) });
+        const moved = state.spent;
+        state.reserve += moved;
+        state.spent = 0;
+        if (state.trashHasSoul) {
+          state.trashHasSoul = false;
+          state.reserveHasSoul = true;
+        }
+        recordCoreMove(state, cards, { amount: moved, source: "trash",
+          destination: "reserve", reason: "trash_flash_use_cost",
+          source_card_no: cardNo });
+        const cost = paymentForState(state, cards, card);
+        const traceDetails = { mode: "trash_flash", pay: cost.pay, total: cost.total,
+          effect_kind: effect.kind };
+        record(state, cards, "play_presented", { card_no: cardNo, ...traceDetails });
+        record(state, cards, "cost_calculated", { card_no: cardNo, ...traceDetails });
+        const deficit = cost.total - state.reserve;
+        if (deficit > 0) fundPayment(state, cards, targets, deficit, false);
+        payFromReserve(state, cost.pay, cost.total - cost.pay);
+        state.reserve -= cost.total;
+        state.spent += cost.pay;
+        record(state, cards, "cost_paid",
+          { card_no: cardNo, payment: "cores", ...traceDetails });
+        state.trashCards.splice(state.trashCards.indexOf(cardNo), 1);
+        protectLife(state, cards, effect);
+        if (route.after_trash_use === "exclude") {
+          state.excludedCards.push(cardNo);
+          record(state, cards, "card_excluded", { card_no: cardNo, source: "trash",
+            reason: "trash_flash_use", source_card_no: cardNo });
+        } else {
+          state.trashCards.push(cardNo);
+        }
+        return { card_no: cardNo, kind: effect.kind, cost: cost.total,
+          protection: effect.protection ?? null,
+          amount: effect.amount ?? null,
+          scope: effect.scope ?? null,
           effect_id: effect.effect_id ?? null };
       },
       // 手順4のフラッシュタイミングで手札から煌臨する口(2026-10-01、Python同一)。
@@ -7863,6 +7977,9 @@
       fieldFlashUsed: new Set(),
       mainActivatedUsed: new Set(),
       trashMainSummonNamesUsed: new Set(),
+      // トラッシュから使ったフラッシュ(〔ゲームに1回：同名〕)のカード名。
+      // Python `trash_flash_names_used` と同一。
+      trashFlashNamesUsed: new Set(),
       // 効いている『ライフ保護』(6C-2B)。盤面の状態でユニットには紐づかない。
       // Python `life_protections` と同一。
       lifeProtections: [],
@@ -8177,6 +8294,8 @@
       state.mainActivatedUsed.clear();
       state.blockTurnUsed.clear();
       state.kourinWaiverNames.clear();
+      // 「次の自分のエンドステップまで」はここで切れる(Python同一)。
+      expireOwnEndStepProtections(state);
       // ターン終了。エンドステップの処理まで終わった後(公式の並び)。
       record(state, cards, "turn_end");
       state.ownTurnActive = false;
@@ -8475,7 +8594,7 @@
   const FORBIDDEN_EVENT_TYPES = new Set([
     "attack_declared", "block_declared", "life_damaged", "battle_resolved",
     "destroyed_by_battle", "burst_activated", "flash_defense_played", "flash_kourin_played",
-    "flash_removal_played",
+    "flash_removal_played", "trash_flash_played",
     "field_flash_resolved",
     "attack_effects_resolved", "block_effects_resolved",
     "blocked_effects_resolved", "battle_end_effects_resolved",
@@ -8497,6 +8616,8 @@
     "burst_activated",
     // 6C-2B: 守り手が手札からフラッシュの防御札を使った記録。
     "flash_defense_played",
+    // ライフが減った直後にトラッシュのフラッシュを使った記録(2026-10-08、Python同一)。
+    "trash_flash_played",
     // 公式手順4のフラッシュタイミングで手札から煌臨した記録(2026-10-01)。
     "flash_kourin_played",
     // 公式手順2・4のフラッシュタイミングで手札の除去を撃った記録(2026-10-01)。
@@ -8523,6 +8644,8 @@
     "mirage_set", "open_reaction_declared", "open_reaction_queued", "opening_hand",
     "play_complete", "play_presented", "deck_top_revealed",
     "card_excluded", "trash_summon_declared", "effect_free_summon_declared",
+    // トラッシュから使うフラッシュの宣言(2026-10-08、Python同一)。
+    "trash_flash_declared",
     // アタックの窓で付いた一時シンボル(2026-08-31)。
     "symbol_granted",
     "opponent_turn_end",
@@ -9212,6 +9335,43 @@
     return openBurst(emit, owner, board, BURST_LIFE_LOSS, opponentBoard);
   }
 
+  /** トラッシュから使う『ライフ保護』が、この後のアタックで減る量を減らすか(方針)。
+   *  ゲームに1回で、使うのはライフが減った後(Q27696)。残りのアタッカーに
+   *  シンボルが上限より多いものが居るときだけ。Python `_trash_flash_helps` と同一。 */
+  //  得になるかは**後続の打点の合計**で見る(2026-10-08 利用者指摘)。合計で数える
+  //  保護(`total_cap`)は発揮後に何回殴られても合計Nしか減らない。
+  function trashFlashHelps(option, laterAttackers) {
+    if (option.kind !== "flash_life_protection") return false;
+    const rows = laterAttackers.filter((row) => option.attacker_cost_min === null
+      || option.attacker_cost_min === undefined || row.cost >= option.attacker_cost_min);
+    const threat = rows.reduce((sum, row) => sum + row.symbol_count, 0);
+    let protectedLife;
+    if (option.protection === "none") protectedLife = 0;
+    else if (option.protection === "total_cap") protectedLife = Math.min(option.amount, threat);
+    else protectedLife = rows.reduce(
+      (sum, row) => sum + Math.min(option.amount, row.symbol_count), 0);
+    return threat > protectedLife;
+  }
+
+  /** 相手によってライフが減った直後に、トラッシュのフラッシュを使う(2026-10-08)。
+   *  手番側の誘発の後、バーストより前。並びはコスト→カード番号。
+   *  Python `_trash_flash_after_life_loss` と同一。 */
+  function trashFlashAfterLifeLoss(emit, owner, board, laterAttackers) {
+    if (board.life() <= 0) return null;
+    const options = board.trash_flash_options().slice().sort((left, right) =>
+      left.cost - right.cost
+      || (left.card_no < right.card_no ? -1 : left.card_no > right.card_no ? 1 : 0));
+    for (const option of options) {
+      if (!trashFlashHelps(option, laterAttackers)) continue;
+      const played = board.play_trash_flash(option.card_no, option.effect_id);
+      if (!played) continue;
+      emit("trash_flash_played", owner, { card_no: played.card_no, kind: played.kind,
+        cost: played.cost, reason: "attackers_remain" });
+      return played;
+    }
+    return null;
+  }
+
   /** 2人しかいないので、相手のplayer_id。Python `_other_player` と同一。 */
   function otherPlayer(owner) {
     return PLAYER_IDS.find((playerId) => playerId !== owner);
@@ -9290,6 +9450,10 @@
       if (!threat.life) return false;
       if (option.attacker_cost_min !== null && option.attacker_cost_min !== undefined
           && threat.attacker_cost < option.attacker_cost_min) return false;
+      // 合計で数える保護は、このバトルと後続の打点の合計で見る(Python同一)。
+      if (option.protection === "total_cap") {
+        return threat.life + (threat.later_life || 0) > option.amount;
+      }
       return option.protection === "none" || threat.life > option.amount;
     }
     const threatened = Boolean(threat.life || threat.unit);
@@ -9561,7 +9725,9 @@
         // 『ライフ保護』を選ぶには**量**が要る(Python同一)。
         const flash = flashDefense(emit, defenderId, defenderBoard,
           { life: Math.min(attacker.symbol_count, defenderBoard.life()),
-            unit: false, attacker_cost: attacker.cost },
+            unit: false, attacker_cost: attacker.cost,
+            later_life: remainingAttackerRows(order, index, attackerBoard)
+              .reduce((sum, row) => sum + row.symbol_count, 0) },
           remainingAttackers(order, index, attackerBoard).length > 0);
         if (flashStopsTheBattle(flash)) {
           if (flashStopBattle(emit, actor, defenderId, boards, attacker, null, flash)) {
@@ -9583,6 +9749,9 @@
           // 依然処理できるなら発動する。Python `_resolve_attack_step` と同一。
           emitTrigger(emit, attackerBoard, actor, uid, attacker,
             "life_reduced", defenderBoard);
+          // 守り手の「相手によって自分のライフが減ったとき」(トラッシュのフラッシュ)。
+          trashFlashAfterLifeLoss(emit, defenderId, defenderBoard,
+            remainingAttackerRows(order, index, attackerBoard));
           burstAfterLifeLoss(emit, defenderId, defenderBoard, attackerBoard);
         }
         emit("battle_resolved", actor, { attacker, blocker: null,
