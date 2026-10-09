@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v77-v1";
-  const STAGE_VERSION = "v77";
+  const ENGINE_SLICE = "stage4-v78-v1";
+  const STAGE_VERSION = "v78";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v77 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v78 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v77-portable-v25";
+  const RUNTIME_VERSION = "stage4-v78-portable-v26";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3489,6 +3489,15 @@
         source_uid: sourceUid, target_uid: unit.uid });
       return amount > 0;
     }
+    if (effect.kind === "draw_step_bonus") {
+      // ドローする効果ではなく、ステップ本来のドローの枚数を増やす修正
+      // (Q442・Q29479)。引くのは`runDrawStep`。Python同一。
+      state.stepDrawBonus += amount;
+      if (effect.discard_after) {
+        state.stepDrawDiscards.push([effect.discard_after, effect.source_card_no ?? null]);
+      }
+      return true;
+    }
     if (effect.kind === "count_gain") {
       return applyCountGain(state, cards, amount, effect.cap, {
         source_card_no: effect.source_card_no, source_uid: sourceUid });
@@ -3859,8 +3868,13 @@
       if (effect.requires_successful_draw
           && !(handDiscardRequired > 0 && state.hand.length >= handDiscardRequired
                && state.deck.length > 0)) return false;
+      // 「手札をK枚以下になるように破棄する」(BS35-084、2026-10-10)。手札が既に
+      // K枚以上なら引いた分を全部捨てるだけなので、任意の節は撃たない。Python同一。
+      const downTo = effect.discard_down_to ?? null;
+      if (downTo !== null && effect.optional && state.hand.length >= downTo) return false;
       if (effect.draw_first) draw(state, cards, effect.draw || 0, "hand_filter");
-      const discard = effect.discard_all ? state.hand.length : Math.min(effect.discard || 0, state.hand.length);
+      let discard = effect.discard_all ? state.hand.length : Math.min(effect.discard || 0, state.hand.length);
+      if (downTo !== null) discard = Math.max(0, state.hand.length - downTo);
       const ordered = chooseHandDiscards(
         state, cards, targets, discard, Boolean(effect.discard_all),
         discardSummonReady(state, cards, effect.source_card_no));
@@ -7218,6 +7232,69 @@
     return false;
   }
 
+  // 先攻1ターン目に**ステップごと無い**もの(Python `FIRST_TURN_SKIPPED_OWN_STEPS`)。
+  const FIRST_TURN_SKIPPED_OWN_STEPS = new Set(["core", "attack_start", "attack", "attack_end"]);
+
+  /** 自分のターンの『〜ステップ』の節を、そのステップで撃つ(2026-10-10)。
+   *  発揮元は**ステップに入った時点で場に居たものだけ**で、解決待ちの間に場を
+   *  離れたものは撃たない。〔重複不可〕は同じ効果を1回だけ。並びは場に出た順。
+   *  Python `_resolve_own_step_effects` と同一。 */
+  function resolveOwnStepEffects(state, cards, targets, step, goingFirst) {
+    const unitOf = (uid) => state.field.find((unit) => unit.uid === uid);
+    const present = (uid) => uid === null || uid === undefined
+      || Boolean(unitOf(uid) && !unitOf(uid).waiting);
+    const sources = [];
+    for (const entry of state.recurring) {
+      if (!present(entry.uid)) continue;
+      for (const effect of entry.effects) {
+        if (effect.own_step !== step) continue;
+        if (goingFirst && state.turn === 1 && FIRST_TURN_SKIPPED_OWN_STEPS.has(step)) continue;
+        // 合体中効果は合体プレイのブレイヴでだけ(Python `_enabler_active_for_unit`)。
+        if (effect.combine_only && unitOf(entry.uid)?.brave_mode !== "combine") continue;
+        sources.push([entry.uid, effect]);
+      }
+    }
+    const stacked = new Set();
+    for (const [uid, effect] of sources) {
+      if (!present(uid)) continue;
+      // 発揮できない節は宣言できないので棋譜にも出さない(D29、Python同一)。
+      // 〔重複不可〕も撃てた1枚目だけを数える。
+      if (!effectActive(effect, state, cards, uid)) continue;
+      if (effect.non_stackable) {
+        if (stacked.has(effect.effect_id)) continue;
+        stacked.add(effect.effect_id);
+      }
+      const cardNo = unitOf(uid)?.card_no ?? effect.source_card_no ?? null;
+      resolveEffect(state, cards, targets, effect, uid);
+      flushCountReactions(state, cards, targets);
+      record(state, cards, "step_effect", {
+        step, card_no: cardNo, uid: uid ?? null, effect_kind: effect.kind,
+      });
+      noteLegalCandidates(state, cards, targets);
+    }
+  }
+
+  /** ドローステップ: 効果を解いてから、増えた枚数で本来のドロー(Q291・Q4763)。
+   *  「ドロー後、手札M枚を破棄する」は本来のドローの後にまとめて1回(Q13636)。
+   *  Python `_run_draw_step` と同一。 */
+  function runDrawStep(state, cards, targets, goingFirst) {
+    state.stepDrawBonus = 0;
+    state.stepDrawDiscards = [];
+    resolveOwnStepEffects(state, cards, targets, "draw", goingFirst);
+    draw(state, cards, 1 + state.stepDrawBonus, "draw_step");
+    const discards = state.stepDrawDiscards;
+    state.stepDrawBonus = 0;
+    state.stepDrawDiscards = [];
+    if (discards.length) {
+      resolveEffectBody(state, cards, targets, {
+        kind: "hand_filter", draw: 0,
+        discard: discards.reduce((sum, [amount]) => sum + amount, 0),
+        discard_all: false, draw_first: true, draw_per_discard: 0,
+        requires_successful_draw: false, source_card_no: discards[0][1],
+      }, null);
+    }
+  }
+
   function resolveOpponentEndStep(state, cards, targets, lifeReduced = false,
       model = "actual") {
     const sources = [];
@@ -7988,6 +8065,9 @@
       dig: opening.opening_hand.length, handGain: opening.opening_hand.length,
       sideGain: 0, sacrifice: 0, seen: new Set(opening.opening_hand), played: new Set(),
       playCounts: {}, recurring: [], oraclePool: [], openPoolStack: [], burst: null,
+      // ドローステップの「ドローの枚数を+N枚する」(Python `step_draw_bonus`と同一)。
+      // 値が残るのはドローステップの中だけ。
+      stepDrawBonus: 0, stepDrawDiscards: [],
       effectFrameDepth: 0, deferredFieldLeaves: [], deferredPlayCompletions: [],
       deferredDerivedPlays: [],
       // 相手盤面の**公開情報の要約**(6C-3)。Stage6が自分のターンの前に入れる。
@@ -8091,18 +8171,21 @@
       record(state, cards, "turn_start");
       // ①スタートステップ。公式の7ステップ(page05)は戦闘モードだけ棋譜へ出す。
       if (state.combat) record(state, cards, "step_start");
+      resolveOwnStepEffects(state, cards, targets, "start", options.going_first);
       // ②コアステップ(先攻1ターン目のみ無し)
       if (!(options.going_first && turn === 1)) {
         // ⚠️ ステップの記録は**処理より前**(Python同一)。後ろへ置くと棋譜が
         // 「コアを得た→コアステップ」の順に読め、将来ここへ『自分のコア
         // ステップ』の効果を足す人がルール処理の後ろへ差し込んでしまう。
         if (state.combat) record(state, cards, "step_core", { gained: 1 });
+        // 『自分のコアステップ』は記録とコアの間(Q291、Python同一)。
+        resolveOwnStepEffects(state, cards, targets, "core", options.going_first);
         state.reserve += 1;
       }
       // ③ドローステップ。記録はドローの前——『自分のドローステップ』の効果を
       // 足すときは、この記録と`draw`の**間**で解決する(引いた後では遅い)。
       if (state.combat) record(state, cards, "step_draw", { drawn: 1 });
-      draw(state, cards, 1, "draw_step");
+      runDrawStep(state, cards, targets, options.going_first);
       // ④リフレッシュステップ(トラッシュ→リザーブ＋疲労の全回復)。記録は処理の前。
       if (state.combat) {
         record(state, cards, "step_refresh", {
@@ -8110,6 +8193,7 @@
             .map((unit) => unit.uid).sort((left, right) => left - right),
         });
       }
+      resolveOwnStepEffects(state, cards, targets, "refresh", options.going_first);
       state.reserve += state.spent;
       state.reserveHasSoul = state.reserveHasSoul || state.trashHasSoul;
       state.spent = 0;
@@ -8126,6 +8210,11 @@
       // ⑤メインステップ。開始の記録は他のステップと同じく`step_*`。A-1(戦闘なし)は
       // ステップを持たないので、その棋譜ではturn_start〜turn_endがメインの範囲になる。
       if (state.combat) record(state, cards, "step_main");
+      // 『自分のメインステップ開始時』、続いて窓。窓の節はメインの手に使えるよう
+      // 入口で1回撃つ(Python同一)。
+      for (const ownStep of ["main_start", "main", "turn"]) {
+        resolveOwnStepEffects(state, cards, targets, ownStep, options.going_first);
+      }
       // 盤面のフラッシュ効果は**メインステップでも撃てる**(ステップ指定の無い
       // 『フラッシュ』はメインステップのフラッシュタイミングでも使える。Q2508)。
       // メインの手を打つ前に一度試す——カウントを増やすフラッシュ効果は、その
@@ -8265,31 +8354,31 @@
       }
       // ⑥アタックステップ。先攻1ターン目には存在しない(公式 page05)。解決は
       // Stage6が行う——相手の盤面が要るのでこの試行の中では決められない。
-      // 位置はPython側と同じ「メインの後・ターン末のrecurringより前」。
-      if (state.combat && !(options.going_first && turn === 1)) {
-        record(state, cards, "step_attack");
-        yield { turn, step: "attack", board: combatBoard(state, cards, targets) };
+      // 位置はPython側と同じ「メインの後・エンドステップの前」。
+      if (!(options.going_first && turn === 1)) {
+        if (state.combat) record(state, cards, "step_attack");
+        // 開始時は開始の記録の直後、窓も入口で1回。Stage4ソロはアタックが無いので
+        // 終了時も続けて撃つ(Python同一)。
+        resolveOwnStepEffects(state, cards, targets, "attack_start", options.going_first);
+        resolveOwnStepEffects(state, cards, targets, "attack", options.going_first);
+        if (state.combat) {
+          yield { turn, step: "attack", board: combatBoard(state, cards, targets) };
+          record(state, cards, "step_attack_end");
+        }
+        resolveOwnStepEffects(state, cards, targets, "attack_end", options.going_first);
       }
       // メインの後にもう一度試す。入口では条件(Lv・支払い)が揃っていなくても、
       // メインでコアやカードが動いた後なら撃てることがある。〔ターンに1回〕が
       // あるので、入口で撃てていればここは何もしない。Python同一。
       resolveAllFieldFlash(state, cards, targets);
-      for (const entry of state.recurring) {
-        if (!state.field.some((unit) => unit.uid === entry.uid)) continue;
-        for (const effect of entry.effects) {
-          if (options.going_first && turn === 1
-              && effect.recurring_timing === "attack_step") continue;
-          resolveEffect(state, cards, targets, effect, entry.uid);
-          flushCountReactions(state, cards, targets);
-          noteLegalCandidates(state, cards, targets);
-        }
-      }
       noteLegalCandidates(state, cards, targets);
       allocateEndTurnLevelCores(state, cards, targets);
       // ⑦エンドステップ。**〔ターンに1回〕の数え直しはここ**(ユーザー裁定)。
       // ターン開始で消すと、自分のターンに撃った札が相手のターンでも撃てない
       // ままになる。Python `_end_step_reset` と同一。
       if (state.combat) record(state, cards, "step_end");
+      // 『自分のエンドステップ』は〔ターンに1回〕の数え直しより前(Python同一)。
+      resolveOwnStepEffects(state, cards, targets, "end", options.going_first);
       state.fieldFlashUsed.clear();
       state.mainActivatedUsed.clear();
       state.blockTurnUsed.clear();
@@ -8630,6 +8719,8 @@
   const STEP_EVENT_PHASES = {
     step_start: "start", step_core: "core", step_draw: "draw",
     step_refresh: "refresh", step_main: "main", step_attack: "attack",
+    // アタックステップの終わり(2026-10-10、Python同一)。
+    step_attack_end: "attack_end",
     step_end: "end",
   };
   // Python側 MAIN_EVENT_TYPES と同一。メインステップの中でStage4が記録する
@@ -8649,6 +8740,8 @@
     // アタックの窓で付いた一時シンボル(2026-08-31)。
     "symbol_granted",
     "opponent_turn_end",
+    // 自分のターンの『〜ステップ』の節を、そのステップで撃った記録(2026-10-10)。
+    "step_effect",
     // 契約カードが場を離れる代わりに魂状態になった記録(`field_left`とは別)。
     "soul_state_entered",
     // 魂状態から《契約煌臨》で戻った記録(Python同一)。
@@ -10038,7 +10131,8 @@
       // 詳細イベントのphaseは**そのとき踏んでいるステップ**(Python同一)。
       let currentPhase = "main";
       for (const source of sourceEvents) {
-        if (source.type === "step_end") {
+        // アタックステップの終わりの記録があればその前、無ければエンドの前(Python同一)。
+        if (!spliced && (source.type === "step_attack_end" || source.type === "step_end")) {
           spliceCombat(round, actor);
           spliced = true;
         }
