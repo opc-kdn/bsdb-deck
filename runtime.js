@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v78-v1";
-  const STAGE_VERSION = "v78";
+  const ENGINE_SLICE = "stage4-v79-v1";
+  const STAGE_VERSION = "v79";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v78 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v79 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v78-portable-v26";
+  const RUNTIME_VERSION = "stage4-v79-portable-v27";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3453,6 +3453,16 @@
         reason: "coreboost", source_card_no: effect.source_card_no, source_uid: sourceUid });
       return amount > 0;
     }
+    if (effect.kind === "field_coreboost" && effect.target_event_subject) {
+      // 「そのスピリットに置く」＝引き金の主語(アタックした体、Python同一)。
+      const unit = state.field.find((row) => row.uid === state.eventSubjectUid && !row.waiting);
+      if (!unit || amount <= 0) return false;
+      unit.cores += amount;
+      recordCoreMove(state, cards, { amount, source: "void", destination: "field",
+        reason: effect.kind, source_card_no: effect.source_card_no,
+        source_uid: sourceUid, target_uid: unit.uid });
+      return true;
+    }
     if (effect.kind === "self_coreboost" || effect.kind === "field_coreboost") {
       const targetMatches = (unit) => {
         if (effect.kind === "self_coreboost") return unit.uid === sourceUid;
@@ -4931,13 +4941,25 @@
   // `block_turn_limit`は見出しの読み違いで付かないことがある)。まとめる単位は
   // `effect_block_id`なので、1つの印字効果が節へ割れていても回数は1回。
   // Python `_event_trigger_limit_keys` と同一。
-  function eventTriggerLimitKeys(cards, effect, unit) {
+  function eventTriggerLimitKeys(cards, effect, sourceUid, sourceCardNo) {
+    const keys = [];
     const limit = (effect.trigger || {}).limit;
     const block = effect.effect_block_id;
-    if (!limit || !block) return [];
-    return [limit === "once_per_turn_name"
-      ? `name\u0000${cards[unit.card_no]?.name || unit.card_no}\u0000${block}`
-      : `card\u0000${unit.uid}\u0000${block}`];
+    const name = cards[sourceCardNo]?.name || sourceCardNo;
+    if (limit && block) {
+      keys.push(limit === "once_per_turn_name"
+        ? `name\u0000${name}\u0000${block}`
+        : `card\u0000${sourceUid}\u0000${block}`);
+    }
+    // 節の文に置かれた「ターンに1回」(2026-10-10、Python同一)。節ごとに数える。
+    if (effect.clause_turn_limit) {
+      // 鍵は`effect_id`(配布カタログは逐語の印字を持たない。Python同一)。
+      const clause = effect.effect_id ?? "";
+      keys.push(effect.clause_turn_limit === "once_per_turn_name"
+        ? `clause_name\u0000${name}\u0000${clause}`
+        : `clause\u0000${sourceUid}\u0000${sourceCardNo}\u0000${clause}`);
+    }
+    return keys;
   }
 
   /** 誘発の窓。場に在るカードが、**別のカードに起きたこと**で撃つ。
@@ -4945,13 +4967,25 @@
    *  ⚠️ 自分自身の召喚では撃たない(発揮元が場に載るのと同じ処理なので、
    *  素通しにすると「自分が出たこと」で自分の誘発が開く)。 */
   function resolveEventTriggers(state, cards, targets, event, payload) {
-    for (const unit of [...state.field]) {
-      if (unit.waiting || payload.uid === unit.uid) continue;
-      const card = cards[unit.card_no];
+    // 発揮元は場のユニットと、【セット中】の効果ならセットされたミラージュ
+    // (2026-10-10、Python同一)。アタックは発揮元が既に場に居るので自分の
+    // アタックでも撃つ(「このスピリット以外の」が無ければ)。
+    const sources = state.field
+      .filter((unit) => !unit.waiting
+        && (payload.uid !== unit.uid || event === "ally_attacked"))
+      .map((unit) => [unit.uid, unit.card_no, false]);
+    if (state.mirage) sources.push([null, state.mirage, true]);
+    const stacked = new Set();
+    for (const [sourceUid, sourceCardNo, fromMirage] of sources) {
+      const card = cards[sourceCardNo];
       const matched = [];
       for (const effect of (card?.triggered_effects || [])) {
         const trigger = effect.trigger || {};
         if (trigger.event !== event) continue;
+        if (Boolean(effect.works_while_set) !== fromMirage) continue;
+        if (trigger.own_turn_only && !state.ownTurnActive) continue;
+        if (trigger.excludes_source && sourceUid !== null
+            && payload.uid === sourceUid) continue;
         if (event === "ally_summoned") {
           const played = cards[payload.card_no] || {};
           if (!SUMMONABLE_CARD_TYPES.has(played.card_type)) continue;
@@ -4961,15 +4995,37 @@
         matched.push(effect);
       }
       const fired = [];
+      const chosen = new Set();
       for (const effect of matched) {
         // 発揮できない誘発は回数を消費しない(D29、Python同一)。
-        if (!effectActive(effect, state, cards, unit.uid)) continue;
-        const keys = eventTriggerLimitKeys(cards, effect, unit);
+        if (!effectActive(effect, state, cards, sourceUid)) continue;
+        // 択一は撃てる最初の枝だけ、〔重複不可〕は同じ出来事で1回(Python同一)。
+        const choice = effect.exclusive_group ?? null;
+        if (choice !== null && chosen.has(choice)) continue;
+        const stackKey = `${sourceCardNo}\u0000${effect.effect_id ?? ""}`;
+        if (effect.non_stackable && stacked.has(stackKey)) continue;
+        const keys = eventTriggerLimitKeys(cards, effect, sourceUid, sourceCardNo);
         if (keys.some((key) => state.blockTurnUsed.has(key))) continue;
         fired.push(effect);
         keys.forEach((key) => state.blockTurnUsed.add(key));
+        if (choice !== null) chosen.add(choice);
+        if (effect.non_stackable) stacked.add(stackKey);
       }
-      for (const effect of fired) resolveEffect(state, cards, targets, effect, unit.uid);
+      for (const effect of fired) {
+        const previous = state.eventSubjectUid;
+        state.eventSubjectUid = payload.uid ?? null;
+        try {
+          resolveEffect(state, cards, targets, effect, sourceUid);
+        } finally {
+          state.eventSubjectUid = previous;
+        }
+        if (event === "ally_attacked") {
+          record(state, cards, "event_trigger_effect", {
+            event, card_no: sourceCardNo, uid: sourceUid, effect_kind: effect.kind,
+            subject_uid: payload.uid ?? null, subject_card_no: payload.card_no ?? null,
+          });
+        }
+      }
     }
   }
 
@@ -7986,6 +8042,22 @@
           state.combatOpponent = null;
           endEffectFrame(state);
         }
+        // アタック宣言なら、ほかの札の「アタックしたとき」も配る(2026-10-10)。
+        // 『アタック時』と同じタイミングで、アタックした体自身の窓の後に解く
+        // (Python `_combat_resolve_trigger`と同一)。
+        const attacker = state.field.find((row) => row.uid === uid);
+        if (window === "attack" && attacker && !attacker.waiting) {
+          state.combatOpponent = opponent || null;
+          beginEffectFrame(state);
+          try {
+            resolveEventTriggers(state, cards, targets, "ally_attacked",
+              { card_no: attacker.card_no, uid });
+            flushCountReactions(state, cards, targets);
+          } finally {
+            state.combatOpponent = null;
+            endEffectFrame(state);
+          }
+        }
         return resolved;
       },
       life: () => state.life,
@@ -8068,6 +8140,9 @@
       // ドローステップの「ドローの枚数を+N枚する」(Python `step_draw_bonus`と同一)。
       // 値が残るのはドローステップの中だけ。
       stepDrawBonus: 0, stepDrawDiscards: [],
+      // 解決中の誘発の引き金の主語(「そのスピリットに置く」の「その」、Python
+      // `event_subject_uid`と同一)。誘発を解くあいだだけ立てる。
+      eventSubjectUid: null,
       effectFrameDepth: 0, deferredFieldLeaves: [], deferredPlayCompletions: [],
       deferredDerivedPlays: [],
       // 相手盤面の**公開情報の要約**(6C-3)。Stage6が自分のターンの前に入れる。
@@ -8742,6 +8817,8 @@
     "opponent_turn_end",
     // 自分のターンの『〜ステップ』の節を、そのステップで撃った記録(2026-10-10)。
     "step_effect",
+    // ほかの札の「自分のスピリットがアタックしたとき」を撃った記録(2026-10-10)。
+    "event_trigger_effect",
     // 契約カードが場を離れる代わりに魂状態になった記録(`field_left`とは別)。
     "soul_state_entered",
     // 魂状態から《契約煌臨》で戻った記録(Python同一)。
