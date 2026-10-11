@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v79-v1";
-  const STAGE_VERSION = "v79";
+  const ENGINE_SLICE = "stage4-v80-v1";
+  const STAGE_VERSION = "v80";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v79 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v80 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v79-portable-v27";
+  const RUNTIME_VERSION = "stage4-v80-portable-v28";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -745,6 +745,15 @@
     "exchange", "reveal_play_remainder", "face_up_top_cycle",
     // 自己反応の続き(「そうしたとき、…」、2026-10-03)。
     "creator_core_gain", "hand_to_deck_bottom",
+    // ドローステップの「ドローの枚数を+N枚する」(v78)。⚠️ v78・v79はここに無く、
+    // 配布HTMLと公開Web版がこの札を入れたデッキの計算を入口で拒否していた
+    // (2026-10-10に発見。テストが写しの表を見ていたので通っていた)。
+    "draw_step_bonus",
+    // 相手のターンのステップ(と、お互いの開始時・エンドステップ)の節は相手を触る
+    // 種別も`enablers`に持つ(v80)。解き方はバーストと同じ`resolveEffect`。
+    "unit_destroy", "unit_exhaust", "unit_core_remove", "unit_bounce",
+    "unit_heavy_exhaust", "unit_bp_down", "life_core_remove", "field_core_remove",
+    "reserve_core_remove", "soul_core_remove", "creator_core_remove",
   ]);
   // Python `resolve_burst_effects`が実際に解ける語彙と同一。以前は資源系だけを
   // 列挙していたため、実行系には実装済みの相手盤面干渉でも共有HTMLが入口で拒否した。
@@ -1539,6 +1548,10 @@
         const source = state.field.find((unit) => unit.uid === sourceUid);
         return Boolean(source && source.summoned_from === "side");
       }
+      // このターン、自分のライフが減っていなかったとき(2026-10-10、Python同一)。
+      if (condition.kind === "own_life_not_reduced_this_turn") return !state.lifeReducedThisTurn;
+      // このスピリットがいれば(魂状態から撃つときだけ偽、Python同一)。
+      if (condition.kind === "source_on_field") return state.stepSourceOnField !== false;
       // 「魂状態/煌臨元を含む自分の白の契約スピリットがいる間」(2026-10-04)。
       // Python `own_contract_colors`と同一。場は常に、他のゾーンは印字どおり。
       if (condition.kind === "own_contract_spirit_present") {
@@ -1933,6 +1946,7 @@
         && cards[unit.card_no]?.has_sealed_effect);
       const takesSoul = state.lifeHasSoul && (!sealedActive || plan.life > ordinary);
       state.life -= plan.life;
+      if (plan.life > 0) state.lifeReducedThisTurn = true;
       if (takesSoul) {
         state.lifeHasSoul = false;
         state.trashHasSoul = true;
@@ -2722,7 +2736,9 @@
       source_card_no: null, source_uid: null, target_uid: null, ...filled });
   }
 
-  function record(state, cards, type, details = {}, turn = state.turn) {
+  // 棋譜のターン番号は、相手のターンの間だけ直前の自分のターンに固定する
+  // (`state.traceTurn`、Python `trace_turn`と同一)。
+  function record(state, cards, type, details = {}, turn = state.traceTurn ?? state.turn) {
     if (!state.trace) return;
     state.events.push({
       seq: state.events.length + 1,
@@ -3924,6 +3940,7 @@
         && cards[unit.card_no]?.has_sealed_effect);
       const takesSoul = state.lifeHasSoul && (!sealedActive || amount > ordinary);
       state.life -= amount;
+      if (amount > 0) state.lifeReducedThisTurn = true;
       if (takesSoul) {
         state.lifeHasSoul = false;
         if (effect.destination === "reserve") state.reserveHasSoul = true;
@@ -4056,7 +4073,10 @@
       applyOpenReactions(state, cards, targets, pool, effect.source_card_no);
       pool.forEach((cardNo) => state.seen.add(cardNo));
       const selection = chooseFromPool(pool, effect.condition_slots || [], cards, targets);
-      const remaining = [...pool];
+      // 出した札は**オープン中の場所そのもの**から抜く(Pythonと同一)。⚠️ 2026-10-11まで
+      // 写し(`[...pool]`)から抜いていたので、棋譜の盤面では出した札が手札と公開の
+      // 両方に居て、場に出た後も公開に残っていた(詳細モードの掃検で発覚、BS52-072)。
+      const remaining = pool;
       // 公開から出す札は同じ効果の同時召喚。Pythonは1つの予約にまとめて神託を
       // 1回にする(裁定2955)ので、窓がカードごとのWorkerは組で数える。
       const previousGroup = state.summonGroup;
@@ -4382,12 +4402,25 @@
       const choiceGroup = effect.exclusive_group;
       if (choiceGroup !== null && choiceGroup !== undefined
           && resolvedChoiceGroups.has(choiceGroup)) continue;
+      // 発揮できない節(条件・対価)は宣言できないので棋譜にも出さない(D29、
+      // Python `resolve_burst_effects`の入口の`can_resolve_enabler`と同一)。
+      // ⚠️ 2026-10-11まで既定の枝は不発でも見出しと終わり(`resolved: false`)を
+      // 書いていて、Pythonと詳細の棋譜が割れていた。
+      if (!effectActive(effect, state, cards, null)) continue;
       if (effect.kind === "burst_free_play_self") {
         // 直接合体は維持コアが要らない（裁定3616、Python同一）。以前は合体させても
         // 維持コアぶんをリザーブから払い、どこにも置かずに消していた。
         const mode = braveMode(card, state, cards);
+        const total = mode === "combine" ? 0 : card.maintenance || 0;
+        // 召喚条件と維持コアの原資は`play`へ入る**前**に見る(Python
+        // `resolve_burst_effects`の`_summon_condition_met`・`_affordable(total, True)`
+        // と同一)。⚠️ 2026-10-11まで両方とも見ておらず、`play`が「提示」「コスト確定」
+        // を書いてから捻出で失敗して戻っていた(BS69-NX02、詳細モードの掃検で発覚)。
+        // 召喚条件は記録だけでなく、満たさないのに出してしまう穴でもあった。
+        if (!summonConditionsMet(card, state, cards)
+            || total > reclaimable(state, true, cards)) continue;
         selfPlayed = play(state, cards, targets, {
-          card_no: cardNo, pay: 0, total: mode === "combine" ? 0 : card.maintenance || 0,
+          card_no: cardNo, pay: 0, total,
           maintenance: card.maintenance || 0, brave_mode: mode,
           allow_sacrifice: true, mode: "burst_free_play",
         });
@@ -4552,6 +4585,7 @@
       state.reserveHasSoul = false;
     } else if (source === "life") {
       state.life -= 1;
+      state.lifeReducedThisTurn = true;
       state.lifeHasSoul = false;
     } else if (source === "field") {
       const holder = soulFieldHolder(state, host);
@@ -4578,6 +4612,7 @@
       state.reserveHasSoul = false;
     } else if (source.zone === "life") {
       state.life -= 1;
+      state.lifeReducedThisTurn = true;
       state.lifeHasSoul = false;
     } else {
       source.unit.cores -= 1;
@@ -5012,18 +5047,19 @@
         if (effect.non_stackable) stacked.add(stackKey);
       }
       for (const effect of fired) {
+        // 見出しは解決の前(何をしたかは続く記録が持つ、Python同一)。
+        if (event === "ally_attacked") {
+          record(state, cards, "event_trigger_effect", {
+            event, card_no: sourceCardNo, uid: sourceUid, effect_kind: effect.kind,
+            subject_uid: payload.uid ?? null, subject_card_no: payload.card_no ?? null,
+          });
+        }
         const previous = state.eventSubjectUid;
         state.eventSubjectUid = payload.uid ?? null;
         try {
           resolveEffect(state, cards, targets, effect, sourceUid);
         } finally {
           state.eventSubjectUid = previous;
-        }
-        if (event === "ally_attacked") {
-          record(state, cards, "event_trigger_effect", {
-            event, card_no: sourceCardNo, uid: sourceUid, effect_kind: effect.kind,
-            subject_uid: payload.uid ?? null, subject_card_no: payload.card_no ?? null,
-          });
         }
       }
     }
@@ -5621,7 +5657,9 @@
     const summonGroup = state.summonGroup || null;
     const mode = candidate.mode || "normal";
     const traceDetails = { mode, pay: candidate.pay, total: candidate.total };
-    if (["normal", "manifestation"].includes(mode)) {
+    // トラッシュからの召喚も通常の召喚と同じ支払いなので、同じ鍵を持つ(2026-10-11、
+    // Python `play_card`の`trace_mode`と同一。それまで`brave_mode`を書いていなかった)。
+    if (["normal", "manifestation", "trash_main_summon"].includes(mode)) {
       traceDetails.creator_uid = candidate.manifestation_creator_uid ?? null;
       traceDetails.brave_mode = candidate.brave_mode;
     }
@@ -7296,38 +7334,97 @@
    *  離れたものは撃たない。〔重複不可〕は同じ効果を1回だけ。並びは場に出た順。
    *  Python `_resolve_own_step_effects` と同一。 */
   function resolveOwnStepEffects(state, cards, targets, step, goingFirst) {
+    if (goingFirst && state.turn === 1 && FIRST_TURN_SKIPPED_OWN_STEPS.has(step)) return;
+    // 『お互いの〜』は自分のターンにも撃つ。相手を触る節はメインステップの相手の口を
+    // 結ぶ(Python同一)。
+    resolveStepSources(state, cards, targets, [step, `both_${step}`], step,
+      state.combat ? (MAIN_STEP_OPPONENTS.get(state) || null) : null);
+  }
+
+  /** `own_step`が`ownSteps`のどれかの節を撃ち、撃った節を返す。自分のターンと
+   *  相手のターンの共通の芯。Python `_resolve_step_sources` と同一。 */
+  function resolveStepSources(state, cards, targets, ownSteps, recordStep, opponent) {
     const unitOf = (uid) => state.field.find((unit) => unit.uid === uid);
     const present = (uid) => uid === null || uid === undefined
       || Boolean(unitOf(uid) && !unitOf(uid).waiting);
+    const wanted = (effect, uid) => effect.mode === "recurring"
+      && ownSteps.includes(effect.own_step)
+      // 合体中効果は合体プレイのブレイヴでだけ(Python `_enabler_active_for_unit`)。
+      && !(effect.combine_only && unitOf(uid)?.brave_mode !== "combine");
+    // [uid, 節, 札, 場に居るか]。場の札に加えて、【契約煌臨元】の節は煌臨元から、
+    // 【魂状態】の節は魂状態から撃つ(魂状態はLvを見ない、Python同一)。
     const sources = [];
     for (const entry of state.recurring) {
       if (!present(entry.uid)) continue;
       for (const effect of entry.effects) {
-        if (effect.own_step !== step) continue;
-        if (goingFirst && state.turn === 1 && FIRST_TURN_SKIPPED_OWN_STEPS.has(step)) continue;
-        // 合体中効果は合体プレイのブレイヴでだけ(Python `_enabler_active_for_unit`)。
-        if (effect.combine_only && unitOf(entry.uid)?.brave_mode !== "combine") continue;
-        sources.push([entry.uid, effect]);
+        if (wanted(effect, entry.uid)) sources.push([entry.uid, effect, null, true]);
+      }
+    }
+    for (const unit of [...state.field].sort((left, right) => left.uid - right.uid)) {
+      if (unit.waiting) continue;
+      for (const baseNo of unit.kourin_stack || []) {
+        for (const effect of cards[baseNo]?.enablers || []) {
+          if (effect.works_as_contract_base && wanted(effect, unit.uid)) {
+            sources.push([unit.uid, effect, baseNo, true]);
+          }
+        }
+      }
+    }
+    for (const soulNo of [...new Set(state.soulCards)]) {
+      for (const effect of cards[soulNo]?.enablers || []) {
+        if (!effect.works_as_soul_state || !wanted(effect, null)) continue;
+        const { levels, required_level: requiredLevel, ...soulEffect } = effect;
+        sources.push([null, soulEffect, soulNo, false]);
       }
     }
     const stacked = new Set();
-    for (const [uid, effect] of sources) {
-      if (!present(uid)) continue;
-      // 発揮できない節は宣言できないので棋譜にも出さない(D29、Python同一)。
-      // 〔重複不可〕も撃てた1枚目だけを数える。
-      if (!effectActive(effect, state, cards, uid)) continue;
-      if (effect.non_stackable) {
-        if (stacked.has(effect.effect_id)) continue;
-        stacked.add(effect.effect_id);
+    const chosen = new Set();
+    const resolved = [];
+    const previous = state.combatOpponent || null;
+    state.combatOpponent = opponent || null;
+    try {
+      for (const [uid, effect, fromCard, onField] of sources) {
+        if (!present(uid)) continue;
+        state.stepSourceOnField = onField;
+        let cardNo;
+        try {
+          // 発揮できない節は宣言できないので棋譜にも出さない(D29、Python同一)。
+          // 〔重複不可〕・択一も撃てた節だけを数える。
+          if (!effectActive(effect, state, cards, uid)) continue;
+          if (effect.non_stackable) {
+            if (stacked.has(effect.effect_id)) continue;
+            stacked.add(effect.effect_id);
+          }
+          const choice = effect.exclusive_group ?? null;
+          if (choice !== null) {
+            const key = `${fromCard}\u0000${uid}\u0000${choice}`;
+            if (chosen.has(key)) continue;
+            chosen.add(key);
+          }
+          cardNo = fromCard || (unitOf(uid)?.card_no ?? effect.source_card_no ?? null);
+          // 見出しは解決の前(何をしたかは続く記録が持つ、Python同一)。
+          record(state, cards, "step_effect", {
+            step: recordStep, card_no: cardNo, uid: uid ?? null, effect_kind: effect.kind,
+          });
+          resolveEffect(state, cards, targets, effect, uid);
+        } finally {
+          state.stepSourceOnField = true;
+        }
+        flushCountReactions(state, cards, targets);
+        resolved.push({ card_no: cardNo, uid: uid ?? null, kind: effect.kind });
+        noteLegalCandidates(state, cards, targets);
       }
-      const cardNo = unitOf(uid)?.card_no ?? effect.source_card_no ?? null;
-      resolveEffect(state, cards, targets, effect, uid);
-      flushCountReactions(state, cards, targets);
-      record(state, cards, "step_effect", {
-        step, card_no: cardNo, uid: uid ?? null, effect_kind: effect.kind,
-      });
-      noteLegalCandidates(state, cards, targets);
+    } finally {
+      state.combatOpponent = previous;
     }
+    return resolved;
+  }
+
+  /** 相手のターンの『相手の〜ステップ』『お互いの〜』を守り手として撃つ(2026-10-10)。
+   *  `opponent`は手番側の盤面の口。Python `_resolve_opponent_step` と同一。 */
+  function resolveOpponentStep(state, cards, targets, step, opponent = null) {
+    return resolveStepSources(state, cards, targets, [`opp_${step}`, `both_${step}`],
+      `opp_${step}`, opponent);
   }
 
   /** ドローステップ: 効果を解いてから、増えた枚数で本来のドロー(Q291・Q4763)。
@@ -7349,51 +7446,6 @@
         requires_successful_draw: false, source_card_no: discards[0][1],
       }, null);
     }
-  }
-
-  function resolveOpponentEndStep(state, cards, targets, lifeReduced = false,
-      model = "actual") {
-    const sources = [];
-    for (const unit of [...state.field].sort((left, right) => left.uid - right.uid)) {
-      if (unit.waiting || unit.brave_mode === "combine") continue;
-      const candidates = [[unit.card_no, true],
-        ...(unit.kourin_stack || []).map((cardNo) => [cardNo, false])];
-      for (const [cardNo, isTop] of candidates) {
-        const effect = cards[cardNo]?.opponent_end_effect;
-        if (!effect || (!isTop && !effect.works_as_contract_base)) continue;
-        sources.push({ cardNo, uid: unit.uid, fieldPresent: true, effect });
-      }
-    }
-    for (const cardNo of [...new Set(state.soulCards)]) {
-      const effect = cards[cardNo]?.opponent_end_effect;
-      if (effect?.works_as_soul_state) {
-        sources.push({ cardNo, uid: null, fieldPresent: false, effect });
-      }
-    }
-    const seen = new Set();
-    const resolved = [];
-    for (const source of sources) {
-      const { cardNo, uid, fieldPresent, effect } = source;
-      if (effect.non_stackable && seen.has(cardNo)) continue;
-      if (effect.non_stackable) seen.add(cardNo);
-      record(state, cards, "effect_start", { card_no: cardNo, uid,
-        effect_kind: "opponent_end", opponent_model: model });
-      let count = effect.base_count || 0;
-      if (!lifeReduced) count += effect.no_life_loss_count || 0;
-      if (count) applyCountGain(state, cards, count, null, {
-        reason: "opponent_end", source_card_no: cardNo, source_uid: uid,
-      });
-      let drawAmount = lifeReduced ? 0 : effect.no_life_loss_draw || 0;
-      if (effect.draw_requires_field_presence && !fieldPresent) drawAmount = 0;
-      if (drawAmount) draw(state, cards, drawAmount, "opponent_end");
-      record(state, cards, "effect_complete", { card_no: cardNo, uid,
-        effect_kind: "opponent_end", resolved: true,
-        life_reduced: Boolean(lifeReduced), opponent_model: model });
-      flushCountReactions(state, cards, targets);
-      resolved.push({ card_no: cardNo, uid, count, draw: drawAmount,
-        life_reduced: Boolean(lifeReduced), opponent_model: model });
-    }
-    return resolved;
   }
 
   function combatBoard(state, cards, targets) {
@@ -7655,6 +7707,7 @@
           else if (destination === "trash") state.trashHasSoul = true;
         }
         state.life -= taken;
+        if (taken > 0) state.lifeReducedThisTurn = true;
         if (destination === "reserve") state.reserve += taken;
         // 合計で数える保護(`total_cap`)へ、実際に減った量を控える(Python同一)。
         for (const row of applicableLifeProtections(state, attacker)) {
@@ -7694,10 +7747,16 @@
         // 破壊・バウンス・コア除去の節を戦闘の窓と同じように撃てる。
         state.combatOpponent = opponent || null;
         // `burst_activated`を書くのはStage6側(窓を開いたのは対戦の層)。
+        // バーストの解決は1つの効果の処理枠(Python `runtime.begin()`〜`end()`と同一)。
+        // ⚠️ 2026-10-11まで枠が無く、自分を出す維持コアの捻出で0コアになった体が
+        // コストを払う前にその場で場を離れていた(Pythonは解決の終わり)。詳細モードの
+        // 掃検で発覚(BS69-NX02がBS69-025のコアを取る)。
+        beginEffectFrame(state);
         try {
           resolveBurstEffects(state, cards, targets, cardNo);
         } finally {
           state.combatOpponent = null;
+          endEffectFrame(state);
         }
         return cardNo;
       },
@@ -7920,9 +7979,8 @@
         state.mainActivatedUsed.clear();
         state.blockTurnUsed.clear();
         state.kourinWaiverNames.clear();
+        state.lifeReducedThisTurn = false;
       },
-      opponent_end_step: (lifeReduced = false, model = "actual") =>
-        resolveOpponentEndStep(state, cards, targets, lifeReduced, model),
       resolve_field_flash: (uid) => {
         // `uid`がnullなら魂状態のカードの分(Python同一。Stage6は行のuidを
         // そのまま渡してくるので、口をひとつにしておく)。
@@ -7935,6 +7993,9 @@
         resolveFieldFlash(state, cards, targets, unit);
         return state.fieldFlashUsed.size > before;
       },
+      // 相手のターンの『相手の〜ステップ』(2026-10-10、Python `resolve_opponent_step`)。
+      resolve_opponent_step: (step, opponent) =>
+        resolveOpponentStep(state, cards, targets, step, opponent || null),
       resolve_trigger: (uid, window, opponent, battleRole) => {
         const unit = state.field.find((row) => row.uid === uid);
         if (!unit || unit.waiting) return [];
@@ -8143,6 +8204,11 @@
       // 解決中の誘発の引き金の主語(「そのスピリットに置く」の「その」、Python
       // `event_subject_uid`と同一)。誘発を解くあいだだけ立てる。
       eventSubjectUid: null,
+      // このターン、自分のライフが減ったか(Python `life_reduced_this_turn`と同一)。
+      lifeReducedThisTurn: false,
+      // 解いている最中のステップの節の発揮元が場(か煌臨元)に居るか(Python
+      // `step_source_on_field`と同一)。魂状態から撃つときだけ偽。
+      stepSourceOnField: true,
       effectFrameDepth: 0, deferredFieldLeaves: [], deferredPlayCompletions: [],
       deferredDerivedPlays: [],
       // 相手盤面の**公開情報の要約**(6C-3)。Stage6が自分のターンの前に入れる。
@@ -8157,7 +8223,7 @@
       // 発動したバーストは行き先が決まるまでバーストゾーンで**表向き**
       // (Python `burst_open` と同一)。裏向きのセットとは別枠。
       burstOpen: null,
-      mirage: null, turn: 0, pendingCountEvents: [], handReactionNames: new Set(),
+      mirage: null, turn: 0, traceTurn: null, pendingCountEvents: [], handReactionNames: new Set(),
       // 「破棄されたとき」の発揮待ち(`discard_summons`)。Python `runtime.reserve`。
       pendingDiscardSummons: [],
       openReactionNames: new Set(), trashReactionNames: new Set(),
@@ -8221,13 +8287,23 @@
     for (let turn = 1; turn <= options.turns; turn += 1) {
       state.turn = turn;
       if (turn > 1 && !state.combat) {
-        record(state, cards, "opponent_turn_end", {
-          opponent_model: "unspecified_pass", life_reduced: false,
-        }, turn - 1);
-        resolveOpponentEndStep(
-          state, cards, targets, false, "unspecified_pass");
+        // 相手のターンのステップ(2026-10-10、Python同一)。相手の口は無い。
+        // 記録はすべて直前の自分のターン(turn-1)の番号で付け、相手のターンの
+        // 終わりの見出しはステップの効果の後に置く。
+        state.traceTurn = turn - 1;
+        try {
+          for (const opponentStep of ["main_start", "attack_start", "end"]) {
+            resolveOpponentStep(state, cards, targets, opponentStep);
+          }
+          record(state, cards, "opponent_turn_end", {
+            opponent_model: "unspecified_pass", life_reduced: false,
+          });
+        } finally {
+          state.traceTurn = null;
+        }
         state.fieldFlashUsed.clear();
         state.mainActivatedUsed.clear();
+        state.lifeReducedThisTurn = false;
       }
       // 今がこの試行のターンか(v395)。Python `own_turn_active` と同一。
       state.ownTurnActive = true;
@@ -8289,6 +8365,10 @@
       // 入口で1回撃つ(Python同一)。
       for (const ownStep of ["main_start", "main", "turn"]) {
         resolveOwnStepEffects(state, cards, targets, ownStep, options.going_first);
+      }
+      // 相手の『相手のメインステップ開始時』はここ(戦闘モードだけ、Python同一)。
+      if (state.combat) {
+        yield { turn, step: "main_start", board: combatBoard(state, cards, targets) };
       }
       // 盤面のフラッシュ効果は**メインステップでも撃てる**(ステップ指定の無い
       // 『フラッシュ』はメインステップのフラッシュタイミングでも使える。Q2508)。
@@ -8458,6 +8538,7 @@
       state.mainActivatedUsed.clear();
       state.blockTurnUsed.clear();
       state.kourinWaiverNames.clear();
+      state.lifeReducedThisTurn = false;
       // 「次の自分のエンドステップまで」はここで切れる(Python同一)。
       expireOwnEndStepProtections(state);
       // ターン終了。エンドステップの処理まで終わった後(公式の並び)。
@@ -8763,7 +8844,8 @@
     "attack_effects_resolved", "block_effects_resolved",
     "blocked_effects_resolved", "battle_end_effects_resolved",
     "life_reduced_effects_resolved",
-    "opponent_end_effect_resolved",
+    // 守り手が相手のターンの『相手の〜ステップ』を撃った記録(2026-10-10、Python同一)。
+    "opponent_step_effect_resolved",
   ]);
   const COMBAT_EVENT_TYPES = new Set([
     "attack_declared", "block_declared", "battle_resolved", "life_damaged",
@@ -8775,7 +8857,8 @@
     // 『アタックによって相手のライフを減らしたとき』。ライフが実際に減ったかが
     // 条件なので、battle_end(ブロックの有無と無関係)とは別に出す(Python同一)。
     "life_reduced_effects_resolved",
-    "opponent_end_effect_resolved",
+    // 守り手が相手のターンの『相手の〜ステップ』を撃った記録(2026-10-10、Python同一)。
+    "opponent_step_effect_resolved",
     // 6C-2: セット中バーストを実イベント(いまはライフ減少)で開いた記録。
     "burst_activated",
     // 6C-2B: 守り手が手札からフラッシュの防御札を使った記録。
@@ -10062,8 +10145,8 @@
     const combatEvents = [];
     let currentRound = 0;
     let currentActor = null;
-    const emit = (type, owner, details) => {
-      const phase = type === "opponent_end_effect_resolved" ? "end" : "attack";
+    const emit = (type, owner, details, phaseOverride = null) => {
+      const phase = phaseOverride || "attack";
       // board APIが記録した詳細行を、持ち主の自ターンではなく実際に起きた
       // 相手ターン位置へ移す。魂状態の遷移もこの経路で表示する(Python同一)。
       const ownerRunner = runners[owner];
@@ -10104,7 +10187,6 @@
         currentActor = actor;
         const defender = otherPlayer(actor);
         const defenderBoard = combat ? runners[defender].board : null;
-        const defenderLifeBefore = defenderBoard ? defenderBoard.life() : null;
         // **スタートステップは到達している**ので、このターンは棋譜へ記録する
         // (`turn_order`に無いターンの`match_won`はspliceが拾えない)。Python同一。
         playedTurns.push({ round, player_id: actor });
@@ -10128,10 +10210,24 @@
             [playerId, runners[playerId].board])), actor);
           if (board && other) board.observe_opponent(opponentPublicSummary(other), other);
         }
+        // 守り手の『相手の〜ステップ』を手番側の盤面へ向けて撃つ(2026-10-10、Python同一)。
+        const defenderStep = (stepName, phase) => {
+          if (!defenderBoard) return;
+          const resolved = defenderBoard.resolve_opponent_step(stepName, runners[actor].board);
+          if (resolved.length) {
+            emit("opponent_step_effect_resolved", defender,
+              { step: stepName, effects: resolved }, phase);
+          }
+        };
         for (;;) {
           const step = advanceTurn(runners[actor]);
           if (!step || step.step === "turn_end") break;
+          if (step.step === "main_start") {
+            defenderStep("main_start", "main");
+            continue;
+          }
           if (step.step === "attack") {
+            defenderStep("attack_start", "attack");
             const boards = Object.fromEntries(PLAYER_IDS.map((playerId) =>
               [playerId, runners[playerId].board]));
             if (resolveAttackStep(actor, defender, boards, emit, profiles, plans[actor])) {
@@ -10140,13 +10236,9 @@
             }
           }
         }
-        if (winner === null && defenderBoard) {
-          const lifeReduced = defenderBoard.life() < defenderLifeBefore;
-          for (const resolved of defenderBoard.opponent_end_step(
-            lifeReduced, "actual_opponent")) {
-            emit("opponent_end_effect_resolved", defender, resolved);
-          }
-        }
+        // 守り手の『相手のエンドステップ』(Python同一。専用の`opponent_end_step`を
+        // この汎用の口へ寄せた、2026-10-10)。
+        if (winner === null) defenderStep("end", "end");
         // ターンの終わりで「このターンの間」のBP修正を両側から捨てる(6B-3)。
         // 相手のユニットへ掛けた修正も**掛けた側のターン**で切れるので、
         // 各シミュレータの自分のturn_endではなくここで揃えて捨てる。
@@ -10181,9 +10273,15 @@
       state: jointState(null, latest),
     }];
     const turnOrder = [...playedTurns];
-    const spliceCombat = (round, actor) => {
-      for (const combatEvent of combatEvents) {
+    // 差し込み済みの戦闘イベント。守り手の『相手のメインステップ開始時』(段`main`)
+    // だけはメインステップの記録の直後へ先に置く(Python `_splice_combat`同一)。
+    const splicedCombat = new Set();
+    const spliceCombat = (round, actor, phases = null) => {
+      for (const [index, combatEvent] of combatEvents.entries()) {
         if (combatEvent.round !== round || combatEvent.turn_of !== actor) continue;
+        if (phases && !phases.includes(combatEvent.phase)) continue;
+        if (splicedCombat.has(index)) continue;
+        splicedCombat.add(index);
         for (const playerId of PLAYER_IDS) latest[playerId] = combatEvent.state[playerId];
         events.push({
           seq: events.length + 1,
@@ -10234,6 +10332,7 @@
               ([key]) => ["gained", "drawn", "recovered_uids"].includes(key))),
           state: jointState(actor, latest),
         });
+        if (source.type === "step_main") spliceCombat(round, actor, ["main"]);
       }
       // 決着したターンはエンドステップまで進まないので、最後に置く。
       if (!spliced) spliceCombat(round, actor);
