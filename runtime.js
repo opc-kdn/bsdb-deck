@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v80-v1";
-  const STAGE_VERSION = "v80";
+  const ENGINE_SLICE = "stage4-v82-v1";
+  const STAGE_VERSION = "v82";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v80 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v82 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v80-portable-v28";
+  const RUNTIME_VERSION = "stage4-v82-portable-v31";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3810,7 +3810,8 @@
       // 旧式の盤面mockは必要な口を持たないので従来順へフォールバックする。
       const smartBounce = effect.kind === "unit_bounce" && !effect.target_order
         && typeof board.units === "function" && typeof board.life === "function";
-      const picked = smartBounce ? selectBounceTargets(
+      // 「相手の…すべて」(`target_all`、2026-10-11)は数で切らず、選びもしない(Python同一)。
+      const picked = effect.target_all ? rows : smartBounce ? selectBounceTargets(
         rows, amount, effect.bounce_destination || "hand", {
           ownLife: state.life,
           ownUnits: combatUnits(state, cards),
@@ -6342,6 +6343,21 @@
   const SOUL_POSITION_THREAT_KINDS = new Set(["unit_destroy", "unit_bounce",
     "unit_core_remove", "field_core_remove", "reserve_core_remove", "soul_core_remove"]);
 
+  /** 節の下限と列挙(「BP10000以上」「コスト6/7/8」、2026-10-11)をこの体が満たすか。
+   *  対象選択と除去見込みが共有する。Python `target_lower_bounds_admit` と同一。 */
+  const TARGET_LOWER_BOUND_KEYS = ["target_bp_min", "target_cost_min",
+    "target_symbols_min", "target_cost_in"];
+  function targetLowerBoundsAdmit(spec, row) {
+    for (const [key, field] of [["target_bp_min", "bp"], ["target_cost_min", "cost"],
+      ["target_symbols_min", "symbol_count"]]) {
+      if (spec[key] !== null && spec[key] !== undefined && row[field] < spec[key]) {
+        return false;
+      }
+    }
+    const listed = spec.target_cost_in;
+    return listed === null || listed === undefined || listed.includes(row.cost);
+  }
+
   /** 相手の除去(`removal_threats`の1件)がこの体を対象に取れるか。耐性は見ない。
    *  Python `removal_threat_reaches` と同一。 */
   function removalThreatReaches(threat, row) {
@@ -6357,6 +6373,7 @@
     }
     if (threat.target_cores_min !== null && threat.target_cores_min !== undefined
       && row.cores < threat.target_cores_min) return false;
+    if (!targetLowerBoundsAdmit(threat, row)) return false;
     if (threat.target_under_min !== null && threat.target_under_min !== undefined
       && (row.under_count || 0) < threat.target_under_min) return false;
     if (threat.target_state === "exhausted" && !row.exhausted) return false;
@@ -6386,6 +6403,10 @@
         "target_symbols_max", "target_cores_min", "target_cores_max",
         "target_state", "target_soul_core", "target_under_min"]) {
         row[key] = effect[key] ?? null;
+      }
+      // 下限と列挙は節が持つときだけ写す(Python同一)。
+      for (const key of TARGET_LOWER_BOUND_KEYS) {
+        if (effect[key] !== null && effect[key] !== undefined) row[key] = effect[key];
       }
       for (const [key, field] of [["target_bp_max", "bp"], ["target_cost_max", "cost"],
         ["target_symbols_max", "symbol_count"]]) {
@@ -7038,6 +7059,8 @@
       }
       if (bpMax !== null && bpMax !== undefined && row.bp > bpMax) return false;
       if (costMax !== null && costMax !== undefined && row.cost > costMax) return false;
+      // 下限と列挙(「BP10000以上」「コスト6/7/8」、2026-10-11、Python同一)。
+      if (!targetLowerBoundsAdmit(effect, row)) return false;
       // 「回復状態の」は疲労も重疲労もしていないもの。「疲労状態の」は重疲労を
       // **含む**(重疲労は疲労を含む状態なのでexhaustedも立つ)。
       if (effect.target_state === "exhausted" && !row.exhausted) return false;
@@ -7732,9 +7755,15 @@
       hand_count: () => state.hand.length,
       // ミラージュを**置いてあるか**だけ(中身は渡さない)。Python `mirage_set` 同一。
       mirage_set: () => state.mirage != null,
+      // セット中バーストがこの条件で開けるか。Python `burst_opens_on` と同一。
+      // **持ち主の方針だけが読む口**(Stage6 `burstOpenDecision`)。伏せ札の条件は
+      // 非公開なので、相手へは`burst_set`の真偽値しか見せない。
+      burst_opens_on: (category) => state.burst != null
+        && ((cards[state.burst] || {}).burst_conditions || []).includes(category),
       // 6C-2: 実イベントでセット中バーストを開く。Python `trigger_event_burst`
       // と同一——確率入力(5C-2A)ではなく、盤面で実際に起きたことから発火させる。
-      // 開くかどうかの方針はまだ持たない(開けるなら開く)。
+      // ここはルールの層で、呼ばれたら開く。開くかどうかはStage6
+      // (`burstOpenDecision`)が比べてから呼ぶ(2026-10-11)。
       trigger_burst: (category, opponent) => {
         const cardNo = state.burst;
         if (!cardNo) return null;
@@ -8751,6 +8780,8 @@
     playableCandidates,
     paymentFor, representativeRows, runSimulation, runTrial, runTrialStream,
     winningBlockValue, selectBounceTargets,
+    // バーストを開くかの比較(Stage6 `burstBoardRank`)も同じ公開盤面の物差し。
+    publicStepDamage, UNREACHABLE_CLOCK,
     trialGoldenSignature, verifyGolden,
     // Stage6が実イベントから開けるバーストの条件(6C-2)。**正典はここ**で、
     // `stage6_sim.js`はこれを引く(Python側で`stage6_sim`が`stage4_sim`から
@@ -8791,7 +8822,8 @@
   // v8: 宣言する前に「宣言したら誰が退くか」を一度解いて巻き戻し、その事実を
   // 見積もり3箇所(attackReason/attackOrder/stepDamageThrough)へ配る。相手にも
   // 同じ先読みを与える。相手の伏せたバーストは開かない(Python同一)。
-  const COMBAT_POLICY = "combat-victory-plan-v11";
+  // v12: 自分のバーストを開くかを、開かない盤面と比べる(2026-10-11、Python同一)。
+  const COMBAT_POLICY = "combat-victory-plan-v12";
   const PLAYER_IDS = ["self", "opponent"];
   const CAPABILITIES = Object.freeze({
     dual_deck_execution: true,
@@ -8838,7 +8870,8 @@
   });
   const FORBIDDEN_EVENT_TYPES = new Set([
     "attack_declared", "block_declared", "life_damaged", "battle_resolved",
-    "destroyed_by_battle", "burst_activated", "flash_defense_played", "flash_kourin_played",
+    "destroyed_by_battle", "burst_activated", "burst_declined",
+    "flash_defense_played", "flash_kourin_played",
     "flash_removal_played", "trash_flash_played",
     "field_flash_resolved",
     "attack_effects_resolved", "block_effects_resolved",
@@ -8861,6 +8894,9 @@
     "opponent_step_effect_resolved",
     // 6C-2: セット中バーストを実イベント(いまはライフ減少)で開いた記録。
     "burst_activated",
+    // 開ける窓で、開かない盤面のほうが良いと比べて開かなかった記録(2026-10-11、
+    // Python同一)。開いたときは`burst_activated`がその記録になる。
+    "burst_declined",
     // 6C-2B: 守り手が手札からフラッシュの防御札を使った記録。
     "flash_defense_played",
     // ライフが減った直後にトラッシュのフラッシュを使った記録(2026-10-08、Python同一)。
@@ -9568,12 +9604,110 @@
     // 定義は下の層に1つだけ置く(2026-08-23、①)。
     turnsToFinish,
     winningBlockValue,
+    // バーストを開くかの比較(2026-10-11)も、バウンス対象と同じ公開盤面の物差し。
+    publicStepDamage,
+    UNREACHABLE_CLOCK,
   } = Stage5PortableSimulation;
+
+  /** バーストを開くか比べるための、持ち主から見た公開盤面の値(2026-10-11)。
+   *  Python `_burst_board_rank` と同一。物差しはバウンス対象と同じ「いま決着するか→
+   *  勝つ／負けるまで何ターンか」で、最後に場の札の総コストの差(出る体の質)。
+   *  pendingAttackerUidは『相手のアタック後』のまだバトルになっていないアタッカー
+   *  (いま通る打点では疲労していない扱い)、ownTurnは持ち主の手番で開くとき。 */
+  function burstBoardRank(board, opponentBoard, pendingAttackerUid = null, ownTurn = false) {
+    const ownLife = board.life();
+    const theirLife = opponentBoard.life();
+    const ownUnits = board.units();
+    const theirUnits = opponentBoard.units();
+    const ownAttackers = ownUnits.filter(canAttack);
+    const theirAttackers = theirUnits.filter(canAttack);
+    let damageInNow = 0;
+    let damageOutNow = 0;
+    if (ownTurn) {
+      damageOutNow = publicStepDamage(ownAttackers, theirUnits, true);
+    } else {
+      const pending = theirAttackers.map((row) => (row.uid === pendingAttackerUid
+        ? { ...row, exhausted: false } : row));
+      damageInNow = publicStepDamage(pending, ownUnits, true);
+    }
+    const turnsToWin = turnsToFinish(theirLife, publicStepDamage(ownAttackers, theirUnits));
+    const turnsToLose = turnsToFinish(ownLife, publicStepDamage(theirAttackers, ownUnits));
+    const costOf = (rows) => rows.reduce((sum, row) => sum + (row.cost || 0), 0);
+    return {
+      survives_now: damageInNow < ownLife ? 1 : 0,
+      lethal_now: ownTurn && damageOutNow >= theirLife ? 1 : 0,
+      wins_race: winsTheRace(turnsToWin, turnsToLose) ? 1 : 0,
+      turns_to_win: turnsToWin,
+      turns_to_lose: turnsToLose,
+      damage_in_now: damageInNow,
+      damage_out_now: damageOutNow,
+      material: costOf(board.field()) - costOf(opponentBoard.field()),
+    };
+  }
+
+  /** `burstBoardRank`を大きいほど良い比較用の並びにする。Python `_burst_rank_key`。 */
+  function burstRankKey(rank) {
+    const finite = (clock) => (clock === null || clock === undefined
+      ? UNREACHABLE_CLOCK : clock);
+    return [rank.survives_now, rank.lethal_now, rank.wins_race,
+      -finite(rank.turns_to_win), finite(rank.turns_to_lose),
+      -rank.damage_in_now, rank.damage_out_now, rank.material];
+  }
+
+  /** 辞書順の比較(left >= right)。 */
+  function rankKeyAtLeast(left, right) {
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return left[index] > right[index];
+    }
+    return true;
+  }
+
+  /** セット中バーストを開くか、開かないかを比べる(2026-10-11 利用者指示)。
+   *  Python `_burst_open_decision` と同一——開いた後は両方の盤面を実際に解いてみて
+   *  戻す。同点なら開く。「開いて召喚だけしない」は候補に無い(自分を出す節は全部
+   *  「召喚する」、Q15753)。比べられないときはnull(従来どおり開く)。 */
+  function burstOpenDecision(board, category, opponentBoard, pendingAttackerUid = null,
+    ownTurn = false) {
+    if (!opponentBoard || typeof board.burst_opens_on !== "function") return null;
+    for (const each of [board, opponentBoard]) {
+      if (typeof each.trial_snapshot !== "function"
+        || typeof each.trial_restore !== "function") return null;
+    }
+    if (!board.burst_opens_on(category)) return null;
+    const hold = burstBoardRank(board, opponentBoard, pendingAttackerUid, ownTurn);
+    const ownState = board.trial_snapshot();
+    const theirState = opponentBoard.trial_snapshot();
+    let cardNo;
+    let opened;
+    try {
+      cardNo = board.trigger_burst(category, opponentBoard);
+      opened = burstBoardRank(board, opponentBoard, pendingAttackerUid, ownTurn);
+    } finally {
+      board.trial_restore(ownState);
+      opponentBoard.trial_restore(theirState);
+    }
+    return {
+      open: rankKeyAtLeast(burstRankKey(opened), burstRankKey(hold)),
+      card_no: cardNo, open_rank: opened, hold_rank: hold,
+    };
+  }
 
   /** その持ち主のバーストを実イベントで開く。Python `_open_burst` と同一。
    *  opponentBoardは6C-2C——バーストが開くのは戦闘の途中か相手のターンで、そのとき
-   *  相手の盤面は目の前にあるので、破壊・バウンス・コア除去の節を撃てる。 */
-  function openBurst(emit, owner, board, category, opponentBoard = null) {
+   *  相手の盤面は目の前にあるので、破壊・バウンス・コア除去の節を撃てる。
+   *  開く前に開かない場合と比べ(`burstOpenDecision`)、開かなかったら
+   *  `burst_declined`を書いてfalseを返す(開ける窓が無かったnullと区別する)。 */
+  function openBurst(emit, owner, board, category, opponentBoard = null,
+    { pendingAttackerUid = null, ownTurn = false } = {}) {
+    const decision = burstOpenDecision(board, category, opponentBoard,
+      pendingAttackerUid, ownTurn);
+    if (decision && !decision.open) {
+      emit("burst_declined", owner, {
+        card_no: decision.card_no, condition: category,
+        open: decision.open_rank, hold: decision.hold_rank,
+      });
+      return false;
+    }
     const cardNo = board.trigger_burst(category, opponentBoard);
     if (cardNo) {
       emit("burst_activated", owner, { card_no: cardNo, condition: category });
@@ -9648,13 +9782,17 @@
 
   /** 相手のせいで自分のカードが場を離れたので開く。
    *  **「消滅/破壊後」はトラッシュに置かれたときだけ**(SD52-012・CB24-X06の裁定)、
-   *  「離脱後」は行き先を問わない。Python `_burst_after_field_leave` と同一。 */
-  function burstAfterFieldLeave(emit, owner, board, reachedTrash, opponentBoard = null) {
+   *  「離脱後」は行き先を問わない。Python `_burst_after_field_leave` と同一。
+   *  ownTurnは持ち主が手番のとき。「消滅/破壊後」で開かないと決めたら(false)、
+   *  同じ札を「離脱後」で比べ直さない。 */
+  function burstAfterFieldLeave(emit, owner, board, reachedTrash, opponentBoard = null,
+    ownTurn = false) {
     if (reachedTrash === "trash") {
-      const opened = openBurst(emit, owner, board, BURST_OWN_DESTROYED, opponentBoard);
-      if (opened) return opened;
+      const opened = openBurst(emit, owner, board, BURST_OWN_DESTROYED, opponentBoard,
+        { ownTurn });
+      if (opened !== null && opened !== undefined) return opened;
     }
-    return openBurst(emit, owner, board, BURST_OWN_LEFT_FIELD, opponentBoard);
+    return openBurst(emit, owner, board, BURST_OWN_LEFT_FIELD, opponentBoard, { ownTurn });
   }
 
   /** 1回のバトルの終わり(6C)。Python `_end_battle` と同一。
@@ -9929,7 +10067,8 @@
       // 公式手順1(アタック宣言)の直後、手順2(ブロック)より前(page08)。
       emitTrigger(emit, attackerBoard, actor, uid, attacker, "attack", defenderBoard);
       // 「相手のスピリット/アルティメットのアタック後」のバースト(Python同一)。
-      openBurst(emit, defenderId, defenderBoard, BURST_OPPONENT_ATTACK, attackerBoard);
+      openBurst(emit, defenderId, defenderBoard, BURST_OPPONENT_ATTACK, attackerBoard,
+        { pendingAttackerUid: uid });
       // ⭐ **アタッカー自身の戦闘値も取り直す**(Python同一、2026-08-31)。アタック時
       // 効果は自分の打点やBPも動かす——『このスピリットのアタック時』のシンボル
       // 追加が代表で、宣言前の行を使い回すと足したシンボルが打点に乗らない。
@@ -10087,7 +10226,7 @@
         emit("destroyed_by_battle", owner, { unit: row, outcome });
         // 破壊は相手のアタック/ブロックによるものなので「相手による」に当たる。
         burstAfterFieldLeave(emit, owner, boards[owner], landed,
-          otherBoard(boards, owner));
+          otherBoard(boards, owner), owner === actor);
       }
       emit("battle_resolved", actor,
         { attacker: freshAttacker, blocker: freshBlocker, outcome });
@@ -10469,5 +10608,8 @@
     TRACE_FORMAT, TRACE_FORMAT_VERSION, TRACE_MODE, RUNTIME_VERSION,
     COMBAT_MODE, COMBAT_RUNTIME_VERSION, COMBAT_POLICY, COMBAT_CAPABILITIES,
     CAPABILITIES, DETAIL_LEVEL, MAIN_EVENT_TYPES, buildCombatProfiles, run, validate,
+    // バーストを開くかの比較(Python `_burst_open_decision`)。テストが同じ盤面を
+    // 両方へ通して判断を突き合わせるために出す。
+    burstOpenDecision,
   };
 })();
