@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v82-v1";
-  const STAGE_VERSION = "v82";
+  const ENGINE_SLICE = "stage4-v93-v1";
+  const STAGE_VERSION = "v93";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v82 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v93 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v82-portable-v31";
+  const RUNTIME_VERSION = "stage4-v93-portable-v42";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -735,6 +735,10 @@
   // structuredClone used by lookahead.  Only the live state is keyed here;
   // speculative clones intentionally have no opponent and cannot mutate it.
   const MAIN_STEP_OPPONENTS = new WeakMap();
+  // 択一の物差し(2026-10-13)。対戦ではStage6が盤面ごとに置く(`set_choice_ranker`)。
+  // 先読みのclone(state)には付かない(Pythonは`speculative_depth`/`clone_estimate_depth`の
+  // 間は使わない)。
+  const CHOICE_RANKERS = new WeakMap();
   const BASIC_COLORS = ["赤", "紫", "緑", "白", "黄", "青"];
   const SUPPORTED_EFFECTS = new Set([
     "draw", "coreboost", "self_coreboost", "field_coreboost", "count_gain",
@@ -766,6 +770,8 @@
     "poison_blade", "reserve_core_remove", "soul_core_remove",
     // 相手の創界神ネクサスのコアをボイドへ(2026-10-08)。
     "creator_core_remove",
+    // 自分の別の札を手札/トラッシュから出す(2026-10-11、`zone_summon`を流用)。
+    "zone_summon",
   ]);
 
   // Stage 5C-2A opponent branches. Keep every name and rule identical to the
@@ -1504,6 +1510,13 @@
       }
       // 手札の**枚数**は公開情報。相手の枚数は盤面が結ばれていないと読めない。
       // Python `state_conditions_met` の`hand_counts`と同一。
+      // 相手のカウント(2026-10-11)。盤面が結ばれていなければ満たさない(Python同一)。
+      if (condition.kind === "opponent_count") {
+        if (!board || typeof board.public_count !== "function") return false;
+        const have = board.public_count();
+        return condition.comparison === "以上"
+          ? have >= condition.value : have <= condition.value;
+      }
       if (condition.kind === "hand_count") {
         const have = condition.subject === "自分"
           ? state.hand.length
@@ -1532,6 +1545,13 @@
       if (condition.kind === "source_has_soul_core") {
         const source = state.field.find((unit) => unit.uid === sourceUid);
         return Boolean(source && source.soul_core);
+      }
+      // 自分の(色の)アルティメットが場にいるか(2026-10-11、Python同一)。
+      if (condition.kind === "own_type_unit_present") {
+        return state.field.some((unit) => !unit.waiting
+          && String(cards[unit.card_no]?.card_type || "").includes(condition.card_type)
+          && (condition.color === null || condition.color === undefined
+            || (cards[unit.card_no]?.colors || []).includes(condition.color)));
       }
       // 【X】を持つ自分の体が場にいるか(v66、Python同一)。
       if (condition.kind === "own_keyword_unit_present") {
@@ -2486,6 +2506,51 @@
   }
 
   /** このユニットに合体しているブレイヴ(uid昇順)。Python `_combined_braves`と同一。 */
+  /** アルティメットトリガー(2026-10-12)。相手のデッキの上からN枚をトラッシュに置き、
+   *  1枚でもコストが境目より低ければヒット。境目は【Uトリガー】なら発揮した体の今の
+   *  コスト(合体中はブレイヴのコストも足す)、【CUトリガー】なら自分のカウント。
+   *  Python `_resolve_u_trigger`と同一。 */
+  function resolveUTrigger(state, cards, effect, sourceUid) {
+    const board = state.combatOpponent;
+    if (!board || typeof board.trigger_mill !== "function") return false;
+    const unit = state.field.find((row) => row.uid === sourceUid);
+    let threshold;
+    if (effect.trigger_threshold === "own_count") threshold = state.count;
+    else if (!unit) return false;
+    else {
+      threshold = (cards[unit.card_no]?.cost || 0) + combinedBraves(state, sourceUid)
+        .reduce((sum, brave) => sum + (cards[brave.card_no]?.cost || 0), 0);
+    }
+    const milled = board.trigger_mill(effect.trigger_cards || 1);
+    // 1枚ごとに1回のUトリガー。境目より低い札の枚数がヒットした回数(Python同一)。
+    let hits = milled.filter((row) => row.cost < threshold);
+    // 相手のガード型【トリガーカウンター】(Stage D、Python同一)。
+    let countered = null;
+    if (hits.length && typeof board.trigger_counter === "function") {
+      countered = board.trigger_counter(hits);
+      if (countered) hits = [];
+    }
+    if (hits.length) state.uTriggerHits.set(`${effect.effect_id}@${sourceUid}`, hits);
+    state.uTriggerEvents.push([hits.length ? "u_trigger_hit" : "u_trigger_guard",
+      { card_no: unit ? unit.card_no : effect.source_card_no, uid: sourceUid, hits }]);
+    record(state, cards, "u_trigger", {
+      card_no: unit ? unit.card_no : effect.source_card_no, uid: sourceUid,
+      milled: milled.map((row) => row.card_no), threshold, hit: hits.length > 0,
+      hit_count: hits.length, ...(countered ? { countered_by: countered } : {}),
+    });
+    return true;
+  }
+
+  /** アルティメットトリガーの区切りの縛り(2026-10-12)。Python `u_hit_gate_met`と同一。 */
+  function uHitGateMet(effect, hits) {
+    if (hits.length < (effect.u_hit_min || 1)) return false;
+    const condition = effect.u_hit_card;
+    if (!condition) return true;
+    return hits.some((row) => (condition.card_type == null || row.card_type === condition.card_type)
+      && (condition.cost_min == null || row.cost >= condition.cost_min)
+      && (condition.cost_max == null || row.cost <= condition.cost_max));
+  }
+
   function combinedBraves(state, hostUid) {
     if (hostUid === null || hostUid === undefined) return [];
     return state.field
@@ -3192,8 +3257,9 @@
    *  「その後コストを支払うことで…」は**本体効果が撃てるときだけ**数える。
    *  相手盤面干渉(6C-2C)も数える——開くのは戦闘の途中か相手のターンなので、
    *  相手の体を落とせるならそのためにセットする価値がある。 */
+  // `zone_summon`(自分の別の札を出す、2026-10-11)はPython `_USEFUL_BURST_KINDS`同一。
   const USEFUL_BURST_KINDS = ["draw", "coreboost", "core_to_trash",
-    "field_coreboost", "count_gain", "burst_free_play_self",
+    "field_coreboost", "count_gain", "burst_free_play_self", "zone_summon",
     "unit_destroy", "unit_exhaust", "unit_core_remove", "unit_bounce",
     "unit_heavy_exhaust", "unit_bp_down", "life_core_remove", "field_core_remove"];
 
@@ -3414,6 +3480,13 @@
     let value;
     if (spec.subject === "count") value = state.count;
     else if (spec.subject === "own_hand") value = state.hand.length;
+    else if (spec.subject === "opponent_hand") {
+      // 相手の手札の枚数(公開情報、2026-10-13、Python同一)。結ばれていなければ撃たない。
+      // 召喚時の節は戦闘の窓の外で解くので、メインステップの相手の口も見る(Python同一)。
+      const board = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state) || null;
+      if (!board || typeof board.hand_count !== "function") return 0;
+      value = board.hand_count();
+    }
     else if (spec.subject === "own_field_units") {
       value = state.field.filter(
         (unit) => amountPerUnitMatches(spec, unit, state, cards)).length;
@@ -3428,6 +3501,43 @@
    *  ⚠️ `reveal_play_remainder`は自前で同じ判定と消費を持つ(B-3の元の組)ので
    *  二重に食わない。Python側の除外と同じ。 */
   function resolveEffect(state, cards, targets, effect, sourceUid) {
+    // トリガーは発揮のたびにヒットを決め直す。可否の判定より前に前回の印を消す。
+    // アルティメットトリガーのヒット時の節は、同じ体のそのトリガーがヒットしていなければ
+    // 撃たない(2026-10-12)。Python `resolve_enabler`の入口と同一。
+    if (effect.kind === "u_trigger") state.uTriggerHits.delete(`${effect.effect_id}@${sourceUid}`);
+    // 「このアルティメットの合体アタック時」は合体しているときだけ(Python同一)。
+    if (effect.requires_combined && !combinedBraves(state, sourceUid).length) return false;
+    // 【連鎖】の行(2026-10-12)。発揮の時点で自分のシンボルが行の［色］の数だけ無ければ
+    // 撃たない。合体中のブレイヴが「条件を無視して発揮する」なら見ない(Python同一)。
+    if (effect.chain_symbols && !combinedBraves(state, sourceUid)
+      .some((brave) => cards[brave.card_no]?.chain_waiver)) {
+      const symbols = effectiveSymbols(state, cards);
+      if (Object.entries(effect.chain_symbols)
+        .some(([color, count]) => (symbols[color] || 0) < count)) return false;
+    }
+    // 追加で発揮するトリガー(BS29-X06)。k回目は自分の<色>シンボルがk個以上のときだけ
+    // (Python同一)。
+    if (effect.u_extra
+        && (effectiveSymbols(state, cards)[effect.u_extra.color] || 0) < effect.u_extra.index) {
+      return false;
+    }
+    // 反応の誘発の節(Stage E)は、誘発が受け取ったヒットの一覧で見る(Python同一)。
+    if (effect.requires_u_hit || effect.u_per_hit || effect.u_hit_card) {
+      const hits = (effect.requires_u_hit
+        ? state.uTriggerHits.get(`${effect.requires_u_hit}@${sourceUid}`)
+        : state.eventUHits) || [];
+      if (!uHitGateMet(effect, hits)) return false;
+      // 「ヒットしたUトリガー1回につき、」はヒットした回数だけ同じ節を解く(Python同一)。
+      if (effect.u_per_hit) {
+        const once = { ...effect };
+        delete once.u_per_hit;
+        let any = false;
+        for (let index = 0; index < hits.length; index += 1) {
+          if (resolveEffect(state, cards, targets, once, sourceUid)) any = true;
+        }
+        return any;
+      }
+    }
     if (effect.requires_predecessor_id && effect.kind !== "reveal_play_remainder") {
       if (!state.completedEffects.has(effect.requires_predecessor_id)) return false;
       state.completedEffects.delete(effect.requires_predecessor_id);
@@ -3759,6 +3869,7 @@
       }
       return Boolean(board.remove_soul_core(effect.core_destination || "trash"));
     }
+    if (effect.kind === "u_trigger") return resolveUTrigger(state, cards, effect, sourceUid);
     if (effect.kind === "poison_blade") {
       // 【毒刃：N】相手のデッキの上からN枚を裏向きで相手の体1体の下に置く(2026-10-02)。
       // 置く先は狙える体の並びの先頭。Python `_resolve_poison_blade` と同一。
@@ -3811,7 +3922,11 @@
       const smartBounce = effect.kind === "unit_bounce" && !effect.target_order
         && typeof board.units === "function" && typeof board.life === "function";
       // 「相手の…すべて」(`target_all`、2026-10-11)は数で切らず、選びもしない(Python同一)。
-      const picked = effect.target_all ? rows : smartBounce ? selectBounceTargets(
+      // 「BP合計Nまで好きなだけ」(`target_total`)は合計の上限で組を選ぶ(Python同一)。
+      const picked = effect.target_all ? rows
+        : effect.target_total ? selectTotalCappedTargets(
+          rows, effect.target_total.stat, effect.target_total.cap)
+        : smartBounce ? selectBounceTargets(
         rows, amount, effect.bounce_destination || "hand", {
           ownLife: state.life,
           ownUnits: combatUnits(state, cards),
@@ -4393,16 +4508,137 @@
     });
   }
 
+  // 試しに解いて戻すとき、写せない(関数・盤面の口を持つ)ので外して持ち越す鍵(2026-10-13)。
+  const TRIAL_HELD_KEYS = ["combatOpponent", "deferredFieldLeaves",
+    "deferredPlayCompletions", "deferredDerivedPlays"];
+  // バーストの節のうち`resolveEffect`を通らない種類。択一の試行に載せない(Python同一)。
+  const BURST_SPECIAL_KINDS = new Set([
+    "burst_free_play_self", "burst_return_self_to_hand", "burst_pay_own_effect"]);
+
+  /** 択一の枝を解いた後の値(大きいほど良い、2026-10-13 利用者指示)。Python
+   *  `_alternative_key`と同一——カウント(最上位、利用者指示)→対戦の盤面の物差し
+   *  (Stage6 `burstBoardRank`)→掘削と手札→自分のコアの総数(リザーブ＋場)。 */
+  function alternativeKey(state) {
+    const ranker = CHOICE_RANKERS.get(state);
+    return [state.count, ...(ranker ? ranker() : []), state.dig + state.handGain,
+      state.reserve + state.field.reduce((sum, unit) => sum + (unit.cores || 0), 0)];
+  }
+
+  function alternativeKeyAbove(left, right) {
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return left[index] > right[index];
+    }
+    return false;
+  }
+
+  /** 写しを**同じ実体**へ書き戻す(配列・集合・場の体の参照を保つ)。呼ぶ側が解決の
+   *  途中で握っている参照を古い写しにしない(Python `_choose_alternative`と同じ配慮)。 */
+  function restoreTrialInPlace(state, snap, units) {
+    for (const key of Object.keys(state)) if (!(key in snap)) delete state[key];
+    for (const [key, value] of Object.entries(snap)) {
+      const current = state[key];
+      if (Array.isArray(current) && Array.isArray(value)) {
+        current.length = 0;
+        for (const item of value) current.push(item);
+      } else if (current instanceof Set && value instanceof Set) {
+        current.clear();
+        for (const item of value) current.add(item);
+      } else if (current instanceof Map && value instanceof Map) {
+        current.clear();
+        for (const [mapKey, item] of value) current.set(mapKey, item);
+      } else {
+        state[key] = value;
+      }
+    }
+    state.field.forEach((unit, index) => {
+      const original = units.get(unit.uid);
+      if (!original || original === unit) return;
+      for (const key of Object.keys(original)) delete original[key];
+      Object.assign(original, unit);
+      state.field[index] = original;
+    });
+  }
+
+  /** 「Aするか、Bする」の枝をそれぞれ実際に解いてみて戻し、いちばん良い枝を返す
+   *  (2026-10-13 利用者指示「択一は意味ある方、より展開良くなる方撃とうね」)。解けな
+   *  かった枝は候補にしない。同点なら印字の順。枝が2つ未満なら`null`(従来どおり)。
+   *  相手の盤面に触る枝は相手の`trial_snapshot`でも戻す。Python
+   *  `_choose_alternative`と同一。 */
+  function chooseAlternative(state, branches, attempt, opponent = null) {
+    const trial = Boolean(opponent) && typeof opponent.trial_snapshot === "function"
+      && typeof opponent.trial_restore === "function";
+    // 戻す口の無い相手(手で組んだテストの盤面)では試さない——相手に触った跡が残る(Python同一)。
+    if (branches.length < 2 || (opponent && !trial)) return null;
+    const held = new Map();
+    for (const key of TRIAL_HELD_KEYS) {
+      if (!(key in state)) continue;
+      const value = state[key];
+      held.set(key, [value, Array.isArray(value) ? [...value] : null]);
+    }
+    const putBack = () => {
+      for (const [key, [value, items]] of held) {
+        if (items) {
+          value.length = 0;
+          for (const item of items) value.push(item);
+        }
+        state[key] = value;
+      }
+    };
+    const units = new Map(state.field.map((unit) => [unit.uid, unit]));
+    let best = null;
+    let bestKey = null;
+    for (const effect of branches) {
+      for (const key of held.keys()) delete state[key];
+      const own = clone(state);
+      putBack();
+      const their = trial ? opponent.trial_snapshot() : null;
+      let key = null;
+      try {
+        key = attempt(effect) ? alternativeKey(state) : null;
+      } finally {
+        restoreTrialInPlace(state, own, units);
+        putBack();
+        if (trial) opponent.trial_restore(their);
+      }
+      if (key && (!bestKey || alternativeKeyAbove(key, bestKey))) {
+        best = effect;
+        bestKey = key;
+      }
+    }
+    return best;
+  }
+
+  /** 択一の組で選ばれなかった枝なら真。組の最初の枝に来たときに1回だけ選ぶ(Python
+   *  `_skip_unchosen`)。選べなければ偽——従来どおり撃てる最初の枝。 */
+  function skipUnchosen(state, effect, decided, key, branches, attempt, opponent = null) {
+    if (!decided.has(key)) {
+      decided.set(key, chooseAlternative(state, branches(), attempt, opponent));
+    }
+    const chosen = decided.get(key);
+    return chosen !== null && effect !== chosen;
+  }
+
   function resolveBurstEffects(state, cards, targets, cardNo) {
     const card = cards[cardNo];
     if (!card) return false;
     let selfPlayed = false;
     let returnedToHand = false;
     const resolvedChoiceGroups = new Set();
+    // 択一は解いてみて良い方(2026-10-13、Python同一)。自分を出す枝などを含む組は従来どおり。
+    const decidedAlternatives = new Map();
+    const burstBranches = (group) => {
+      const members = (card.burst_effects || []).filter((row) => row.exclusive_group === group);
+      if (members.some((row) => BURST_SPECIAL_KINDS.has(row.kind))) return [];
+      return members.filter((row) => effectActive(row, state, cards, null));
+    };
     for (const effect of card.burst_effects || []) {
       const choiceGroup = effect.exclusive_group;
       if (choiceGroup !== null && choiceGroup !== undefined
           && resolvedChoiceGroups.has(choiceGroup)) continue;
+      if (choiceGroup !== null && choiceGroup !== undefined && skipUnchosen(
+        state, effect, decidedAlternatives, choiceGroup, () => burstBranches(choiceGroup),
+        (row) => resolveEffect(state, cards, targets, row, null),
+        state.combatOpponent || null)) continue;
       // 発揮できない節(条件・対価)は宣言できないので棋譜にも出さない(D29、
       // Python `resolve_burst_effects`の入口の`can_resolve_enabler`と同一)。
       // ⚠️ 2026-10-11まで既定の枝は不発でも見出しと終わり(`resolved: false`)を
@@ -4470,6 +4706,14 @@
       const resolved = resolveAfterBurstOpen(state, cards, targets, source, effect);
       record(state, cards, "effect_complete", { card_no: source.card_no, uid: source.uid,
         effect_kind: "after_burst_open", resolved });
+    }
+    // バーストの節で出した別の札(`zone_summon`、2026-10-11)の召喚時効果は、自分を出す
+    // 節の完了より**先**に解く(Pythonは`runtime.reserve`へ出した順に積み、枠の終わりに
+    // その順で解く)。ここで空にしないと、自分を出さないマジックのバーストでは、次に
+    // 何かを召喚するまで召喚時効果が解かれずに残る。
+    while (state.deferredDerivedPlays.length) {
+      const play = state.deferredDerivedPlays.shift();
+      if (play.run) play.run(); else play();
     }
     while (state.deferredPlayCompletions.length) {
       state.deferredPlayCompletions.shift()();
@@ -4648,9 +4892,12 @@
         || left.zoneRank - right.zoneRank || left.index - right.index);
       const selected = choices[0];
       effectSummon(state, cards, targets, selected.cardNo, selected.zoneName,
-        selected.pay, selected.mode, selected.total, effect.source_card_no);
+        selected.pay, selected.mode, selected.total, effect.source_card_no, null,
+        Boolean(effect.suppress_summon_effects));
       summoned += 1;
-      if (effect.amount !== "any" || summoned >= 10) break;
+      // 「1枚」「N枚まで」(バーストの節、2026-10-11)は出せるだけN枚まで。Python同一。
+      if (summoned >= 10
+        || (effect.amount !== "any" && summoned >= Number(effect.amount || 1))) break;
     }
     return summoned > 0;
   }
@@ -4670,7 +4917,7 @@
   /** 効果で1枚出す。Python `_effect_summon`と同一。召喚時効果は親の窓の後
    *  （`derived_play`）。`trigger`は破棄から出たときだけ棋譜へ足す。 */
   function effectSummon(state, cards, targets, cardNo, zoneName, pay, mode, total,
-                        sourceCardNo, trigger = null) {
+                        sourceCardNo, trigger = null, suppressSummonEffects = false) {
     record(state, cards, "effect_free_summon_declared", { card_no: cardNo,
       source: zoneName, source_card_no: sourceCardNo,
       brave_mode: mode, printed_cost_waived: pay === 0, pay,
@@ -4679,7 +4926,7 @@
       maintenance: cards[cardNo].maintenance || 0,
       brave_mode: mode, allow_sacrifice: false, mode: "normal",
       manifestation_creator_uid: null, source_zone_name: zoneName,
-      derived_play: true });
+      derived_play: true, suppress_summon_effects: suppressSummonEffects });
   }
 
   /** 破棄した効果の出どころ。節が持たなければ発揮元のカード。
@@ -4998,6 +5245,27 @@
     return keys;
   }
 
+  // 発揮元が自分自身の出来事でも撃つ誘発。Python `SELF_INCLUSIVE_EVENTS`と同一。
+  const SELF_INCLUSIVE_EVENTS = new Set(["ally_attacked", "u_trigger_hit", "u_trigger_guard"]);
+
+  /** 貯めたアルティメットトリガーのヒット/ガードを配る(Stage C)。Python
+   *  `_dispatch_u_trigger_events`と同一——「アタックしたとき」と同じ形で枠を開いて解く。 */
+  function dispatchUTriggerEvents(state, cards, targets, opponent) {
+    while (state.uTriggerEvents.length) {
+      const [event, payload] = state.uTriggerEvents.shift();
+      const previous = state.combatOpponent || null;
+      state.combatOpponent = opponent || null;
+      beginEffectFrame(state);
+      try {
+        resolveEventTriggers(state, cards, targets, event, payload);
+        flushCountReactions(state, cards, targets);
+      } finally {
+        state.combatOpponent = previous;
+        endEffectFrame(state);
+      }
+    }
+  }
+
   /** 誘発の窓。場に在るカードが、**別のカードに起きたこと**で撃つ。
    *  Python `_resolve_event_triggers` と同一。
    *  ⚠️ 自分自身の召喚では撃たない(発揮元が場に載るのと同じ処理なので、
@@ -5008,7 +5276,7 @@
     // アタックでも撃つ(「このスピリット以外の」が無ければ)。
     const sources = state.field
       .filter((unit) => !unit.waiting
-        && (payload.uid !== unit.uid || event === "ally_attacked"))
+        && (payload.uid !== unit.uid || SELF_INCLUSIVE_EVENTS.has(event)))
       .map((unit) => [unit.uid, unit.card_no, false]);
     if (state.mirage) sources.push([null, state.mirage, true]);
     const stacked = new Set();
@@ -5022,6 +5290,9 @@
         if (trigger.own_turn_only && !state.ownTurnActive) continue;
         if (trigger.excludes_source && sourceUid !== null
             && payload.uid === sourceUid) continue;
+        // 「このアルティメットのUトリガーが…」は自分自身だけ、ダブルヒットは2回以上(Python同一)。
+        if (trigger.self_only && payload.uid !== sourceUid) continue;
+        if (trigger.hit_min && (payload.hits || []).length < trigger.hit_min) continue;
         if (event === "ally_summoned") {
           const played = cards[payload.card_no] || {};
           if (!SUMMONABLE_CARD_TYPES.has(played.card_type)) continue;
@@ -5032,36 +5303,53 @@
       }
       const fired = [];
       const chosen = new Set();
+      // 択一の組ごとの撃てる枝(2026-10-13、Python同一)。どれを撃つかは解く時点で選ぶ。
+      const alternatives = new Map();
       for (const effect of matched) {
         // 発揮できない誘発は回数を消費しない(D29、Python同一)。
         if (!effectActive(effect, state, cards, sourceUid)) continue;
-        // 択一は撃てる最初の枝だけ、〔重複不可〕は同じ出来事で1回(Python同一)。
+        // 択一は組で1回、〔重複不可〕は同じ出来事で1回(Python同一)。
         const choice = effect.exclusive_group ?? null;
-        if (choice !== null && chosen.has(choice)) continue;
+        if (choice !== null && chosen.has(choice)) {
+          alternatives.get(choice).push(effect);
+          continue;
+        }
         const stackKey = `${sourceCardNo}\u0000${effect.effect_id ?? ""}`;
         if (effect.non_stackable && stacked.has(stackKey)) continue;
         const keys = eventTriggerLimitKeys(cards, effect, sourceUid, sourceCardNo);
         if (keys.some((key) => state.blockTurnUsed.has(key))) continue;
         fired.push(effect);
         keys.forEach((key) => state.blockTurnUsed.add(key));
-        if (choice !== null) chosen.add(choice);
+        if (choice !== null) {
+          chosen.add(choice);
+          alternatives.set(choice, [effect]);
+        }
         if (effect.non_stackable) stacked.add(stackKey);
       }
-      for (const effect of fired) {
+      const resolveOne = (effect) => {
         // 見出しは解決の前(何をしたかは続く記録が持つ、Python同一)。
-        if (event === "ally_attacked") {
+        if (SELF_INCLUSIVE_EVENTS.has(event)) {
           record(state, cards, "event_trigger_effect", {
             event, card_no: sourceCardNo, uid: sourceUid, effect_kind: effect.kind,
             subject_uid: payload.uid ?? null, subject_card_no: payload.card_no ?? null,
           });
         }
-        const previous = state.eventSubjectUid;
+        const previous = [state.eventSubjectUid, state.eventUHits];
         state.eventSubjectUid = payload.uid ?? null;
+        // 反応の誘発が受け取ったヒットの一覧(Stage E、Python `event_u_hits`)。
+        state.eventUHits = payload.hits ?? null;
         try {
-          resolveEffect(state, cards, targets, effect, sourceUid);
+          return resolveEffect(state, cards, targets, effect, sourceUid);
         } finally {
-          state.eventSubjectUid = previous;
+          [state.eventSubjectUid, state.eventUHits] = previous;
         }
+      };
+      for (const effect of fired) {
+        // 択一の組なら解いてみて良い方(2026-10-13、Python `_resolve_event_trigger_choice`)。
+        const branches = alternatives.get(effect.exclusive_group ?? null) || [effect];
+        const picked = chooseAlternative(state, branches, resolveOne,
+          state.combatOpponent || null);
+        resolveOne(picked ?? branches[0]);
       }
     }
   }
@@ -5248,9 +5536,10 @@
   function resolvePlayedEffects(state, cards, targets, card, uid, braveMode,
                                 soulCoreUsedForSummonCost = false,
                                 watcherUnits = [], watchEventKind = null,
-                                summonGroup = null) {
+                                summonGroup = null, suppressOwnSummonEffects = false) {
     const built = buildPlayedEffects(state, cards, targets, card, uid, braveMode,
-      soulCoreUsedForSummonCost, watcherUnits, watchEventKind, summonGroup);
+      soulCoreUsedForSummonCost, watcherUnits, watchEventKind, summonGroup,
+      suppressOwnSummonEffects);
     resolvePendingEffectWindow(state, cards, targets, built.instances,
       built.resolveInstance, built.candidateLegal, { mergeDerived: true });
     while (state.deferredDerivedPlays.length) {
@@ -5265,11 +5554,36 @@
   function buildPlayedEffects(state, cards, targets, card, uid, braveMode,
                               soulCoreUsedForSummonCost = false,
                               watcherUnits = [], watchEventKind = null,
-                              summonGroup = null) {
+                              summonGroup = null, suppressOwnSummonEffects = false) {
     raiseLevelForOnPlay(state, cards, card, uid);
     const opponent = MAIN_STEP_OPPONENTS.get(state) || null;
-    for (const effect of card.on_play_opponent_effects || []) {
-      if (braveMode === "spirit" && effect.combine_only) continue;
+    // 「ただし、『このスピリットの召喚時』効果は発揮されない」(2026-10-11)は出した札
+    // **自身**の召喚時の節だけを外す。ほかの札の「召喚されたとき」(神託)は外さない。
+    // Python `resolve_card_on_play`の`own_summon_effects`と同一。
+    const ownOpponentEffects = suppressOwnSummonEffects
+      ? [] : card.on_play_opponent_effects || [];
+    // 「Aするか、Bする」(2026-10-13): 解いてみて良い方の枝だけ(Python同一)。
+    const chosenAlternatives = new Set();
+    const decidedAlternatives = new Map();
+    const usableOpponentEffect = (row) => !(braveMode === "spirit" && row.combine_only);
+    const resolveAgainst = (row) => {
+      if (!opponent) return false;
+      const previousOpponent = state.combatOpponent || null;
+      state.combatOpponent = opponent;
+      try {
+        return resolveEffect(state, cards, targets, row, uid);
+      } finally {
+        state.combatOpponent = previousOpponent;
+      }
+    };
+    for (const effect of ownOpponentEffects) {
+      if (!usableOpponentEffect(effect)) continue;
+      const group = effect.exclusive_group ?? null;
+      if (group !== null && chosenAlternatives.has(group)) continue;
+      if (group !== null && skipUnchosen(state, effect, decidedAlternatives, group,
+        () => ownOpponentEffects.filter((row) => row.exclusive_group === group
+          && usableOpponentEffect(row)),
+        resolveAgainst, opponent)) continue;
       const beforeUids = new Set(opponent ? opponent.field().map((row) => row.uid) : []);
       record(state, cards, "effect_start", { card_no: card.card_no, uid,
         effect_kind: effect.kind, target_side: "opponent" });
@@ -5288,7 +5602,10 @@
       record(state, cards, "effect_complete", { card_no: card.card_no, uid,
         effect_kind: effect.kind, target_side: "opponent", resolved,
         unit_vanished: vanished, followup_draw: drawAmount });
+      if (effect.exclusive_group && resolved) chosenAlternatives.add(effect.exclusive_group);
     }
+    // 召喚時のアルティメットトリガーのヒット/ガードを配る(Python同一)。
+    if (state.uTriggerEvents.length) dispatchUTriggerEvents(state, cards, targets, opponent);
     let replacedEffectKind = null;
     if (card.soul_paid_on_play && soulCoreUsedForSummonCost) {
       const special = card.soul_paid_on_play;
@@ -5300,7 +5617,8 @@
         effect_kind: special.kind, resolved });
       replacedEffectKind = special.replaces_effect_kind || null;
     }
-    const active = (card.enablers || []).filter((effect) => effect.mode === "on_play"
+    const active = (card.enablers || []).filter((effect) => !suppressOwnSummonEffects
+      && effect.mode === "on_play"
       && effect.kind !== replacedEffectKind
       && !(braveMode === "spirit" && effect.combine_only));
     const triggerEventId = `turn${state.turn}:play:${card.card_no}#${uid}:`
@@ -5390,7 +5708,17 @@
         state.derivedEffectBuffer = [];
         return generated;
       };
+      // 「Aするか、Bする」(2026-10-13): 解いてみて良い方の枝だけ(Python同一)。
+      const chosenAlternatives = new Set();
+      const decidedAlternatives = new Map();
       for (const [clauseIndex, effect] of instance.clauses.entries()) {
+        const group = effect.exclusive_group ?? null;
+        if (group !== null && chosenAlternatives.has(group)) continue;
+        if (group !== null && skipUnchosen(state, effect, decidedAlternatives, group,
+          () => instance.clauses.filter((row) => row.exclusive_group === group
+            && effectActive(row, state, cards, uid)),
+          (row) => resolveEffect(state, cards, targets, row, uid),
+          state.combatOpponent || null)) continue;
         if (effect.simultaneous_group) {
           if (processedSimultaneous.has(effect.simultaneous_group)) continue;
           processedSimultaneous.add(effect.simultaneous_group);
@@ -5440,6 +5768,7 @@
         const resolved = effect.kind === "exchange" ? true : changed;
         record(state, cards, "effect_complete", { card_no: card.card_no, uid,
           effect_kind: effect.kind, effect_tag: effect.effect_tag || null, resolved });
+        if (effect.exclusive_group && resolved) chosenAlternatives.add(effect.exclusive_group);
         predecessor = { resolved, changed, kind: effect.kind };
         gatesNext = Boolean(effect.gates_next_effect);
         // 後節が待っている節だけ記録する(Python `resolve_enabler` と同一)。
@@ -5784,7 +6113,7 @@
     };
     const playedArgs = () => [state, cards, targets, { ...card, card_no: candidate.card_no },
       uid, candidate.brave_mode, soulCoreUsedForSummonCost, watcherUnits,
-      watchEvent(card, mode), summonGroup];
+      watchEvent(card, mode), summonGroup, Boolean(candidate.suppress_summon_effects)];
     const postBody = () => {
         if (isMagic && staysOnField) {
           state.uid += 1;
@@ -6092,6 +6421,76 @@
       prefix.pop();
     }
     return output;
+  }
+
+  /** 撃つ対象を、絞りに合う並びから切り出す。「すべて」(`target_all`)は全部、「合計Nまで」
+   *  (`target_total`)は合計の上限で選んだ組、ほかは`amount`体。Python `_combat_pick_targets`
+   *  の`limit`と同一。⚠️ 2026-10-11まで「除去を残すか」(`removalHoldPlan`)だけが`amount`で
+   *  切っていて、全焼きの判定がPythonと割れた(フラカン対光契約の掃検で発覚)。 */
+  function limitTargetRows(rows, effect, amount = effect.amount) {
+    if (effect.target_all) return rows;
+    if (effect.target_total) {
+      return selectTotalCappedTargets(rows, effect.target_total.stat, effect.target_total.cap);
+    }
+    return rows.slice(0, amount);
+  }
+
+  /** 「…を相手が破壊する」で相手が差し出す体の順(2026-10-12)。Python
+   *  `opponent_choice_key`と同一——シンボル数→BP→コスト→uidの小さい順、疲労/重疲労
+   *  させる形は既に疲労している体が先。 */
+  function opponentChoiceOrder(kind) {
+    const exhaustFirst = kind === "unit_exhaust" || kind === "unit_heavy_exhaust";
+    return (left, right) => {
+      if (exhaustFirst && Boolean(left.exhausted) !== Boolean(right.exhausted)) {
+        return left.exhausted ? -1 : 1;
+      }
+      return (left.symbol_count || 0) - (right.symbol_count || 0)
+        || (left.bp || 0) - (right.bp || 0)
+        || (left.cost || 0) - (right.cost || 0)
+        || left.uid - right.uid;
+    };
+  }
+
+  /** 「BP合計Nまで好きなだけ」の組を選ぶ(2026-10-11)。Python
+   *  `select_total_capped_targets`と同一——シンボル数→体数→BP→コストの大きい順、
+   *  同じならuidの小さい組。候補は並び順の上位12体。 */
+  function selectTotalCappedTargets(rows, stat, cap) {
+    const key = { bp: "bp", cost: "cost", level: "level" }[stat];
+    const pool = [...rows].slice(0, 12);
+    let best = [];
+    let bestRank = null;
+    const compare = (left, right) => {
+      for (let index = 0; index < left.length; index += 1) {
+        const a = left[index];
+        const b = right[index];
+        if (Array.isArray(a)) {
+          for (let inner = 0; inner < Math.max(a.length, b.length); inner += 1) {
+            if (a[inner] === undefined) return -1;
+            if (b[inner] === undefined) return 1;
+            if (a[inner] !== b[inner]) return a[inner] > b[inner] ? 1 : -1;
+          }
+          continue;
+        }
+        if (a !== b) return a > b ? 1 : -1;
+      }
+      return 0;
+    };
+    for (let size = 1; size <= pool.length; size += 1) {
+      for (const picked of rowCombinations(pool, size)) {
+        if (picked.reduce((sum, row) => sum + (row[key] || 0), 0) > cap) continue;
+        const rank = [
+          picked.reduce((sum, row) => sum + (row.symbol_count || 0), 0), picked.length,
+          picked.reduce((sum, row) => sum + (row.bp || 0), 0),
+          picked.reduce((sum, row) => sum + (row.cost || 0), 0),
+          [...picked].sort((a, b) => a.uid - b.uid).map((row) => -row.uid),
+        ];
+        if (bestRank === null || compare(rank, bestRank) > 0) {
+          best = picked;
+          bestRank = rank;
+        }
+      }
+    }
+    return best;
   }
 
   /** 手札バウンス対象を、現在ステップの詰み→勝利/敗北期限→再使用リスクで選ぶ。
@@ -6610,8 +7009,11 @@
         for (const effect of cards[cardNo].on_play_opponent_effects || []) {
           if (!FIELD_LEAVING_REMOVAL_KINDS.has(effect.kind)) continue;
           const every = combatTargetRows(state, cards, effect, null);
-          every.slice(0, effect.amount).forEach((row) => removed.add(row.uid));
-          every.forEach((row) => reachable.add(row.uid));
+          const picked = limitTargetRows(every, effect);
+          picked.forEach((row) => removed.add(row.uid));
+          // 相手が選ぶ節(2026-10-12)は、相手が差し出す体にしか届かない(Python同一)。
+          (effect.target_chooser === "opponent" ? picked : every)
+            .forEach((row) => reachable.add(row.uid));
         }
         covers.push(removed);
       }
@@ -6814,6 +7216,8 @@
           card_type: card.card_type || "",
           bp: row ? row.bp : (card.base_bp || 0),
           cost: card.cost || 0,
+          // 今のLv(公開情報、「Lv合計4まで」用、2026-10-12、Python同一)。
+          level: levelFor(unit, cards),
           // 「シンボル2つ以下の相手のスピリット」用。数え方も窓も打点と同じ
           // (印字＋旗の追加＋常時の追加＋合体中のブレイヴ)。`combatUnitRow`と揃える。
           symbol_count: Object.values(card.symbols || {})
@@ -7096,6 +7500,11 @@
       return true;
     });
     rows.sort(COMBAT_TARGET_ORDERS[effect.target_order || "bp_desc"]);
+    // 「…を相手が破壊する」(2026-10-12)は相手が選ぶ。こちらの狙いは効かない(Python同一)。
+    if (effect.target_chooser === "opponent") {
+      rows.sort(opponentChoiceOrder(effect.kind));
+      return rows;
+    }
     // 手順2・4のフラッシュの除去で先に狙う体(2026-10-01、Python `preferred_targets`)。
     const preferred = state.preferredTargets || [];
     if (preferred.length) {
@@ -7402,9 +7811,19 @@
     }
     const stacked = new Set();
     const chosen = new Set();
+    const decidedAlternatives = new Map();
     const resolved = [];
     const previous = state.combatOpponent || null;
     state.combatOpponent = opponent || null;
+    const stepAttempt = (onField, uid) => (row) => {
+      const previousOnField = state.stepSourceOnField;
+      state.stepSourceOnField = onField;
+      try {
+        return resolveEffect(state, cards, targets, row, uid);
+      } finally {
+        state.stepSourceOnField = previousOnField;
+      }
+    };
     try {
       for (const [uid, effect, fromCard, onField] of sources) {
         if (!present(uid)) continue;
@@ -7422,6 +7841,12 @@
           if (choice !== null) {
             const key = `${fromCard}\u0000${uid}\u0000${choice}`;
             if (chosen.has(key)) continue;
+            // 解いてみて良い方の枝(2026-10-13、Python同一)。
+            if (skipUnchosen(state, effect, decidedAlternatives, key,
+              () => sources.filter(([sourceUid, row, sourceCard]) => sourceCard === fromCard
+                && sourceUid === uid && row.exclusive_group === choice && present(sourceUid)
+                && effectActive(row, state, cards, sourceUid)).map(([, row]) => row),
+              stepAttempt(onField, uid), opponent || null)) continue;
             chosen.add(key);
           }
           cardNo = fromCard || (unitOf(uid)?.card_no ?? effect.source_card_no ?? null);
@@ -7677,6 +8102,51 @@
         }
         return placed.length;
       },
+      // 相手のアルティメットトリガー(2026-10-12): 自分のデッキの上からcount枚を
+      // トラッシュに置く。破棄ではない。Python `_combat_trigger_mill`と同一。
+      trigger_mill: (count) => {
+        const milled = [];
+        for (let index = 0; index < count && state.deck.length; index += 1) {
+          observeDeckExit(state, state.deck.at(-1), state.deck.length);
+          milled.push(state.deck.pop());
+        }
+        if (milled.length) {
+          state.trashCards.push(...milled);
+          record(state, cards, "u_trigger_milled", { cards: [...milled] });
+        }
+        return milled.map((cardNo) => ({ card_no: cardNo, cost: cards[cardNo]?.cost || 0,
+          card_type: cards[cardNo]?.card_type || "",
+          colors: [...(cards[cardNo]?.colors || [])].sort() }));
+      },
+      // 相手のUトリガーのヒットに、手札のガード型【トリガーカウンター】を使う(Stage D)。
+      // Python `_combat_trigger_counter`と同一——色が合う最初の札を、払えるなら使う。
+      trigger_counter: (hits) => {
+        const colors = new Set(hits.flatMap((row) => row.colors || []));
+        for (const cardNo of [...state.hand]) {
+          const card = cards[cardNo] || {};
+          const counter = card.trigger_counter;
+          if (!counter || !counter.guard_colors.some((color) => colors.has(color))) continue;
+          const cost = paymentForState(state, cards, card);
+          if (cost.total > reclaimable(state, false, cards)) continue;
+          const traceDetails = { mode: "trigger_counter", pay: cost.pay, total: cost.total };
+          record(state, cards, "play_presented", { card_no: cardNo, ...traceDetails });
+          record(state, cards, "cost_calculated", { card_no: cardNo, ...traceDetails });
+          const deficit = cost.total - state.reserve;
+          if (deficit > 0) fundPayment(state, cards, targets, deficit, false);
+          payFromReserve(state, cost.pay, cost.total - cost.pay);
+          state.reserve -= cost.total;
+          state.spent += cost.pay;
+          record(state, cards, "cost_paid",
+            { card_no: cardNo, payment: "cores", ...traceDetails });
+          takeCardForPlay(state, cards, cardNo, "use");
+          state.trashCards.push(cardNo);
+          record(state, cards, "card_moved",
+            { card_no: cardNo, destination: "trash", ...traceDetails });
+          record(state, cards, "trigger_counter_used", { card_no: cardNo, guarded: true });
+          return cardNo;
+        }
+        return null;
+      },
       move_under: (fromUid, toUid) => {
         const source = state.field.find((row) => row.uid === fromUid);
         const target = state.field.find((row) => row.uid === toUid);
@@ -7753,6 +8223,8 @@
       burst_set: () => state.burst != null,
       // 手札の**枚数**は公開情報(中身は渡さない)。Python `hand_count` と同一。
       hand_count: () => state.hand.length,
+      // カウントは公開情報(「相手のカウント3以上のとき」、2026-10-11、Python同一)。
+      public_count: () => state.count,
       // ミラージュを**置いてあるか**だけ(中身は渡さない)。Python `mirage_set` 同一。
       mirage_set: () => state.mirage != null,
       // セット中バーストがこの条件で開けるか。Python `burst_opens_on` と同一。
@@ -8104,8 +8576,20 @@
               gate_source: group.source,
             }));
           const resolveCombatInstance = (instance) => {
+            // 「Aするか、Bする」(2026-10-13): 解いてみて良い方の枝だけ(Python同一)。
+            const chosen = new Set();
+            const decidedAlternatives = new Map();
+            const usable = (row) => !(instance.gate_source.brave_mode === "spirit"
+              && row.combine_only);
             for (const effect of instance.clauses) {
-              if (instance.gate_source.brave_mode === "spirit" && effect.combine_only) continue;
+              if (!usable(effect)) continue;
+              const group = effect.exclusive_group ?? null;
+              if (group !== null && chosen.has(group)) continue;
+              if (group !== null && skipUnchosen(state, effect, decidedAlternatives, group,
+                () => instance.clauses.filter((row) => row.exclusive_group === group
+                  && usable(row)),
+                (row) => resolveEffect(state, cards, targets, row, uid),
+                state.combatOpponent || null)) continue;
               record(state, cards, "effect_start", { card_no: instance.source_card_no, uid,
                 effect_kind: effect.kind, effect_tag: effect.effect_tag || null, window });
               const ok = resolveEffect(state, cards, targets, effect, uid);
@@ -8114,6 +8598,7 @@
                 window, resolved: ok });
               resolved.push({ kind: effect.kind, effect_id: effect.effect_id ?? null,
                 resolved: Boolean(ok) });
+              if (effect.exclusive_group && ok) chosen.add(effect.exclusive_group);
             }
             return [];
           };
@@ -8132,6 +8617,8 @@
           state.combatOpponent = null;
           endEffectFrame(state);
         }
+        // 窓の中で撃ったアルティメットトリガーのヒット/ガードを配る(Python同一)。
+        dispatchUTriggerEvents(state, cards, targets, opponent);
         // アタック宣言なら、ほかの札の「アタックしたとき」も配る(2026-10-10)。
         // 『アタック時』と同じタイミングで、アタックした体自身の窓の後に解く
         // (Python `_combat_resolve_trigger`と同一)。
@@ -8169,6 +8656,11 @@
       trial_restore: (snap) => {
         for (const key of Object.keys(state)) delete state[key];
         Object.assign(state, clone(snap));
+      },
+      // 択一の物差しを置く口(2026-10-13、Python同一)。Stage6が対戦の盤面の値を渡す。
+      set_choice_ranker: (ranker) => {
+        if (ranker) CHOICE_RANKERS.set(state, ranker);
+        else CHOICE_RANKERS.delete(state);
       },
       // 決着で試行を打ち切ると戻り値が無いので、記録済みイベントはここから読む。
       events: () => state.events,
@@ -8233,6 +8725,7 @@
       // 解決中の誘発の引き金の主語(「そのスピリットに置く」の「その」、Python
       // `event_subject_uid`と同一)。誘発を解くあいだだけ立てる。
       eventSubjectUid: null,
+      eventUHits: null,
       // このターン、自分のライフが減ったか(Python `life_reduced_this_turn`と同一)。
       lifeReducedThisTurn: false,
       // 解いている最中のステップの節の発揮元が場(か煌臨元)に居るか(Python
@@ -8263,6 +8756,11 @@
         return counts;
       }, {}),
       completedEffects: new Set(), sealedKourinNames: new Set(),
+      // アルティメットトリガーの結果:「トリガーのid@体のuid」→ ヒットした札の行
+      // (2026-10-12、Python `u_trigger_hits`)。ヒット時の節は消費しない。
+      uTriggerHits: new Map(),
+      // ヒット/ガードの出来事(Stage C、Python `u_trigger_events`)。窓を解き終えてから配る。
+      uTriggerEvents: [],
       // 開発用の候補・順位診断。明示された配列へだけ書き、通常のstate/棋譜には
       // 出さない。Python `choice_debug` と同じ構造を返す。
       choiceDebug: Array.isArray(options.choice_debug) ? options.choice_debug : null,
@@ -8780,6 +9278,11 @@
     playableCandidates,
     paymentFor, representativeRows, runSimulation, runTrial, runTrialStream,
     winningBlockValue, selectBounceTargets,
+    // 「BP合計Nまで好きなだけ」の組(テストがPythonと突き合わせる、2026-10-11)。
+    selectTotalCappedTargets,
+    opponentChoiceOrder,
+    // アルティメットトリガーの区切りの縛り(テストがPythonと突き合わせる、2026-10-12)。
+    uHitGateMet,
     // バーストを開くかの比較(Stage6 `burstBoardRank`)も同じ公開盤面の物差し。
     publicStepDamage, UNREACHABLE_CLOCK,
     trialGoldenSignature, verifyGolden,
@@ -8953,6 +9456,10 @@
     "soul_position",
     // 【毒刃】の下のカード(2026-10-02): 置いた・移した・場を離れて破棄した。
     "under_cards_placed", "under_cards_moved", "under_cards_discarded",
+    // アルティメットトリガー(2026-10-12、Python同一)。
+    "u_trigger", "u_trigger_milled",
+    // ガード型の【トリガーカウンター】を使った記録(Stage D、Python同一)。
+    "trigger_counter_used",
     // 印字の対価（「〜することで」）を払った記録。Python同一。
     "payment",
     // 場に残るマジックの■で創界神ネクサスを守った記録(2026-10-08、Python同一)。
@@ -10317,6 +10824,15 @@
     };
     if (combat) {
       for (const playerId of PLAYER_IDS) advanceTurn(runners[playerId]);
+      // 択一の物差しを両者の盤面へ置く(2026-10-13、Python `_install_choice_rankers`同一)。
+      // バーストを開くかと同じ物差しを持ち主から見て、手番は比べる時点で決める。
+      for (const playerId of PLAYER_IDS) {
+        const board = runners[playerId].board;
+        if (!board || typeof board.set_choice_ranker !== "function") continue;
+        board.set_choice_ranker(() => burstRankKey(burstBoardRank(
+          runners[playerId].board, runners[otherPlayer(playerId)].board, null,
+          currentActor === playerId)));
+      }
     }
     let winner = null;
     const playedTurns = [];
