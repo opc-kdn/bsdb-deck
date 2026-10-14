@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v93-v1";
-  const STAGE_VERSION = "v93";
+  const ENGINE_SLICE = "stage4-v94-v1";
+  const STAGE_VERSION = "v94";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v93 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v94 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v93-portable-v42";
+  const RUNTIME_VERSION = "stage4-v94-portable-v43";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1658,6 +1658,10 @@
       && paymentAffordable(state, cards, NO_PAYMENT_TARGETS, effect, sourceUid)
       // 見返りが起こせない節の対価は払えない(Python同一)。山札0のドローは払わない。
       && !(effect.payment && effect.kind === "draw" && !state.deck.length)
+      // 倍率が0なら見返りが無いので払わない(2026-10-13、Python同一)。相手が結ばれて
+      // いない場の「相手の手札/手元のカード1枚につき」で手札をすべて捨てないため。
+      && !(effect.payment && effect.amount_per && !effect.amount_per_paid
+        && amountPerMultiplier(effect, state, cards) <= 0)
       && stateConditionsMet(effect.state_conditions, state, cards, sourceUid);
   }
 
@@ -1818,6 +1822,10 @@
       return (board && typeof board.units === "function") ? {} : null;
     }
     if (["hand_discard", "hand_to_side", "hand_set_burst"].includes(kind)) {
+      // 「手札すべてを破棄できる。この効果で系統：「X」を持つカードを破棄したとき」
+      // (2026-10-13、Python同一)。捨てる前の手札にXが無ければ払わない。
+      if (payment.requires_any && !state.hand.some(
+        (cardNo) => cardMatchesSlot(cards[cardNo], payment.requires_any) === true)) return null;
       let candidates = paymentHandCandidates(state, cards, payment);
       if (kind === "hand_set_burst") {
         candidates = candidates.filter(
@@ -3487,6 +3495,13 @@
       if (!board || typeof board.hand_count !== "function") return 0;
       value = board.hand_count();
     }
+    else if (spec.subject === "opponent_hand_side") {
+      // 相手の手札と手元を合わせた枚数(裁定BS60-090 Q25975、2026-10-13、Python同一)。
+      const board = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state) || null;
+      if (!board || typeof board.hand_count !== "function"
+        || typeof board.side_count !== "function") return 0;
+      value = board.hand_count() + board.side_count();
+    }
     else if (spec.subject === "own_field_units") {
       value = state.field.filter(
         (unit) => amountPerUnitMatches(spec, unit, state, cards)).length;
@@ -3541,10 +3556,17 @@
     if (effect.requires_predecessor_id && effect.kind !== "reveal_play_remainder") {
       if (!state.completedEffects.has(effect.requires_predecessor_id)) return false;
       state.completedEffects.delete(effect.requires_predecessor_id);
+      // 前節が動かした札の絞り(2026-10-13、Python `requires_predecessor_cards`同一)。
+      const wanted = effect.requires_predecessor_cards;
+      if (wanted && !((state.completedEffectCards || {})[effect.requires_predecessor_id] || [])
+        .some((cardNo) => cardMatchesSlot(cards[cardNo], wanted) === true)) return false;
     }
+    state.movedCards = [];
     const resolved = resolveEffectBody(state, cards, targets, effect, sourceUid);
     if (resolved && effect.b3_followup_id && effect.effect_id) {
       state.completedEffects.add(effect.effect_id);
+      if (!state.completedEffectCards) state.completedEffectCards = {};
+      state.completedEffectCards[effect.effect_id] = [...(state.movedCards || [])];
     }
     return resolved;
   }
@@ -3966,6 +3988,7 @@
       }
       state.sideGain += cardsToStash.length;
       state.dig += cardsToStash.length;
+      state.movedCards = [...cardsToStash];
       return cardsToStash.length > 0;
     }
     if (effect.kind === "side_recover") {
@@ -4017,12 +4040,22 @@
       if (effect.draw_first) draw(state, cards, effect.draw || 0, "hand_filter");
       let discard = effect.discard_all ? state.hand.length : Math.min(effect.discard || 0, state.hand.length);
       if (downTo !== null) discard = Math.max(0, state.hand.length - downTo);
+      const prefer = discardSummonReady(state, cards, effect.source_card_no);
+      // 後節が「この効果で系統：「X」を持つカードを破棄したとき」なら、狙い札でないXを
+      // 先に捨てる(2026-10-13、Python同一)。
+      if (effect.discard_prefer) {
+        for (const cardNo of state.hand) {
+          if (!targets.has(cardNo)
+            && cardMatchesSlot(cards[cardNo], effect.discard_prefer) === true) prefer.add(cardNo);
+        }
+      }
       const ordered = chooseHandDiscards(
-        state, cards, targets, discard, Boolean(effect.discard_all),
-        discardSummonReady(state, cards, effect.source_card_no));
+        state, cards, targets, discard, Boolean(effect.discard_all), prefer);
       discardHandCards(state, cards, targets, ordered, effect.source_card_no);
       if (!effect.draw_first) draw(state, cards, effect.draw || 0, "hand_filter");
       if (effect.draw_per_discard) draw(state, cards, ordered.length * effect.draw_per_discard, "hand_filter");
+      // 最後に書く(破棄・ドローの途中で別の節が解かれても上書きされないように)。Python同一。
+      state.movedCards = [...ordered];
       return true;
     }
     if (effect.kind === "creator_core_gain") return resolveCreatorCoreGain(state, cards, effect);
@@ -8223,6 +8256,8 @@
       burst_set: () => state.burst != null,
       // 手札の**枚数**は公開情報(中身は渡さない)。Python `hand_count` と同一。
       hand_count: () => state.hand.length,
+      // 手元の**枚数**(公開ゾーン、2026-10-13)。Python `side_count` と同一。
+      side_count: () => state.sideCards.length,
       // カウントは公開情報(「相手のカウント3以上のとき」、2026-10-11、Python同一)。
       public_count: () => state.count,
       // ミラージュを**置いてあるか**だけ(中身は渡さない)。Python `mirage_set` 同一。
@@ -8755,7 +8790,8 @@
         counts[cardNo] = (counts[cardNo] || 0) + 1;
         return counts;
       }, {}),
-      completedEffects: new Set(), sealedKourinNames: new Set(),
+      completedEffects: new Set(), completedEffectCards: {}, movedCards: [],
+      sealedKourinNames: new Set(),
       // アルティメットトリガーの結果:「トリガーのid@体のuid」→ ヒットした札の行
       // (2026-10-12、Python `u_trigger_hits`)。ヒット時の節は消費しない。
       uTriggerHits: new Map(),
