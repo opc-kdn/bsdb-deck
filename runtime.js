@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v94-v1";
-  const STAGE_VERSION = "v94";
+  const ENGINE_SLICE = "stage4-v95-v1";
+  const STAGE_VERSION = "v95";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v94 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v95 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v94-portable-v43";
+  const RUNTIME_VERSION = "stage4-v95-portable-v44";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -2589,8 +2589,11 @@
         const requiredLineage = condition.required_lineage ?? condition.required_lineage_id;
         if (requiredLineage
             && !(candidate.lineages || []).includes(requiredLineage)) return false;
-        if (condition.required_card_type
-            && !(candidate.card_type || "").includes(condition.required_card_type)) return false;
+        if (condition.required_card_type) {
+          const types = condition.required_card_type.split(/[／/]/).filter(Boolean);
+          if (types.length && !types.some((type) =>
+            (candidate.card_type || "").includes(type))) return false;
+        }
         return true;
       });
     }).sort((left, right) => Number(Boolean(left.heavy_exhausted))
