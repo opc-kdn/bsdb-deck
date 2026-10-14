@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v95-v1";
-  const STAGE_VERSION = "v95";
+  const ENGINE_SLICE = "stage4-v96-v1";
+  const STAGE_VERSION = "v96";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v95 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v96 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v95-portable-v44";
+  const RUNTIME_VERSION = "stage4-v96-portable-v45";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3508,6 +3508,8 @@
     else if (spec.subject === "own_field_units") {
       value = state.field.filter(
         (unit) => amountPerUnitMatches(spec, unit, state, cards)).length;
+    } else if (spec.subject === "predecessor_destroyed") {
+      value = ((state.completedEffectCards || {})[effect.requires_predecessor_id] || []).length;
     } else return 0;
     return Math.floor(value / per);
   }
@@ -3964,6 +3966,7 @@
       let applied;
       if (effect.kind === "unit_destroy") {
         applied = targets.filter((row) => board.destroy(row.uid, "effect"));
+        if (effect.b3_followup_id) state.movedCards = applied.map((row) => row.card_no);
       } else if (effect.kind === "unit_bounce") {
         const where = effect.bounce_destination || "hand";
         applied = targets.filter((row) => board.bounce(row.uid, where));
@@ -4660,6 +4663,12 @@
     let selfPlayed = false;
     let returnedToHand = false;
     const resolvedChoiceGroups = new Set();
+    for (const effect of card.burst_effects || []) {
+      if (effect.effect_id) {
+        state.completedEffects.delete(effect.effect_id);
+        if (state.completedEffectCards) delete state.completedEffectCards[effect.effect_id];
+      }
+    }
     // 択一は解いてみて良い方(2026-10-13、Python同一)。自分を出す枝などを含む組は従来どおり。
     const decidedAlternatives = new Map();
     const burstBranches = (group) => {
