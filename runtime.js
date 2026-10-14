@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v96-v1";
-  const STAGE_VERSION = "v96";
+  const ENGINE_SLICE = "stage4-v97-v1";
+  const STAGE_VERSION = "v97";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v96 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v97 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v96-portable-v45";
+  const RUNTIME_VERSION = "stage4-v97-portable-v46";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -739,6 +739,41 @@
   // 先読みのclone(state)には付かない(Pythonは`speculative_depth`/`clone_estimate_depth`の
   // 間は使わない)。
   const CHOICE_RANKERS = new WeakMap();
+  const EFFECT_HAND_OBSERVERS = new WeakMap();
+  const HAND_EFFECT_SCOPES = new WeakMap();
+  const PENDING_HAND_NOTIFICATIONS = new WeakMap();
+  const NOTIFICATION_TRIAL_DEPTHS = new WeakMap();
+
+  function notifyEffectHandIncrease(state, amount) {
+    const observer = EFFECT_HAND_OBSERVERS.get(state);
+    if (observer && amount > 0 && !state.burstEventContext?.preview
+      && !NOTIFICATION_TRIAL_DEPTHS.get(state)) {
+      observer(amount);
+    }
+  }
+
+  function executeHandEffect(state, run, defer = false) {
+    if (!EFFECT_HAND_OBSERVERS.has(state)) return run();
+    const scopes = HAND_EFFECT_SCOPES.get(state) || [];
+    HAND_EFFECT_SCOPES.set(state, scopes);
+    const scope = { before: state.handGain, children: 0 };
+    scopes.push(scope);
+    let result;
+    let total;
+    try { result = run(); }
+    finally {
+      scopes.pop();
+      total = state.handGain - scope.before;
+      if (scopes.length) scopes.at(-1).children += total;
+    }
+    const amount = total - scope.children;
+    if (defer && amount > 0) {
+      const pending = PENDING_HAND_NOTIFICATIONS.get(state) || [];
+      pending.push(amount);
+      PENDING_HAND_NOTIFICATIONS.set(state, pending);
+    } else notifyEffectHandIncrease(state, amount);
+    return result;
+  }
   const BASIC_COLORS = ["赤", "紫", "緑", "白", "黄", "青"];
   const SUPPORTED_EFFECTS = new Set([
     "draw", "coreboost", "self_coreboost", "field_coreboost", "count_gain",
@@ -2815,8 +2850,7 @@
   // 棋譜のターン番号は、相手のターンの間だけ直前の自分のターンに固定する
   // (`state.traceTurn`、Python `trace_turn`と同一)。
   function record(state, cards, type, details = {}, turn = state.traceTurn ?? state.turn) {
-    if (!state.trace) return;
-    state.events.push({
+    if (state.trace) state.events.push({
       seq: state.events.length + 1,
       type,
       turn,
@@ -2834,6 +2868,11 @@
         Object.entries(details).map(([key, value]) =>
           [key, value === undefined ? null : value]))),
     });
+    if (type === "effect_complete" && !HAND_EFFECT_SCOPES.get(state)?.length) {
+      const pending = PENDING_HAND_NOTIFICATIONS.get(state) || [];
+      PENDING_HAND_NOTIFICATIONS.delete(state);
+      for (const amount of pending) notifyEffectHandIncrease(state, amount);
+    }
   }
 
   // 5C-2A records the sampled branch and stops there: `applied` stays false so
@@ -3510,6 +3549,13 @@
         (unit) => amountPerUnitMatches(spec, unit, state, cards)).length;
     } else if (spec.subject === "predecessor_destroyed") {
       value = ((state.completedEffectCards || {})[effect.requires_predecessor_id] || []).length;
+    } else if (spec.subject === "event_hand_increased") {
+      value = state.burstEventContext?.hand_increased || 0;
+    } else if (spec.subject === "opponent_field_units") {
+      if (!state.combatOpponent) return 0;
+      value = state.combatOpponent.units().filter((row) => !row.waiting
+        && (spec.target_types || []).includes(row.card_type)
+        && (spec.target_state !== "exhausted" || row.exhausted)).length;
     } else return 0;
     return Math.floor(value / per);
   }
@@ -3521,6 +3567,14 @@
    *  ⚠️ `reveal_play_remainder`は自前で同じ判定と消費を持つ(B-3の元の組)ので
    *  二重に食わない。Python側の除外と同じ。 */
   function resolveEffect(state, cards, targets, effect, sourceUid) {
+    if (HAND_EFFECT_SCOPES.get(state)?.length) {
+      return resolveEffectImpl(state, cards, targets, effect, sourceUid);
+    }
+    return executeHandEffect(state,
+      () => resolveEffectImpl(state, cards, targets, effect, sourceUid), true);
+  }
+
+  function resolveEffectImpl(state, cards, targets, effect, sourceUid) {
     // トリガーは発揮のたびにヒットを決め直す。可否の判定より前に前回の印を消す。
     // アルティメットトリガーのヒット時の節は、同じ体のそのトリガーがヒットしていなければ
     // 撃たない(2026-10-12)。Python `resolve_enabler`の入口と同一。
@@ -3913,6 +3967,17 @@
       // Python `_combat_pick_targets` と同一。
       const board = state.combatOpponent;
       if (!board) return false;
+      if (effect.kind === "unit_destroy" && effect.target_groups) {
+        const selected = new Map();
+        for (const group of effect.target_groups) {
+          const part = { ...effect, ...group };
+          const rows = combatTargetRows(state, cards, part, sourceUid).slice(0, part.amount);
+          for (const row of unguardedTargets(board, rows, part)) selected.set(row.uid, row);
+        }
+        const applied = [...selected.values()].filter((row) => board.destroy(row.uid, "effect"));
+        if (effect.b3_followup_id) state.movedCards = applied.map((row) => row.card_no);
+        return applied.length > 0;
+      }
       if (effect.kind === "unit_destroy" && effect.move_under_to_other) {
         // BS27-078(裁定Q2244)。下にカードがある体を対象にし、枚数が足りるときだけ
         // 破壊する。下のカードは先に他の体へ移す。Python
@@ -4658,6 +4723,10 @@
   }
 
   function resolveBurstEffects(state, cards, targets, cardNo) {
+    return executeHandEffect(state, () => resolveBurstEffectsImpl(state, cards, targets, cardNo));
+  }
+
+  function resolveBurstEffectsImpl(state, cards, targets, cardNo) {
     const card = cards[cardNo];
     if (!card) return false;
     let selfPlayed = false;
@@ -5475,7 +5544,8 @@
         });
       }
       for (const key of instanceTurnLimitKeys(selected, cards)) state.blockTurnUsed.add(key);
-      const generated = [...((selected.run || resolveInstance)(selected) || [])];
+      const generated = [...(executeHandEffect(state,
+        () => (selected.run || resolveInstance)(selected)) || [])];
       const discards = mergeDerived ? state.pendingDiscardSummons.splice(discardMark) : [];
       flushCountReactions(state, cards, targets);
       if (mergeDerived) {
@@ -8283,7 +8353,8 @@
       // と同一——確率入力(5C-2A)ではなく、盤面で実際に起きたことから発火させる。
       // ここはルールの層で、呼ばれたら開く。開くかどうかはStage6
       // (`burstOpenDecision`)が比べてから呼ぶ(2026-10-11)。
-      trigger_burst: (category, opponent) => {
+      set_effect_hand_observer: (observer) => EFFECT_HAND_OBSERVERS.set(state, observer),
+      trigger_burst: (category, opponent, eventContext = null) => {
         const cardNo = state.burst;
         if (!cardNo) return null;
         if (!((cards[cardNo] || {}).burst_conditions || []).includes(category)) {
@@ -8293,7 +8364,12 @@
         state.burstOpen = cardNo;
         // 相手の盤面の口(6C-2C)。バーストが開くのは戦闘の途中か相手のターンなので、
         // 破壊・バウンス・コア除去の節を戦闘の窓と同じように撃てる。
+        const previousOpponent = state.combatOpponent;
+        const previousContext = state.burstEventContext;
         state.combatOpponent = opponent || null;
+        state.burstEventContext = { ...eventContext, active: true };
+        if (!Number.isInteger(state.burstEventContext.hand_increased)
+          || state.burstEventContext.hand_increased < 0) state.burstEventContext.hand_increased = 0;
         // `burst_activated`を書くのはStage6側(窓を開いたのは対戦の層)。
         // バーストの解決は1つの効果の処理枠(Python `runtime.begin()`〜`end()`と同一)。
         // ⚠️ 2026-10-11まで枠が無く、自分を出す維持コアの捻出で0コアになった体が
@@ -8303,8 +8379,9 @@
         try {
           resolveBurstEffects(state, cards, targets, cardNo);
         } finally {
-          state.combatOpponent = null;
           endEffectFrame(state);
+          state.combatOpponent = previousOpponent;
+          state.burstEventContext = previousContext;
         }
         return cardNo;
       },
@@ -8699,10 +8776,28 @@
       // ⚠️ **同じstateオブジェクトへ書き戻す**(参照を差し替えない)。`state`を
       // キーに持つWeakMap(`MAIN_STEP_OPPONENTS`)や、既に配られた`board`の
       // クロージャが同じ実体を見ているため。
-      trial_snapshot: () => clone(state),
+      trial_snapshot: () => {
+        const notificationDepth = NOTIFICATION_TRIAL_DEPTHS.get(state) || 0;
+        NOTIFICATION_TRIAL_DEPTHS.set(state, notificationDepth + 1);
+        const plain = { ...state };
+        const held = new Map();
+        for (const key of TRIAL_HELD_KEYS) {
+          if (!(key in plain)) continue;
+          const value = plain[key];
+          held.set(key, [value, Array.isArray(value) ? [...value] : null]);
+          delete plain[key];
+        }
+        return { plain: clone(plain), held, units: new Map(state.field.map((u) => [u.uid, u])),
+          notificationDepth, handNotifications: [...(PENDING_HAND_NOTIFICATIONS.get(state) || [])] };
+      },
       trial_restore: (snap) => {
-        for (const key of Object.keys(state)) delete state[key];
-        Object.assign(state, clone(snap));
+        restoreTrialInPlace(state, clone(snap.plain), snap.units);
+        NOTIFICATION_TRIAL_DEPTHS.set(state, snap.notificationDepth);
+        PENDING_HAND_NOTIFICATIONS.set(state, [...snap.handNotifications]);
+        for (const [key, [value, items]] of snap.held) {
+          if (items) { value.length = 0; value.push(...items); }
+          state[key] = value;
+        }
       },
       // 択一の物差しを置く口(2026-10-13、Python同一)。Stage6が対戦の盤面の値を渡す。
       set_choice_ranker: (ranker) => {
@@ -10222,7 +10317,7 @@
    *  戻す。同点なら開く。「開いて召喚だけしない」は候補に無い(自分を出す節は全部
    *  「召喚する」、Q15753)。比べられないときはnull(従来どおり開く)。 */
   function burstOpenDecision(board, category, opponentBoard, pendingAttackerUid = null,
-    ownTurn = false) {
+    ownTurn = false, eventContext = null) {
     if (!opponentBoard || typeof board.burst_opens_on !== "function") return null;
     for (const each of [board, opponentBoard]) {
       if (typeof each.trial_snapshot !== "function"
@@ -10235,7 +10330,9 @@
     let cardNo;
     let opened;
     try {
-      cardNo = board.trigger_burst(category, opponentBoard);
+      cardNo = typeof board.set_effect_hand_observer === "function"
+        ? board.trigger_burst(category, opponentBoard, { ...eventContext, preview: true })
+        : board.trigger_burst(category, opponentBoard);
       opened = burstBoardRank(board, opponentBoard, pendingAttackerUid, ownTurn);
     } finally {
       board.trial_restore(ownState);
@@ -10253,9 +10350,9 @@
    *  開く前に開かない場合と比べ(`burstOpenDecision`)、開かなかったら
    *  `burst_declined`を書いてfalseを返す(開ける窓が無かったnullと区別する)。 */
   function openBurst(emit, owner, board, category, opponentBoard = null,
-    { pendingAttackerUid = null, ownTurn = false } = {}) {
+    { pendingAttackerUid = null, ownTurn = false, eventContext = null } = {}) {
     const decision = burstOpenDecision(board, category, opponentBoard,
-      pendingAttackerUid, ownTurn);
+      pendingAttackerUid, ownTurn, eventContext);
     if (decision && !decision.open) {
       emit("burst_declined", owner, {
         card_no: decision.card_no, condition: category,
@@ -10263,7 +10360,8 @@
       });
       return false;
     }
-    const cardNo = board.trigger_burst(category, opponentBoard);
+    const cardNo = eventContext === null ? board.trigger_burst(category, opponentBoard)
+      : board.trigger_burst(category, opponentBoard, eventContext);
     if (cardNo) {
       emit("burst_activated", owner, { card_no: cardNo, condition: category });
     }
@@ -10839,8 +10937,7 @@
     const combatEvents = [];
     let currentRound = 0;
     let currentActor = null;
-    const emit = (type, owner, details, phaseOverride = null) => {
-      const phase = phaseOverride || "attack";
+    const flushExternalMainEvents = (owner, phase) => {
       // board APIが記録した詳細行を、持ち主の自ターンではなく実際に起きた
       // 相手ターン位置へ移す。魂状態の遷移もこの経路で表示する(Python同一)。
       const ownerRunner = runners[owner];
@@ -10859,6 +10956,10 @@
           turn_of: currentActor, state,
         });
       }
+    };
+    const emit = (type, owner, details, phaseOverride = null) => {
+      const phase = phaseOverride || "attack";
+      flushExternalMainEvents(owner, phase);
       combatEvents.push({
         round: currentRound,
         actor: owner,
@@ -10880,6 +10981,17 @@
         board.set_choice_ranker(() => burstRankKey(burstBoardRank(
           runners[playerId].board, runners[otherPlayer(playerId)].board, null,
           currentActor === playerId)));
+        board.set_effect_hand_observer((amount) => {
+          const owner = otherPlayer(playerId);
+          if (!runners[owner].board.burst_opens_on("相手手札増加後")) return;
+          const step = [...runners[currentActor].board.events()].reverse()
+            .find((event) => event.type.startsWith("step_"))?.type || "step_main";
+          const phase = step.startsWith("step_attack") ? "attack" : step === "step_end" ? "end" : "main";
+          flushExternalMainEvents(playerId, phase);
+          openBurst((kind, who, details) => emit(kind, who, details, phase), owner,
+            runners[owner].board, "相手手札増加後", runners[playerId].board,
+            { ownTurn: currentActor === owner, eventContext: { hand_increased: amount } });
+        });
       }
     }
     let winner = null;
