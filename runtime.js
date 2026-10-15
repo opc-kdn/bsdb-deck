@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v98-v1";
-  const STAGE_VERSION = "v98";
+  const ENGINE_SLICE = "stage4-v99-v1";
+  const STAGE_VERSION = "v99";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v98 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v99 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v98-portable-v46";
+  const RUNTIME_VERSION = "stage4-v99-portable-v47";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1313,7 +1313,7 @@
    *  (`works_as_contract_base`)。門は印字のLvの範囲・〔ターンに1回〕・コアの
    *  支払い(支払いがあるのは【契約技：N】を持つものだけ。このカードのコアN個を
    *  ボイドへ)。支払いは盤面を壊さない範囲でだけ行い、ソウルコアは使わない。 */
-  function fieldFlashSources(state, cards, unit) {
+  function fieldFlashSources(state, cards, unit, window = "flash") {
     if (!unit || unit.waiting) return [];
     const level = levelFor(unit, cards);
     const candidates = [[unit.card_no, false],
@@ -1322,14 +1322,28 @@
     for (const [cardNo, baseOnly] of candidates) {
       const effects = ((cards[cardNo] || {}).field_flash_effects || [])
         .filter((effect) => !baseOnly || effect.works_as_contract_base);
-      if (!effects.length || state.fieldFlashUsed.has(`${unit.uid}:${cardNo}`)) continue;
-      const gate = effects[0];
-      if (gate.flash_level_min !== null && gate.flash_level_min !== undefined
-          && !(gate.flash_level_min <= level && level <= gate.flash_level_max)) continue;
-      const cost = gate.flash_cost_cores || 0;
-      const ordinary = unit.cores - Number(Boolean(unit.soul_core));
-      if (cost && (ordinary < cost || unit.cores - cost < unit.floor)) continue;
-      sources.push({ card_no: cardNo, cost, effects });
+      // 【神技】は技ごとの束(`technique_id`、2026-10-13、Python同一)。門は束ごとに見る。
+      const groups = new Map();
+      for (const effect of effects) {
+        const id = effect.technique_id ?? null;
+        if (!groups.has(id)) groups.set(id, []);
+        groups.get(id).push(effect);
+      }
+      for (const [techniqueId, group] of groups) {
+        if ((group[0].flash_window === "main") !== (window === "main")) continue;
+        const key = techniqueId === null ? `${unit.uid}:${cardNo}`
+          : `${unit.uid}:${cardNo}:${techniqueId}`;
+        const used = window === "main" ? state.mainActivatedUsed : state.fieldFlashUsed;
+        if (used.has(key)) continue;
+        const gate = group[0];
+        if (gate.flash_level_min !== null && gate.flash_level_min !== undefined
+            && !(gate.flash_level_min <= level && level <= gate.flash_level_max)) continue;
+        const cost = gate.flash_cost_cores || 0;
+        const ordinary = unit.cores - Number(Boolean(unit.soul_core));
+        if (cost && (ordinary < cost || unit.cores - cost < unit.floor)) continue;
+        sources.push({ card_no: cardNo, cost, effects: group, key,
+          technique: techniqueId !== null });
+      }
     }
     return sources;
   }
@@ -1339,7 +1353,7 @@
    *  何度呼んでも実際に撃つのは1回だけ。 */
   function resolveAllFieldFlash(state, cards, targets) {
     for (const unit of [...state.field].sort((left, right) => left.uid - right.uid)) {
-      resolveFieldFlash(state, cards, targets, unit);
+      resolveFieldFlash(state, cards, targets, unit, true);
     }
     resolveSoulFlash(state, cards, targets);
   }
@@ -1402,35 +1416,90 @@
   }
 
   /** 盤面のフラッシュ効果を撃つ。Python `_resolve_field_flash` と同一。 */
-  function resolveFieldFlash(state, cards, targets, unit) {
+  function resolveFieldFlash(state, cards, targets, unit, ownTurn = false) {
     for (const source of fieldFlashSources(state, cards, unit)) {
-      state.fieldFlashUsed.add(`${unit.uid}:${source.card_no}`);
-      beginEffectFrame(state);
+      // 自分のターンの【神技】の束(2026-10-13)は、撃って値が上がるときだけ(Python同一)。
+      if (ownTurn && source.technique) {
+        decideTechnique(state, cards, targets, unit, source, "field_flash",
+          state.fieldFlashUsed);
+        continue;
+      }
+      state.fieldFlashUsed.add(source.key);
+      fireFieldSource(state, cards, targets, unit, source, "field_flash");
+    }
+  }
+
+  /** 【神技】の束を、撃って値が上がるときだけ撃つ。Python `_decide_technique`と同一。 */
+  function decideTechnique(state, cards, targets, unit, source, window, used) {
+    const opponent = MAIN_STEP_OPPONENTS.get(state) || null;
+    const attempt = (branch) => {
+      if (branch === null) return true;
+      const live = state.field.find((row) => row.uid === unit.uid);
+      if (!live) return false;
+      const previous = state.combatOpponent || null;
+      state.combatOpponent = opponent;
       try {
-        if (source.cost) {
-          unit.cores -= source.cost;
-          // ボイドへ置いたコアはどのゾーンにも入らない(トラッシュではない)。
-          recordCoreMove(state, cards, { amount: source.cost, source: "field",
-            destination: "void", reason: "contract_technique",
-            source_card_no: unit.card_no, source_uid: unit.uid });
-        }
-        for (const effect of source.effects) {
-          record(state, cards, "effect_start", { card_no: source.card_no, uid: unit.uid,
-            effect_kind: effect.kind, window: "field_flash" });
-          const traceMark = state.events.length;
-          const ok = resolveEffect(state, cards, targets, effect, unit.uid);
-          record(state, cards, "effect_complete", { card_no: source.card_no, uid: unit.uid,
-            effect_kind: effect.kind, window: "field_flash", resolved: Boolean(ok) });
-          if (effect.kind === "face_up_top_cycle") {
-            coalesceFaceUpCycleTrace(state, traceMark);
-          }
-        }
-        flushDerivedPlayReactions(state, cards, targets);
-        noteLegalCandidates(state, cards, targets);
+        return fireFieldSource(state, cards, targets, live, branch, window);
       } finally {
-        endEffectFrame(state);
+        state.combatOpponent = previous;
+      }
+    };
+    if (chooseAlternative(state, [null, source], attempt, opponent) !== source) return false;
+    used.add(source.key);
+    attempt(source);
+    return true;
+  }
+
+  /** 場のフラッシュ／【神技】の束を1つ撃つ。Python `_fire_field_source`と同一。
+   *  択一の組(技の中の「A。または、B」)は撃てた最初の枝だけ。1節でも解けたら真。 */
+  function fireFieldSource(state, cards, targets, unit, source, window) {
+    let resolvedAny = false;
+    beginEffectFrame(state);
+    try {
+      if (source.cost) {
+        unit.cores -= source.cost;
+        // ボイドへ置いたコアはどのゾーンにも入らない(トラッシュではない)。
+        recordCoreMove(state, cards, { amount: source.cost, source: "field",
+          destination: "void", reason: "contract_technique",
+          source_card_no: unit.card_no, source_uid: unit.uid });
+      }
+      const chosen = new Set();
+      for (const effect of source.effects) {
+        const group = effect.exclusive_group ?? null;
+        if (group !== null && chosen.has(group)) continue;
+        record(state, cards, "effect_start", { card_no: source.card_no, uid: unit.uid,
+          effect_kind: effect.kind, window });
+        const traceMark = state.events.length;
+        const ok = resolveEffect(state, cards, targets, effect, unit.uid);
+        record(state, cards, "effect_complete", { card_no: source.card_no, uid: unit.uid,
+          effect_kind: effect.kind, window, resolved: Boolean(ok) });
+        if (ok) {
+          resolvedAny = true;
+          if (group !== null) chosen.add(group);
+        }
+        if (effect.kind === "face_up_top_cycle") {
+          coalesceFaceUpCycleTrace(state, traceMark);
+        }
+      }
+      flushDerivedPlayReactions(state, cards, targets);
+      noteLegalCandidates(state, cards, targets);
+    } finally {
+      endEffectFrame(state);
+    }
+    return resolvedAny;
+  }
+
+  /** メインステップの【神技】(2026-10-13)。起動するかは`decideTechnique`。
+   *  Python `_resolve_main_techniques`と同一。 */
+  function resolveMainTechniques(state, cards, targets) {
+    let changed = false;
+    for (const unit of [...state.field].sort((left, right) => left.uid - right.uid)) {
+      for (const source of fieldFlashSources(state, cards, unit, "main")) {
+        if (decideTechnique(state, cards, targets, unit, source, "main_technique",
+          state.mainActivatedUsed)) changed = true;
       }
     }
+    return changed;
   }
 
   /** 効いている『ライフ保護』を通した後の減少量。
@@ -3373,6 +3442,15 @@
     state.effectFrameDepth -= 1;
     if (state.effectFrameDepth < 0) throw new Error("effect frame underflow");
     if (state.effectFrameDepth) return;
+    // 効果で出した召喚(`effectSummon`)の続きが、取り込む窓の無いところ(戦闘の窓・
+    // 場のフラッシュ)で残っていたら、ここで解く。Pythonは窓の外の効果召喚を
+    // `runtime.reserve`へ積み、`runtime.end`で場離れより先に解く。残すと召喚時効果も
+    // `play_complete`も出ないまま、関数が盤面に残って先読みの複製が落ちていた
+    // (2026-10-15、BS76-X12のアタック時にBS36-056)。
+    while (state.deferredDerivedPlays.length) {
+      const play = state.deferredDerivedPlays.shift();
+      if (play.run) play.run(); else play();
+    }
     while (state.deferredFieldLeaves.length) state.deferredFieldLeaves.shift()();
   }
 
@@ -5675,8 +5753,11 @@
     // 「ただし、『このスピリットの召喚時』効果は発揮されない」(2026-10-11)は出した札
     // **自身**の召喚時の節だけを外す。ほかの札の「召喚されたとき」(神託)は外さない。
     // Python `resolve_card_on_play`の`own_summon_effects`と同一。
+    // 召喚時だけ／煌臨時だけの節は出方で絞る(`entry_trigger`、2026-10-13、Python同一)。
+    const entryMatches = (effect) => !effect.entry_trigger
+      || (effect.entry_trigger === "kourin") === (watchEventKind === "kourin");
     const ownOpponentEffects = suppressOwnSummonEffects
-      ? [] : card.on_play_opponent_effects || [];
+      ? [] : (card.on_play_opponent_effects || []).filter(entryMatches);
     // 「Aするか、Bする」(2026-10-13): 解いてみて良い方の枝だけ(Python同一)。
     const chosenAlternatives = new Set();
     const decidedAlternatives = new Map();
@@ -5734,6 +5815,7 @@
     }
     const active = (card.enablers || []).filter((effect) => !suppressOwnSummonEffects
       && effect.mode === "on_play"
+      && entryMatches(effect)
       && effect.kind !== replacedEffectKind
       && !(braveMode === "spirit" && effect.combine_only));
     const triggerEventId = `turn${state.turn}:play:${card.card_no}#${uid}:`
@@ -7840,6 +7922,7 @@
         }
       }
     }
+    if (resolveMainTechniques(state, cards, targets)) changed = true;
     return changed;
   }
 
