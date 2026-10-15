@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v99-v1";
-  const STAGE_VERSION = "v99";
+  const ENGINE_SLICE = "stage4-v102-v1";
+  const STAGE_VERSION = "v102";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v99 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v102 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v99-portable-v47";
+  const RUNTIME_VERSION = "stage4-v102-portable-v50";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -5480,6 +5480,7 @@
         if (trigger.event !== event) continue;
         if (Boolean(effect.works_while_set) !== fromMirage) continue;
         if (trigger.own_turn_only && !state.ownTurnActive) continue;
+        if (effect.own_step === "attack" && !state.ownAttackActive) continue;
         if (trigger.excludes_source && sourceUid !== null
             && payload.uid === sourceUid) continue;
         // 「このアルティメットのUトリガーが…」は自分自身だけ、ダブルヒットは2回以上(Python同一)。
@@ -8312,7 +8313,12 @@
           state.trashCards.push(...milled);
           record(state, cards, "u_trigger_milled", { cards: [...milled] });
         }
-        return milled.map((cardNo) => ({ card_no: cardNo, cost: cards[cardNo]?.cost || 0,
+        // 判定はトラッシュへ置いた後のコスト(Q10884)。Python同一。
+        return milled.map((cardNo) => ({ card_no: cardNo,
+          // 札を置いた側の現在のカウントで条件を判定する。Python同一。
+          cost: countRequirementsMet(cards[cardNo]?.u_trigger_milled_cost_requirements, state.count)
+            ? (cards[cardNo]?.u_trigger_milled_cost ?? cards[cardNo]?.cost ?? 0)
+            : (cards[cardNo]?.cost ?? 0),
           card_type: cards[cardNo]?.card_type || "",
           colors: [...(cards[cardNo]?.colors || [])].sort() }));
       },
@@ -9264,6 +9270,7 @@
       // Stage6が行う——相手の盤面が要るのでこの試行の中では決められない。
       // 位置はPython側と同じ「メインの後・エンドステップの前」。
       if (!(options.going_first && turn === 1)) {
+        state.ownAttackActive = true;
         if (state.combat) record(state, cards, "step_attack");
         // 開始時は開始の記録の直後、窓も入口で1回。Stage4ソロはアタックが無いので
         // 終了時も続けて撃つ(Python同一)。
@@ -9274,6 +9281,7 @@
           record(state, cards, "step_attack_end");
         }
         resolveOwnStepEffects(state, cards, targets, "attack_end", options.going_first);
+        state.ownAttackActive = false;
       }
       // メインの後にもう一度試す。入口では条件(Lv・支払い)が揃っていなくても、
       // メインでコアやカードが動いた後なら撃てることがある。〔ターンに1回〕が
