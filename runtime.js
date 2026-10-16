@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v110-v1";
-  const STAGE_VERSION = "v110";
+  const ENGINE_SLICE = "stage4-v116-v1";
+  const STAGE_VERSION = "v116";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v110 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v116 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v110-portable-v58";
+  const RUNTIME_VERSION = "stage4-v116-portable-v64";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -776,7 +776,7 @@
   }
   const BASIC_COLORS = ["赤", "紫", "緑", "白", "黄", "青"];
   const SUPPORTED_EFFECTS = new Set([
-    "draw", "coreboost", "self_coreboost", "field_coreboost", "count_gain", "symbol_grant", "life_core_gain",
+    "draw", "coreboost", "self_coreboost", "field_coreboost", "count_gain", "symbol_grant", "life_core_gain", "u_trigger_invoke",
     "search", "recover", "self_recover", "side_recover", "stash_top",
     "oracle_mill", "oracle_pickup", "oracle_watch", "deck_discard_draw",
     "hand_filter", "core_to_trash", "life_core_move", "token_spawn",
@@ -1743,6 +1743,8 @@
   }
 
   function effectActive(effect, state, cards, sourceUid) {
+    if (effect.requires_source_kourin
+        && !(state.field.find((unit) => unit.uid === sourceUid)?.kourin_stack || []).length) return false;
     if (effect.kind === "oracle_mill"
         && !oracleMillDeclarable(effect, state, cards, sourceUid)) return false;
     // 印字のLv(下限`required_level`と見出しの並び`levels`、2026-10-02)。
@@ -2639,7 +2641,11 @@
     // 相手のガード型【トリガーカウンター】(Stage D、Python同一)。
     let countered = null;
     if (hits.length && typeof board.trigger_counter === "function") {
-      countered = board.trigger_counter(hits);
+      const attacker = state.field.find((row) => row.uid === state.attackingUid);
+      const forbidden = Boolean(cards[state.mirage]?.counter_lock_while_kourin_attacks
+        && attacker && !attacker.waiting
+        && cards[attacker.card_no]?.card_type === "アルティメット" && attacker.kourin_stack?.length);
+      countered = board.trigger_counter(hits, forbidden, combatBoard(state, cards));
       if (countered) hits = [];
     }
     if (hits.length) state.uTriggerHits.set(`${effect.effect_id}@${sourceUid}`, hits);
@@ -4052,6 +4058,17 @@
         if (!row || resisted(state, cards, row, effect, sourceUid)) return false;
       }
       return Boolean(board.remove_soul_core(effect.core_destination || "trash"));
+    }
+    if (effect.kind === "u_trigger_invoke") {
+      const unit = state.field.find((row) => row.uid === sourceUid);
+      if (!unit || unit.waiting) return false;
+      const byId = new Map((cards[unit.card_no]?.attack_effects || []).map((row) => [row.effect_id, row]));
+      const ids = effect.u_trigger_effect_ids || [];
+      if (!ids.length || ids.some((key) => !byId.has(key))) return false;
+      let resolved = false;
+      for (const key of ids) resolved = resolveEffect(state, cards, targets, byId.get(key), sourceUid) || resolved;
+      dispatchUTriggerEvents(state, cards, targets, state.combatOpponent);
+      return resolved;
     }
     if (effect.kind === "u_trigger") return resolveUTrigger(state, cards, effect, sourceUid);
     if (effect.kind === "poison_blade") {
@@ -5517,6 +5534,7 @@
         if (Boolean(effect.works_while_set) !== fromMirage) continue;
         if (trigger.own_turn_only && !state.ownTurnActive) continue;
         if (effect.own_step === "attack" && !state.ownAttackActive) continue;
+        if (effect.requires_combined && !combinedBraves(state, sourceUid).length) continue;
         if (trigger.excludes_source && sourceUid !== null
             && payload.uid === sourceUid) continue;
         // 「このアルティメットのUトリガーが…」は自分自身だけ、ダブルヒットは2回以上(Python同一)。
@@ -8213,6 +8231,7 @@
       },
       // バトル／ターンの終わりに、その期間のBP修正を捨てる。
       end_battle: () => {
+        state.attackingUid = null;
         for (const unit of state.field) {
           if (unit.bp_penalties) {
             unit.bp_penalties = unit.bp_penalties.filter((row) => row.scope !== "battle");
@@ -8229,6 +8248,7 @@
       // どちらの手番の終わりでも両方の盤面を叩くので、消すのは自分のエンドステップ
       // (`expireOwnEndStepProtections`)。Python `_combat_end_turn_modifiers` と同一。
       end_turn_modifiers: () => {
+        state.attackingUid = null;
         for (const unit of state.field) {
           if (unit.bp_penalties) unit.bp_penalties = [];
           if (unit.timed_symbol_grants) unit.timed_symbol_grants = [];
@@ -8376,7 +8396,27 @@
       },
       // 相手のUトリガーのヒットに、手札のガード型【トリガーカウンター】を使う(Stage D)。
       // Python `_combat_trigger_counter`と同一——色が合う最初の札を、払えるなら使う。
-      trigger_counter: (hits) => {
+      trigger_counter: (hits, forbidden = false, opponent = null) => {
+        // 禁止は手札に届く効果(Q23502)。保護は使用前の枚数と現在の場で判定する。
+        if (forbidden && !state.field.some((unit) => {
+          if (unit.waiting) return false;
+          const guard = cards[unit.card_no]?.counter_hand_protection;
+          if (!guard || (guard.hand_max != null && state.hand.length > guard.hand_max)) return false;
+          if (guard.field_slot && !board.has_field_card(guard.field_slot.alternatives)) return false;
+          if (!stateConditionsMet(guard.state_conditions, state, cards, unit.uid)) return false;
+          if (guard.hand_side_at_most_opponent) {
+            if (!opponent || typeof opponent.hand_count !== "function"
+                || typeof opponent.side_count !== "function") return false;
+            if (state.hand.length + state.sideCards.length > opponent.hand_count() + opponent.side_count()) return false;
+          }
+          if (guard.combine_only) {
+            const host = state.field.find((row) => row.uid === unit.combined_host_uid);
+            if (unit.brave_mode !== "combine" || !host || host.waiting) return false;
+            if (guard.combined_host_slot && !guard.combined_host_slot.alternatives.some(
+              (alternative) => cardMatchesAlternative(cards[host.card_no], alternative))) return false;
+          }
+          return levelFor(unit, cards) >= (guard.required_level || 0);
+        })) return null;
         const colors = new Set(hits.flatMap((row) => row.colors || []));
         for (const cardNo of [...state.hand]) {
           const card = cards[cardNo] || {};
@@ -8764,6 +8804,7 @@
         resolveOpponentStep(state, cards, targets, step, opponent || null),
       resolve_trigger: (uid, window, opponent, battleRole) => {
         const unit = state.field.find((row) => row.uid === uid);
+        if (window === "attack") state.attackingUid = unit && !unit.waiting ? uid : null;
         if (!unit || unit.waiting) return [];
         const key = COMBAT_WINDOW_KEYS[window];
         // 『バトル終了時』は**どちらの宣言から遅らせた節か**で選ぶ(6C)。
@@ -9046,6 +9087,7 @@
       uTriggerHits: new Map(),
       // ヒット/ガードの出来事(Stage C、Python `u_trigger_events`)。窓を解き終えてから配る。
       uTriggerEvents: [],
+      attackingUid: null,
       // 開発用の候補・順位診断。明示された配列へだけ書き、通常のstate/棋譜には
       // 出さない。Python `choice_debug` と同じ構造を返す。
       choiceDebug: Array.isArray(options.choice_debug) ? options.choice_debug : null,
