@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v102-v1";
-  const STAGE_VERSION = "v102";
+  const ENGINE_SLICE = "stage4-v110-v1";
+  const STAGE_VERSION = "v110";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v102 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v110 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v102-portable-v50";
+  const RUNTIME_VERSION = "stage4-v110-portable-v58";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -776,7 +776,7 @@
   }
   const BASIC_COLORS = ["赤", "紫", "緑", "白", "黄", "青"];
   const SUPPORTED_EFFECTS = new Set([
-    "draw", "coreboost", "self_coreboost", "field_coreboost", "count_gain",
+    "draw", "coreboost", "self_coreboost", "field_coreboost", "count_gain", "symbol_grant", "life_core_gain",
     "search", "recover", "self_recover", "side_recover", "stash_top",
     "oracle_mill", "oracle_pickup", "oracle_watch", "deck_discard_draw",
     "hand_filter", "core_to_trash", "life_core_move", "token_spawn",
@@ -2633,7 +2633,7 @@
       threshold = (cards[unit.card_no]?.cost || 0) + combinedBraves(state, sourceUid)
         .reduce((sum, brave) => sum + (cards[brave.card_no]?.cost || 0), 0);
     }
-    const milled = board.trigger_mill(effect.trigger_cards || 1);
+    const milled = board.trigger_mill(effect.trigger_cards || 1, combatBoard(state, cards));
     // 1枚ごとに1回のUトリガー。境目より低い札の枚数がヒットした回数(Python同一)。
     let hits = milled.filter((row) => row.cost < threshold);
     // 相手のガード型【トリガーカウンター】(Stage D、Python同一)。
@@ -2644,7 +2644,10 @@
     }
     if (hits.length) state.uTriggerHits.set(`${effect.effect_id}@${sourceUid}`, hits);
     state.uTriggerEvents.push([hits.length ? "u_trigger_hit" : "u_trigger_guard",
-      { card_no: unit ? unit.card_no : effect.source_card_no, uid: sourceUid, hits }]);
+      { card_no: unit ? unit.card_no : effect.source_card_no, uid: sourceUid, hits,
+        // ヒット/ガードの時点の合体関係。Python同一。
+        combined_braves: unit && !unit.waiting
+          ? combinedBraves(state, sourceUid).map((brave) => brave.card_no) : [] }]);
     record(state, cards, "u_trigger", {
       card_no: unit ? unit.card_no : effect.source_card_no, uid: sourceUid,
       milled: milled.map((row) => row.card_no), threshold, hit: hits.length > 0,
@@ -3474,7 +3477,11 @@
         effect_kind: "opened_reaction", source_card_no: sourceCardNo });
       let resolved = false;
       if (reaction.destination === "burst") {
-        pool.splice(pool.indexOf(cardNo), 1);
+        // セットできない札(バースト効果を持たないミラージュの「セットできる」)は公開
+        // プールに残す。先に抜くと、セットされないまま札がゲームから消えていた
+        // (T47の掃検、BS75-074→BS75-007・BS76-072→BS76-037)。Python
+        // `perform_burst_set`はセットできるときだけ抜く。
+        if ((card?.burst_effects || []).length) pool.splice(pool.indexOf(cardNo), 1);
         resolved = setBurst(state, cards, targets, cardNo, "effect");
       } else if (reaction.destination === "hand") {
         if (total) {
@@ -3731,6 +3738,24 @@
       // 不発と書く(seed 20260817の戦闘モードで発覚)。
       draw(state, cards, amount, "effect");
       return true;
+    }
+    if (effect.kind === "symbol_grant") {
+      const targetUid = effect.target_event_subject ? state.eventSubjectUid : sourceUid;
+      const unit = state.field.find((row) => row.uid === targetUid && !row.waiting);
+      if (!unit) return false;
+      const sourceNo = effect.source_card_no
+        ?? state.field.find((row) => row.uid === sourceUid)?.card_no ?? null;
+      (unit.timed_symbol_grants ??= []).push({symbols:{...effect.symbols},scope:effect.scope,
+        required_level:null,source_card_no:sourceNo});
+      record(state,cards,"symbol_granted",{card_no:sourceNo,uid:targetUid,
+        symbols:{...effect.symbols},scope:effect.scope});
+      return true;
+    }
+    if (effect.kind === "life_core_gain") {
+      state.life += amount;
+      recordCoreMove(state, cards, { amount, source: "void", destination: "life",
+        reason: "life_core_gain", source_card_no: effect.source_card_no, source_uid: sourceUid });
+      return amount > 0;
     }
     if (effect.kind === "coreboost") {
       state.reserve += amount;
@@ -4110,6 +4135,9 @@
       if (effect.kind === "unit_destroy") {
         applied = targets.filter((row) => board.destroy(row.uid, "effect"));
         if (effect.b3_followup_id) state.movedCards = applied.map((row) => row.card_no);
+        if (applied.length && effect.destroy_life_amount) {
+          board.damage_life(effect.destroy_life_amount, "reserve");
+        }
       } else if (effect.kind === "unit_bounce") {
         const where = effect.bounce_destination || "hand";
         applied = targets.filter((row) => board.bounce(row.uid, where));
@@ -4121,6 +4149,14 @@
           Boolean(effect.destroy_at_zero)));
       } else {
         applied = targets.filter((row) => board.exhaust(row.uid));
+      }
+      // 除去対価が成立した後だけ本人を1段階回復(Python同一)。
+      const unit = state.field.find((row) => row.uid === sourceUid && !row.waiting);
+      if (applied.length && effect.refresh_self && unit?.exhausted) {
+        if (unit.heavy_exhausted) unit.heavy_exhausted = false;
+        else unit.exhausted = false;
+        record(state, cards, "unit_refreshed", {card_no:unit.card_no, uid:sourceUid,
+          exhausted:Boolean(unit.exhausted)});
       }
       return applied.length > 0;
     }
@@ -5486,12 +5522,17 @@
         // 「このアルティメットのUトリガーが…」は自分自身だけ、ダブルヒットは2回以上(Python同一)。
         if (trigger.self_only && payload.uid !== sourceUid) continue;
         if (trigger.hit_min && (payload.hits || []).length < trigger.hit_min) continue;
+        if (effect.u_hit_card && !uHitGateMet(effect, payload.hits || [])) continue;
         if (event === "ally_summoned") {
           const played = cards[payload.card_no] || {};
           if (!SUMMONABLE_CARD_TYPES.has(played.card_type)) continue;
           if (KOURIN_PLAY_SOURCES.has(payload.source) && !trigger.includes_kourin) continue;
         }
         if (trigger.slot && !cardMatchesSlot(cards[payload.card_no], trigger.slot)) continue;
+        if (trigger.combined_brave_slot) {
+          if (!(payload.combined_braves || []).some((cardNo) => cards[cardNo]
+            && cardMatchesSlot(cards[cardNo], trigger.combined_brave_slot))) continue;
+        }
         matched.push(effect);
       }
       const fired = [];
@@ -7659,6 +7700,7 @@
       if (types.length && !types.some((word) => (row.card_type || "").endsWith(word))) {
         return false;
       }
+      if (effect.target_levels?.length && !effect.target_levels.includes(row.level)) return false;
       if (bpMax !== null && bpMax !== undefined && row.bp > bpMax) return false;
       if (costMax !== null && costMax !== undefined && row.cost > costMax) return false;
       // 下限と列挙(「BP10000以上」「コスト6/7/8」、2026-10-11、Python同一)。
@@ -8099,6 +8141,8 @@
     // `board`に束ねてから返す。`remove_cores`がコア0のユニットを破壊するとき、
     // 同じ盤面の`destroy`を呼ぶため(毎回作り直すと意図が読みにくい)。
     const board = {
+      has_field_card: (alternatives) => state.field.some((unit) => !unit.waiting
+        && alternatives.some((alternative) => cardMatchesAlternative(cards[unit.card_no], alternative))),
       units: () => combatUnits(state, cards),
       // 場の体の色(公開情報、`units`と同じ並び)。Python同一。棋譜には出ない。
       unit_colors: () => combatUnits(state, cards)
@@ -8303,7 +8347,7 @@
       },
       // 相手のアルティメットトリガー(2026-10-12): 自分のデッキの上からcount枚を
       // トラッシュに置く。破棄ではない。Python `_combat_trigger_mill`と同一。
-      trigger_mill: (count) => {
+      trigger_mill: (count, opponent = null) => {
         const milled = [];
         for (let index = 0; index < count && state.deck.length; index += 1) {
           observeDeckExit(state, state.deck.at(-1), state.deck.length);
@@ -8314,9 +8358,17 @@
           record(state, cards, "u_trigger_milled", { cards: [...milled] });
         }
         // 判定はトラッシュへ置いた後のコスト(Q10884)。Python同一。
+        const fieldMet = (card) => {
+          const condition = card.u_trigger_milled_cost_field;
+          if (!condition) return true;
+          const owner = condition.subject === "自分" ? board : opponent;
+          return Boolean(owner && typeof owner.has_field_card === "function"
+            && owner.has_field_card(condition.alternatives));
+        };
         return milled.map((cardNo) => ({ card_no: cardNo,
           // 札を置いた側の現在のカウントで条件を判定する。Python同一。
           cost: countRequirementsMet(cards[cardNo]?.u_trigger_milled_cost_requirements, state.count)
+            && fieldMet(cards[cardNo])
             ? (cards[cardNo]?.u_trigger_milled_cost ?? cards[cardNo]?.cost ?? 0)
             : (cards[cardNo]?.cost ?? 0),
           card_type: cards[cardNo]?.card_type || "",
@@ -8783,7 +8835,8 @@
               clauses: group.clauses,
               effect_tag: group.clauses.find((effect) => effect.effect_tag)?.effect_tag || null,
               optional: group.clauses.some((effect) => Boolean(effect.optional)),
-              dependencies: [],
+              dependencies: [...new Set(group.clauses
+                .map((effect) => effect.requires_effect_block_id).filter(Boolean))],
               legacy_order: group.legacyOrder,
               priority_depth: 0,
               gate_source: group.source,
@@ -9669,7 +9722,7 @@
     // トラッシュから使うフラッシュの宣言(2026-10-08、Python同一)。
     "trash_flash_declared",
     // アタックの窓で付いた一時シンボル(2026-08-31)。
-    "symbol_granted",
+    "symbol_granted", "unit_refreshed",
     "opponent_turn_end",
     // 自分のターンの『〜ステップ』の節を、そのステップで撃った記録(2026-10-10)。
     "step_effect",
