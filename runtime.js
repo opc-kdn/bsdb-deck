@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v116-v1";
-  const STAGE_VERSION = "v116";
+  const ENGINE_SLICE = "stage4-v117-v1";
+  const STAGE_VERSION = "v117";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -719,12 +719,12 @@
   };
 })();
 
-// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v116 into
+// Stage5 5B-2 portable Stage4 core. Card text is compiled by Python v117 into
 // public JSON IR; this file executes that IR without database or network use.
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v116-portable-v64";
+  const RUNTIME_VERSION = "stage4-v117-portable-v65";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -5437,17 +5437,21 @@
   }
 
   // 印字効果の〔ターンに1回〕キー。同名縛りはカード名、裸はその1枚(uid)ごと。
+  function clauseTurnLimitKey(instance, clause, cards) {
+    const limit = clause.block_turn_limit;
+    const block = clause.effect_block_id;
+    if (!limit || !block) return null;
+    return limit === "once_per_turn_name"
+      ? `name\u0000${cards[instance.source_card_no]?.name || instance.source_card_no}`
+        + `\u0000${nameLimitedBlock(block)}`
+      : `card\u0000${instance.source_uid}\u0000${block}`;
+  }
+
   function instanceTurnLimitKeys(instance, cards) {
     const keys = [];
     for (const clause of instance.clauses) {
-      const limit = clause.block_turn_limit;
-      const block = clause.effect_block_id;
-      if (!limit || !block) continue;
-      const key = limit === "once_per_turn_name"
-        ? `name\u0000${cards[instance.source_card_no]?.name || instance.source_card_no}`
-          + `\u0000${nameLimitedBlock(block)}`
-        : `card\u0000${instance.source_uid}\u0000${block}`;
-      if (!keys.includes(key)) keys.push(key);
+      const key = clauseTurnLimitKey(instance, clause, cards);
+      if (key !== null && !keys.includes(key)) keys.push(key);
     }
     return keys;
   }
@@ -5455,6 +5459,18 @@
   function turnLimitAvailable(state, cards, instance) {
     return instanceTurnLimitKeys(instance, cards)
       .every((key) => !state.blockTurnUsed.has(key));
+  }
+
+  // 効果の途中の「ターンに1回」は、その語より後ろの節だけを縛る(2026-10-17、
+  // 裁定Q11229・Q23398)。縛りを使い終えた節を外し、前の節は毎回発揮する。
+  // 効果全体が縛られているときはそのまま返す。Python `_trim_used_turn_limited`と同一。
+  function trimUsedTurnLimited(state, cards, instance) {
+    const keys = instance.clauses.map((clause) => clauseTurnLimitKey(instance, clause, cards));
+    if (keys.every((key) => key !== null)) return instance;
+    const clauses = instance.clauses.filter((_clause, index) =>
+      keys[index] === null || !state.blockTurnUsed.has(keys[index]));
+    if (clauses.length === instance.clauses.length) return instance;
+    return { ...instance, clauses };
   }
 
 
@@ -5626,7 +5642,8 @@
         .filter((instance) => completed.has(instance.instance_id))
         .map((instance) => instance.effect_block_id));
       let candidates = instances.filter((instance) => !completed.has(instance.instance_id)
-        && instance.dependencies.every((dependency) => completedBlocks.has(dependency)));
+        && instance.dependencies.every((dependency) => completedBlocks.has(dependency)))
+        .map((instance) => trimUsedTurnLimited(state, cards, instance));
       if (!candidates.length) {
         throw new Error(`effect window has unresolved dependencies: ${windowId}`);
       }
