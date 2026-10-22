@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v146-v1";
-  const STAGE_VERSION = "v146";
+  const ENGINE_SLICE = "stage4-v147-v1";
+  const STAGE_VERSION = "v147";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v146-portable-v94";
+  const RUNTIME_VERSION = "stage4-v147-portable-v95";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3530,7 +3530,16 @@
   function openReactionMatches(reaction, sourceCardNo, cards) {
     const source = cards[sourceCardNo];
     if (!source) return Boolean(reaction.source_any);
-    if (reaction.source_color && !(source.colors || []).includes(reaction.source_color)) return false;
+    const colors = source.colors || [];
+    if (reaction.source_color && !colors.includes(reaction.source_color)) return false;
+    // 色・名前・種類の択一と「赤1色」(T88の3、Python `open_reaction_source_matches`同一)。
+    if ((reaction.source_colors || []).length
+        && !reaction.source_colors.some((color) => colors.includes(color))) return false;
+    if (reaction.source_mono && new Set(colors).size !== 1) return false;
+    if ((reaction.source_names || []).length
+        && !reaction.source_names.some((name) => (source.name || "").includes(name))) return false;
+    if ((reaction.source_card_types || []).length
+        && !reaction.source_card_types.some((kind) => (source.card_type || "").includes(kind))) return false;
     if ((reaction.source_lineages || []).length
         && !reaction.source_lineages.some((value) => (source.lineages || []).includes(value))) return false;
     if (reaction.source_name_contains
@@ -3626,11 +3635,22 @@
   }
 
   function applyOpenReactions(state, cards, targets, pool, sourceCardNo) {
-    for (const cardNo of [...pool]) {
+    const matched = (cardNo) => (cards[cardNo]?.open_reactions || []).find((row) =>
+      openReactionMatches(row, sourceCardNo, cards));
+    // ミラージュへのセットは1回の公開で1枚まで(Q1457)。方針は公開プールの上(末尾)から最初に
+    // 宣言できる1枚を選ぶ。選ばれなかった札は宣言もしない(D29、Python同一)。
+    let miragePick = null;
+    for (let index = pool.length - 1; index >= 0 && miragePick === null; index -= 1) {
+      const row = matched(pool[index]);
+      if (row?.destination === "mirage" && !(row.requires_mirage_empty && state.mirage)) {
+        miragePick = index;
+      }
+    }
+    for (const [index, cardNo] of [...pool].entries()) {
       const card = cards[cardNo];
-      const reaction = (card?.open_reactions || []).find((row) =>
-        openReactionMatches(row, sourceCardNo, cards));
+      const reaction = matched(cardNo);
       if (!reaction) continue;
+      if (reaction.destination === "mirage" && index !== miragePick) continue;
       record(state, cards, "open_reaction_declared", { card_no: cardNo,
         source_card_no: sourceCardNo, destination: reaction.destination });
       if (reaction.same_name_policy === "once_per_turn"
@@ -3644,7 +3664,9 @@
       record(state, cards, "effect_start", { card_no: cardNo,
         effect_kind: "opened_reaction", source_card_no: sourceCardNo });
       let resolved = false;
-      if (reaction.destination === "burst") {
+      if (reaction.destination === "mirage") {
+        resolved = setMirageFromOpen(state, cards, targets, pool, cardNo, reaction);
+      } else if (reaction.destination === "burst") {
         // セットできない札(バースト効果を持たないミラージュの「セットできる」)は公開
         // プールに残す。先に抜くと、セットされないまま札がゲームから消えていた
         // (T47の掃検、BS75-074→BS75-007・BS76-072→BS76-037)。Python
@@ -6857,11 +6879,39 @@
     }
     if (!fromHand) pruneSidePlayable(state);
     state.mirage = cardNo;
-    for (const effect of card.enablers || []) {
+    resolveMirageOnSet(state, cards, targets, cardNo);
+    record(state, cards, "mirage_set", { card_no: cardNo, source: "rule", cost: total });
+    return true;
+  }
+
+  // 『このミラージュのセット時』。セットの経路(ルール/効果)を問わない。
+  function resolveMirageOnSet(state, cards, targets, cardNo) {
+    for (const effect of cards[cardNo]?.enablers || []) {
       if (effect.mode !== "on_set" || !effectActive(effect, state, cards, null)) continue;
       resolveEffect(state, cards, targets, effect, null);
     }
-    record(state, cards, "mirage_set", { card_no: cardNo, source: "rule", cost: total });
+  }
+
+  // 公開プールからコストを支払わずにミラージュへセットする(T88の3、Python
+  // `set_mirage_from_open`同一)。ルールのセットの1回枠は使わない。旧ミラージュは
+  // `displaced_to: hand`なら手札へ。「セットしていないとき」の札は枠が空のときしか来ない。
+  function setMirageFromOpen(state, cards, targets, pool, cardNo, reaction) {
+    const at = pool.indexOf(cardNo);
+    if (at < 0) return false;
+    pool.splice(at, 1);
+    state.seen.add(cardNo);
+    const displaced = state.mirage || null;
+    state.mirage = cardNo;
+    if (displaced) {
+      if (reaction.displaced_to !== "hand") {
+        throw new Error("open-reaction mirage set has no destination for the old mirage");
+      }
+      state.hand.push(displaced);
+      state.seen.add(displaced);
+      state.handGain += 1;
+    }
+    resolveMirageOnSet(state, cards, targets, cardNo);
+    record(state, cards, "mirage_set", { card_no: cardNo, source: "open_reaction", cost: 0, displaced });
     return true;
   }
 
@@ -10185,6 +10235,8 @@
     paymentFor, representativeRows, runSimulation, runTrial, runTrialStream,
     // 軽減の割り当て(テストがPythonと突き合わせる、T87)。
     maxSymbolAssignment,
+    // 公開札の反応の発生源(テストがPythonと突き合わせる、T88の3)。
+    openReactionMatches,
     winningBlockValue, selectBounceTargets,
     // 「BP合計Nまで好きなだけ」の組(テストがPythonと突き合わせる、2026-10-11)。
     selectTotalCappedTargets,
