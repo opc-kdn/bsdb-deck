@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v148-v1";
-  const STAGE_VERSION = "v148";
+  const ENGINE_SLICE = "stage4-v149-v1";
+  const STAGE_VERSION = "v149";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v148-portable-v96";
+  const RUNTIME_VERSION = "stage4-v149-portable-v97";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3436,11 +3436,14 @@
     const firedNow = new Set();
     const collectedNames = new Set();
     const collected = [];
+    let mirageTaken = false; // ミラージュへのセットは1回の破棄で1枚まで(Q1457、Python同一)
     for (const [occurrence, cardNo] of [...landed].entries()) {
       const index = state.trashCards.indexOf(cardNo);
       if (index < 0) continue;
       for (const reaction of cards[cardNo]?.trash_reactions || []) {
         if (reaction.event !== "milled_from_deck") continue;
+        if (reaction.destination === "mirage"
+            && (mirageTaken || (reaction.requires_mirage_empty && state.mirage))) continue;
         if (reaction.source_oracle) {
           if (!oracle) continue;
         } else if (!openReactionMatches(reaction, sourceCardNo, cards)) {
@@ -3456,6 +3459,7 @@
               >= (state.deckCopies[cardNo] || 0)) continue;
         firedNow.add(cardNo);
         collectedNames.add(name);
+        mirageTaken = mirageTaken || reaction.destination === "mirage";
         collected.push({ kind: "trash_reaction", card_no: cardNo,
           source_card_no: sourceCardNo, reaction, occurrence });
         break;
@@ -3474,10 +3478,19 @@
     if (limit === "once_per_turn_card"
         && (state.trashReactionCardUses[cardNo] || 0)
           >= (state.deckCopies[cardNo] || 0)) return false;
+    // 「セットしていないとき」は解決の時点でも見る(Python同一)。
+    if (effect.reaction.destination === "mirage" && effect.reaction.requires_mirage_empty
+        && state.mirage) return false;
     if (limit === "once_per_turn_name") state.trashReactionNames.add(name);
     else if (limit === "once_per_turn_card") {
       state.trashReactionCardUses[cardNo] =
         (state.trashReactionCardUses[cardNo] || 0) + 1;
+    }
+    if (effect.reaction.destination === "mirage") {
+      // トラッシュからミラージュへ(T88の3の残り、設計4章「トラッシュ経路」。Python同一)。
+      setMirageFromOpen(state, cards, targets, state.trashCards, cardNo, effect.reaction,
+        "trash_reaction");
+      return true;
     }
     // 手札に加えず続きだけを解く形(BS74-086、Python同一)。
     if (effect.reaction.destination !== "stay") {
@@ -3643,6 +3656,12 @@
     if (reaction.source_not_burst && sourceCardNo && state.burstOpen === sourceCardNo) return false;
     if (reaction.threshold !== null && reaction.threshold !== undefined
         && !requirementMet(reaction, state.count)) return false;
+    // 1文の中の「自分の手札がN枚以下のとき」「自分の白のネクサスがあるとき」。宣言は公開の
+    // 時点なので、同じ公開のほかの反応で手札・場が動く前に見る(Python同一)。
+    if (reaction.hand_max !== null && reaction.hand_max !== undefined
+        && state.hand.length > reaction.hand_max) return false;
+    if (!discardSummonConditionsMet(state, cards,
+      { own_present_slots: reaction.own_present_slots })) return false;
     // 方針: ただちの発動は、撃てる節のあるバーストだけ宣言する(何もしないなら宣言しない)。
     const card = cards[cardNo];
     return reaction.destination !== "burst_activate"
@@ -3655,16 +3674,19 @@
       && openReactionSceneMet(state, cards, row, cardNo, sourceCardNo));
     // ミラージュへのセットは1回の公開で1枚まで(Q1457)。方針は公開プールの上(末尾)から最初に
     // 宣言できる1枚を選ぶ。選ばれなかった札は宣言もしない(D29、Python同一)。
+    // 宣言は公開の時点でまとめて決める(同じ公開のほかの反応の解決で手札・場・カウントが
+    // 動いても、宣言できた札は変わらない。Python同一)。
+    const declarable = pool.map((cardNo) => matched(cardNo));
     let miragePick = null;
     for (let index = pool.length - 1; index >= 0 && miragePick === null; index -= 1) {
-      const row = matched(pool[index]);
+      const row = declarable[index];
       if (row?.destination === "mirage" && !(row.requires_mirage_empty && state.mirage)) {
         miragePick = index;
       }
     }
     for (const [index, cardNo] of [...pool].entries()) {
       const card = cards[cardNo];
-      const reaction = matched(cardNo);
+      const reaction = declarable[index];
       if (!reaction) continue;
       if (reaction.destination === "mirage" && index !== miragePick) continue;
       record(state, cards, "open_reaction_declared", { card_no: cardNo,
@@ -3685,12 +3707,18 @@
           source_card_no: sourceCardNo ?? null, seq: state.derivedSeq++ });
         continue;
       }
-      const cost = reaction.cost || 0;
+      // 支払いの印字の無い「召喚できる」「配置できる」は札のコストを、手札から出すときと同じ
+      // 軽減で払う(手札のコスト補正は掛けない。Python `_play_cost_impl`同一)。
+      const printed = reaction.cost_mode === "printed";
+      const cost = printed ? paymentForState(state, cards, { ...card, card_no: cardNo }, "outside").pay
+        : reaction.cost || 0;
       const total = cost + (reaction.destination === "field" ? card.maintenance || 0 : 0);
       if (reaction.destination === "field" && !summonConditionsMet(card, state, cards)) continue;
-      if (total > reclaimable(state, true, cards)) continue;
+      // 方針: 通常のコストを払う出し方は、自分の場を壊してまでは出さない(Python同一)。
+      if (total > reclaimable(state, !printed, cards)) continue;
       record(state, cards, "open_reaction_queued", { card_no: cardNo,
-        source_card_no: sourceCardNo, destination: reaction.destination });
+        source_card_no: sourceCardNo, destination: reaction.destination,
+        ...(printed ? { pay: cost } : {}) });
       record(state, cards, "effect_start", { card_no: cardNo,
         effect_kind: "opened_reaction", source_card_no: sourceCardNo });
       let resolved = false;
@@ -3720,7 +3748,7 @@
       } else if (reaction.destination === "field") {
         if (total) {
           const deficit = total - state.reserve;
-          if (deficit > 0) fundPayment(state, cards, targets, deficit, true);
+          if (deficit > 0) fundPayment(state, cards, targets, deficit, !printed);
         }
         pool.splice(pool.indexOf(cardNo), 1);
         const soulCore = total ? payFromReserve(state, cost, card.maintenance || 0) : false;
@@ -6968,7 +6996,7 @@
   // 公開プールからコストを支払わずにミラージュへセットする(T88の3、Python
   // `set_mirage_from_open`同一)。ルールのセットの1回枠は使わない。旧ミラージュは
   // `displaced_to: hand`なら手札へ。「セットしていないとき」の札は枠が空のときしか来ない。
-  function setMirageFromOpen(state, cards, targets, pool, cardNo, reaction) {
+  function setMirageFromOpen(state, cards, targets, pool, cardNo, reaction, source = "open_reaction") {
     const at = pool.indexOf(cardNo);
     if (at < 0) return false;
     pool.splice(at, 1);
@@ -6984,7 +7012,7 @@
       state.handGain += 1;
     }
     resolveMirageOnSet(state, cards, targets, cardNo);
-    record(state, cards, "mirage_set", { card_no: cardNo, source: "open_reaction", cost: 0, displaced });
+    record(state, cards, "mirage_set", { card_no: cardNo, source, cost: 0, displaced });
     return true;
   }
 
