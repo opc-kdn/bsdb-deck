@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v147-v1";
-  const STAGE_VERSION = "v147";
+  const ENGINE_SLICE = "stage4-v148-v1";
+  const STAGE_VERSION = "v148";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v147-portable-v95";
+  const RUNTIME_VERSION = "stage4-v148-portable-v96";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3052,6 +3052,8 @@
       soul_location: soulLocation, count: state.count, mirage: state.mirage, burst: state.burst,
       // 発動して解決中のバースト(表向き)。行き先が決まると空になる。
       burst_open: state.burstOpen,
+      // 発動を宣言して待っている公開札のバースト(あるときだけ。T88の3、Python同一)。
+      ...(state.burstDeclared.length ? { burst_declared: [...state.burstDeclared] } : {}),
       // Pythonの`open_pool_stack`と同じく、入れ子になった公開効果も外側から
       // 順に1本へ畳んで棋譜へ出す。各poolは解決中の実配列そのものなので、
       // 公開時反応で札を取り除いた時点も過去のコピーではなく現在値を写せる。
@@ -3634,9 +3636,23 @@
     while (state.deferredFieldLeaves.length) state.deferredFieldLeaves.shift()();
   }
 
+  // 公開札自身の反応を宣言できる場面(T88の3、設計4b章。Python `scene_met`同一)。
+  // オープンした効果がバースト効果か＝その発動元が今バーストゾーンで表向きか。
+  function openReactionSceneMet(state, cards, reaction, cardNo, sourceCardNo) {
+    if (reaction.own_step === "attack" && !state.ownAttackActive) return false;
+    if (reaction.source_not_burst && sourceCardNo && state.burstOpen === sourceCardNo) return false;
+    if (reaction.threshold !== null && reaction.threshold !== undefined
+        && !requirementMet(reaction, state.count)) return false;
+    // 方針: ただちの発動は、撃てる節のあるバーストだけ宣言する(何もしないなら宣言しない)。
+    const card = cards[cardNo];
+    return reaction.destination !== "burst_activate"
+      || (card?.burst_effects || []).some((row) => burstEffectIsUseful(card, row));
+  }
+
   function applyOpenReactions(state, cards, targets, pool, sourceCardNo) {
     const matched = (cardNo) => (cards[cardNo]?.open_reactions || []).find((row) =>
-      openReactionMatches(row, sourceCardNo, cards));
+      openReactionMatches(row, sourceCardNo, cards)
+      && openReactionSceneMet(state, cards, row, cardNo, sourceCardNo));
     // ミラージュへのセットは1回の公開で1枚まで(Q1457)。方針は公開プールの上(末尾)から最初に
     // 宣言できる1枚を選ぶ。選ばれなかった札は宣言もしない(D29、Python同一)。
     let miragePick = null;
@@ -3655,6 +3671,20 @@
         source_card_no: sourceCardNo, destination: reaction.destination });
       if (reaction.same_name_policy === "once_per_turn"
           && state.openReactionNames.has(card.name)) continue;
+      if (reaction.destination === "burst_activate") {
+        // 発動の宣言はオープンした時点(Q9770・Q10923)。札は公開プールから抜き、オープンした
+        // 効果の選択にも残りの移動にも入れない(Q27519)。解決はオープンした効果の後、派生する
+        // 効果としてカウント反応と同じ列で(Python `runtime.reserve`同一)。
+        record(state, cards, "open_reaction_queued", { card_no: cardNo,
+          source_card_no: sourceCardNo, destination: "burst_activate" });
+        pool.splice(pool.indexOf(cardNo), 1);
+        state.seen.add(cardNo);
+        state.burstDeclared.push(cardNo);
+        if (reaction.same_name_policy === "once_per_turn") state.openReactionNames.add(card.name);
+        state.pendingOpenBursts.push({ card_no: cardNo, reaction,
+          source_card_no: sourceCardNo ?? null, seq: state.derivedSeq++ });
+        continue;
+      }
       const cost = reaction.cost || 0;
       const total = cost + (reaction.destination === "field" ? card.maintenance || 0 : 0);
       if (reaction.destination === "field" && !summonConditionsMet(card, state, cards)) continue;
@@ -3733,7 +3763,7 @@
       amount: state.count - before, cap: cap ?? null, reason: "effect",
       source_card_no: null, source_uid: null, source_count: null, ...details });
     state.pendingCountEvents.push({ old_count: before, new_count: state.count,
-      amount: state.count - before });
+      amount: state.count - before, seq: state.derivedSeq++ });
     return true;
   }
 
@@ -5306,7 +5336,14 @@
       const pending = state.pendingDiscardSummons.shift();
       resolveDiscardSummonAfter(state, cards, targets, pending.card_no, pending.entry);
     }
-    while (state.pendingCountEvents.length) {
+    while (state.pendingCountEvents.length || state.pendingOpenBursts.length) {
+      // 公開札のバーストの発動待ちとカウント反応は、予約した順(Pythonの`runtime.reserve`の列)。
+      const countFirst = state.pendingCountEvents.length && (!state.pendingOpenBursts.length
+        || state.pendingCountEvents[0].seq < state.pendingOpenBursts[0].seq);
+      if (!countFirst) {
+        resolveDeclaredOpenBurst(state, cards, targets, state.pendingOpenBursts.shift());
+        continue;
+      }
       const payload = state.pendingCountEvents.shift();
       if (state.burst) {
         const cardNo = state.burst;
@@ -5336,6 +5373,42 @@
     }
   }
 
+  /** 公開札自身の「次のバーストをただちに発動できる」を解く(T88の3、設計4b章。Python
+   *  `resolve_declared_open_burst`同一)。オープンした効果の後、派生する効果として呼ばれる
+   *  (Q10923・Q29072)。宣言の条件を満たさなくなっていたら発動できず、残りの札を動かす時点は
+   *  過ぎているのでトラッシュへ(Q27519)。発動したらセット中のバーストと同じ解き方。 */
+  function resolveDeclaredOpenBurst(state, cards, targets, pending) {
+    const at = state.burstDeclared.indexOf(pending.card_no);
+    if (at < 0) return;
+    state.burstDeclared.splice(at, 1);
+    const cardNo = pending.card_no;
+    const reaction = pending.reaction;
+    record(state, cards, "effect_start", { card_no: cardNo,
+      effect_kind: "opened_reaction", source_card_no: pending.source_card_no });
+    const activated = !state.burstOpen
+      && (reaction.own_step !== "attack" || state.ownAttackActive)
+      && (reaction.threshold === null || reaction.threshold === undefined
+        || requirementMet(reaction, state.count));
+    if (activated) {
+      // そのバーストから派生する効果だけを解き切ってから次へ進む(Q27519)。先から待っている
+      // 発動待ち・カウント反応は退けておく(Python `runtime.flush_since(mark)`と同じ境界)。
+      const waitingBursts = state.pendingOpenBursts.splice(0);
+      const waitingCounts = state.pendingCountEvents.splice(0);
+      state.burstOpen = cardNo;
+      resolveBurstEffects(state, cards, targets, cardNo);
+      flushCountReactions(state, cards, targets);
+      state.pendingOpenBursts.unshift(...waitingBursts);
+      state.pendingCountEvents.unshift(...waitingCounts);
+    } else {
+      state.trashCards.push(cardNo);
+      record(state, cards, "card_moved", { card_no: cardNo, destination: "trash",
+        reason: "open_burst_unavailable" });
+    }
+    record(state, cards, "effect_complete", { card_no: cardNo,
+      effect_kind: "opened_reaction", source_card_no: pending.source_card_no,
+      resolved: activated });
+  }
+
   /** 元効果から派生したカウント反応とプレイ成立時効果を、元効果の外で解く。
    *
    * PythonのEffectRuntimeでは、先に予約されたcount_increasedを処理すると、
@@ -5344,7 +5417,7 @@
    * プレイ成立時効果を順に解決」を繰り返し、親効果の途中へ割り込ませない。 */
   function flushDerivedPlayReactions(state, cards, targets) {
     while (state.pendingCountEvents.length || state.pendingDiscardSummons.length
-           || state.deferredPlayCompletions.length) {
+           || state.pendingOpenBursts.length || state.deferredPlayCompletions.length) {
       flushCountReactions(state, cards, targets);
       while (state.deferredPlayCompletions.length) {
         state.deferredPlayCompletions.shift()();
@@ -9701,6 +9774,10 @@
       // 発動したバーストは行き先が決まるまでバーストゾーンで**表向き**
       // (Python `burst_open` と同一)。裏向きのセットとは別枠。
       burstOpen: null,
+      // 公開札自身の「次のバーストをただちに発動できる」で宣言して待っている札(T88の3、
+      // Python `burst_declared`)と、その発動待ち。発動待ちはカウント反応と同じ列の順
+      // (Pythonの`runtime.reserve`)で解くため、両方に予約の通し番号(`derivedSeq`)を振る。
+      burstDeclared: [], pendingOpenBursts: [], derivedSeq: 0,
       mirage: null, turn: 0, traceTurn: null, pendingCountEvents: [], handReactionNames: new Set(),
       // 「破棄されたとき」の発揮待ち(`discard_summons`)。Python `runtime.reserve`。
       pendingDiscardSummons: [],
