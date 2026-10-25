@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v159-v1";
-  const STAGE_VERSION = "v159";
+  const ENGINE_SLICE = "stage4-v160-v1";
+  const STAGE_VERSION = "v160";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v159-portable-v107";
+  const RUNTIME_VERSION = "stage4-v160-portable-v108";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1378,6 +1378,12 @@
     return levelFromThresholds(unit.cores, cards[unit.card_no]?.level_thresholds);
   }
 
+  // Only for a clause selected from the actual contract base. Python同一。
+  function inheritedContractEffect(effect) {
+    const {levels, required_level, flash_level_min, flash_level_max, ...body} = effect;
+    return body;
+  }
+
   /** そのユニットで撃てる盤面のフラッシュ効果を発揮元ごとに並べる。
    *  Python `_field_flash_sources` と同一。
    *
@@ -1393,7 +1399,8 @@
     const sources = [];
     for (const [cardNo, baseOnly] of candidates) {
       const effects = ((cards[cardNo] || {}).field_flash_effects || [])
-        .filter((effect) => !baseOnly || effect.works_as_contract_base);
+        .filter((effect) => !baseOnly || effect.works_as_contract_base)
+        .map((effect) => baseOnly ? inheritedContractEffect(effect) : effect);
       // 【神技】は技ごとの束(`technique_id`、2026-10-13、Python同一)。門は束ごとに見る。
       const groups = new Map();
       for (const effect of effects) {
@@ -6155,7 +6162,7 @@
       const matched = [];
       for (let effect of (card?.triggered_effects || [])) {
         if (sourceFlag && !effect[sourceFlag]) continue;
-        if (sourceFlag === "works_as_soul_state") {
+        if (sourceFlag === "works_as_soul_state" || sourceFlag === "works_as_contract_base") {
           effect = { ...effect };
           delete effect.levels; delete effect.required_level;
         }
@@ -8093,9 +8100,12 @@
       // この体の戦闘方針を決めるときに見るカード。Python `_combat_unit_row` の
       // `policy_card_nos` と同一。`combatResolveTrigger`はホストの節と合体中の
       // ブレイヴの節を両方撃つのに、方針はホストの`card_no`しか見ていなかった。
-      // ⚠️ 煌臨元は入れない(`works_as_contract_base`を持つ節しか撃たれないため)。
+      // 煌臨元は別の一覧で渡し、その見出しを持つ節だけを方針が読む。
       policy_card_nos: [unit.card_no].concat(
         combinedBraves(state, unit.uid).map((brave) => brave.card_no)),
+      ...((unit.kourin_stack || []).length
+        ? {policy_contract_base_nos: [...unit.kourin_stack]} : {}),
+      level: levelFor(unit, cards),
       exhausted: Boolean(unit.exhausted),
       ...activeResistances(state, cards, unit),
       ...(restriction && state.battleActive && state.attackingUid===unit.uid
@@ -8828,7 +8838,7 @@
       for (const baseNo of unit.kourin_stack || []) {
         for (const effect of cards[baseNo]?.enablers || []) {
           if (effect.works_as_contract_base && wanted(effect, unit.uid)) {
-            sources.push([unit.uid, effect, baseNo, true]);
+            sources.push([unit.uid, inheritedContractEffect(effect), baseNo, true]);
           }
         }
       }
@@ -10078,7 +10088,7 @@
           ((cards[cardNo] || {})[key] || [])
             .filter((effect) => (window !== "destroy" || effect.mode === "on_destroy") && inWindow(effect)
               && (!contractBaseOnly || effect.works_as_contract_base))
-            .map((effect) => [effect, source, cardNo]);
+            .map((effect) => [contractBaseOnly ? inheritedContractEffect(effect) : effect, source, cardNo]);
         // [節, 合体限定判定に使う発揮元]の組。解決は**常にホスト**で行う
         // (合体中のブレイヴはコアを持たないので、置かれるコアはホストへ乗る)。
         const rows = windowRows(unit.card_no, unit);
@@ -10943,7 +10953,7 @@
   // 見積もり3箇所(attackReason/attackOrder/stepDamageThrough)へ配る。相手にも
   // 同じ先読みを与える。相手の伏せたバーストは開かない(Python同一)。
   // v12: 自分のバーストを開くかを、開かない盤面と比べる(2026-10-11、Python同一)。
-  const COMBAT_POLICY = "combat-victory-plan-v12";
+  const COMBAT_POLICY = "combat-victory-plan-v13";
   const PLAYER_IDS = ["self", "opponent"];
   const CAPABILITIES = Object.freeze({
     dual_deck_execution: true,
@@ -11314,29 +11324,48 @@
       .map((cardNo) => byNo[cardNo]).sort((a, b) => b - a);
   }
 
+  function gainProfile(clauses, level = null, contractBase = false) {
+    const reasons = {attack: new Set(), block: new Set()};
+    for (const clause of clauses) {
+      if (contractBase) {
+        if (!clause.works_as_contract_base) continue;
+      } else if (clause.contract_base_only) continue;
+      else if (level !== null) {
+        if (clause.levels?.length && !clause.levels.includes(level)) continue;
+        if (clause.required_level != null && level < clause.required_level) continue;
+      }
+      reasons[clause.window].add(clause.reason);
+    }
+    return {attack_gain: reasons.attack.size > 0, block_gain: reasons.block.size > 0,
+      attack_reasons: [...reasons.attack].sort(), block_reasons: [...reasons.block].sort()};
+  }
+
   function buildCombatProfiles(catalogCards, cardNos = null) {
     const wanted = cardNos ? new Set(cardNos) : null;
     const profiles = {};
     for (const card of catalogCards) {
       if (wanted && !wanted.has(card.card_no)) continue;
-      const reasons = { attack: [], block: [] };
-      if ((card.stage4?.block_effects || []).some(e => e.kind === "attack_step_end"))
-        reasons.block.push("アタックステップ終了");
+      const clauses = [];
+      const gates = (row, keys) => Object.fromEntries(keys.filter(key => key in row)
+        .map(key => [key, row[key]]));
+      for (const effect of card.stage4?.block_effects || []) {
+        if (effect.kind === "attack_step_end") clauses.push({window: "block",
+          reason: "アタックステップ終了", ...gates(effect,
+            ["levels", "required_level", "works_as_contract_base"])});
+      }
       for (const action of card.effect_actions || []) {
         const trigger = combatTrigger(action);
         if (!trigger) continue;
+        let reason;
         if (SELF_GAIN_ACTIONS.has(action.action) && SELF_SIDES.has(action.target_side)) {
-          reasons[trigger].push(`${action.action}(自分)`);
+          reason = `${action.action}(自分)`;
         } else if (OPPONENT_LOSS_ACTIONS.has(action.action) && action.target_side === "相手") {
-          reasons[trigger].push(`${action.action}(相手)`);
-        }
+          reason = `${action.action}(相手)`;
+        } else continue;
+        clauses.push({window: trigger, reason, ...gates(action,
+          ["levels", "required_level", "works_as_contract_base", "contract_base_only"])});
       }
-      profiles[card.card_no] = {
-        attack_gain: reasons.attack.length > 0,
-        block_gain: reasons.block.length > 0,
-        attack_reasons: [...new Set(reasons.attack)].sort(),
-        block_reasons: [...new Set(reasons.block)].sort(),
-      };
+      profiles[card.card_no] = {...gainProfile(clauses), gain_clauses: clauses};
     }
     return profiles;
   }
@@ -11351,19 +11380,23 @@
    *  同じ窓で撃つのに、方針だけがホストの`card_no`で引いていた。見る先は行が
    *  持つ`policy_card_nos`(ホスト＋合体中のブレイヴ)で、カード固有の分岐では
    *  ない——「この体としてどの節が撃たれるか」で引くので同型の新カードにも効く。
-   *  ⚠️ 煌臨元は入れない(`works_as_contract_base`の節しか撃たれないため)。
+   *  現在Lvで絞る。煌臨元は`policy_contract_base_nos`で別に受け取り、
+   *  契約煌臨元の節だけをLvに関係なく引き継ぐ。
    *  ⚠️ `policy_card_nos`が無い行は`card_no`だけを見る従来どおりの退化形。 */
   function rowProfile(profiles, row) {
     if (row.effects_suppressed) return EMPTY_PROFILE;
     const cardNos = (row.policy_card_nos && row.policy_card_nos.length)
       ? row.policy_card_nos : [row.card_no];
-    if (cardNos.length === 1) return profileOf(profiles, cardNos[0]);
     const attackReasons = new Set();
     const blockReasons = new Set();
     let attackGain = false;
     let blockGain = false;
-    for (const cardNo of cardNos) {
-      const profile = profileOf(profiles, cardNo);
+    const sources = cardNos.map(no => [no, false]).concat(
+      (row.policy_contract_base_nos || []).map(no => [no, true]));
+    for (const [cardNo, baseOnly] of sources) {
+      let profile = profileOf(profiles, cardNo);
+      if ("gain_clauses" in profile) profile = gainProfile(profile.gain_clauses, row.level ?? null, baseOnly);
+      else if (baseOnly) continue;
       attackGain = attackGain || profile.attack_gain;
       blockGain = blockGain || profile.block_gain;
       for (const reason of profile.attack_reasons || []) attackReasons.add(reason);
