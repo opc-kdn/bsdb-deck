@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v173-v1";
-  const STAGE_VERSION = "v173";
+  const ENGINE_SLICE = "stage4-v175-v1";
+  const STAGE_VERSION = "v175";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v173-portable-v121";
+  const RUNTIME_VERSION = "stage4-v175-portable-v123";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -2780,25 +2780,32 @@
   function playCountSoulPlacement(state,cards,targets,uid,opponent=null) {
     const choice=countSoulPlacementChoices(state,cards).find(row=>row.uid===uid);
     if(!choice)return null;
-    const effect=choice.effect,origin=state.reserveHasSoul?'reserve':'trash';
+    const effect=choice.effect;
     const previous=state.combatOpponent;state.combatOpponent=opponent || previous || MAIN_STEP_OPPONENTS.get(state);
     beginEffectFrame(state);
     try {
       record(state,cards,'effect_start',{card_no:effect.source_card_no,uid,effect_kind:'count_soul_placement',window:'main'});
-      if(state.reserveHasSoul){state.reserve--;state.reserveHasSoul=false;}
-      else{state.spent--;state.trashHasSoul=false;}
-      state.countHasSoul=true;
-      const candidates=state.hand.filter(n=>cards[n]?.hand_soul_count_reactions?.length);
-      if(candidates.length)state.pendingEffectReactions.push({hand_soul_count:true,card_nos:candidates,seq:state.derivedSeq++});
-      applyCountGain(state,cards,1,null,{reason:'count_soul_placement',source_card_no:effect.source_card_no,source_uid:uid});
-      recordCoreMove(state,cards,{amount:1,source:origin,destination:'count',reason:'count_soul_placement',source_card_no:effect.source_card_no,source_uid:uid});
-      if(voidCoreGainAllowed(state,cards) && effect.trash_gain){
-        state.spent+=effect.trash_gain;
-        recordCoreMove(state,cards,{amount:effect.trash_gain,source:'void',destination:'trash',reason:'count_soul_followup',source_card_no:effect.source_card_no,source_uid:uid});
-      }
+      placeCountSoul(state,cards,effect,uid);
       record(state,cards,'effect_complete',{card_no:effect.source_card_no,uid,effect_kind:'count_soul_placement',window:'main',resolved:true});
     } finally {endEffectFrame(state);flushDerivedPlayReactions(state,cards,targets);state.combatOpponent=previous;}
     return {card_no:effect.source_card_no,uid};
+  }
+
+  function placeCountSoul(state,cards,effect,uid) {
+    if(state.countHasSoul || !(state.reserveHasSoul || state.trashHasSoul))return false;
+    const origin=state.reserveHasSoul?'reserve':'trash';
+    if(state.reserveHasSoul){state.reserve--;state.reserveHasSoul=false;}
+    else{state.spent--;state.trashHasSoul=false;}
+    state.countHasSoul=true;
+    const candidates=state.hand.filter(n=>cards[n]?.hand_soul_count_reactions?.length);
+    if(candidates.length)state.pendingEffectReactions.push({hand_soul_count:true,card_nos:candidates,seq:state.derivedSeq++});
+    applyCountGain(state,cards,1,null,{reason:'count_soul_placement',source_card_no:effect.source_card_no,source_uid:uid});
+    recordCoreMove(state,cards,{amount:1,source:origin,destination:'count',reason:'count_soul_placement',source_card_no:effect.source_card_no,source_uid:uid});
+    if(voidCoreGainAllowed(state,cards) && effect.trash_gain){
+      state.spent+=effect.trash_gain;
+      recordCoreMove(state,cards,{amount:effect.trash_gain,source:'void',destination:'trash',reason:'count_soul_followup',source_card_no:effect.source_card_no,source_uid:uid});
+    }
+    return true;
   }
 
   function awakeningSource(state,cards,uid,opponent) {
@@ -3352,7 +3359,8 @@
           pay: 0, total: card.maintenance || 0, maintenance: card.maintenance || 0 });
         return;
       }
-      const creator = (may("manifestation") ? manifestationCreators(card, state, cards) : [])
+      const creator = (may("manifestation") && ["main", "self_turn"].includes(card.manifestation_timing)
+        ? manifestationCreators(card, state, cards) : [])
         .find((unit) =>
           manifestationPossible(state, cards, unit, card.maintenance || 0, allowSacrifice));
       if (!creator && !summonConditionsMet(card, state, cards)) return;
@@ -4497,6 +4505,8 @@
       // ここで0枚を「不発」にすると、Pythonが解決済みと書く節をWorkerだけ
       // 不発と書く(seed 20260817の戦闘モードで発覚)。
       draw(state, cards, amount, "effect");
+      if(effect.count_soul_followup)placeCountSoul(state,cards,
+        {...effect.count_soul_followup,source_card_no:effect.source_card_no},sourceUid);
       return true;
     }
     if (effect.kind === "self_remain") {
