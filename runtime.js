@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v201-v1";
-  const STAGE_VERSION = "v201";
+  const ENGINE_SLICE = "stage4-v203-v1";
+  const STAGE_VERSION = "v203";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v201-portable-v148";
+  const RUNTIME_VERSION = "stage4-v203-portable-v150";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -6391,8 +6391,20 @@
       mode: "soul_paid_free_summon" });
   }
 
+  function firedEffectTiming(timing, entryTrigger = null, entryEvent = "summon") {
+    if (timing !== "on_play") return ({attack:"on_attack",block:"on_block"})[timing] || timing;
+    if (entryTrigger === "manifestation") return "manifestation";
+    return ({manifestation:"summon",super_manifestation:"summon",normal:"summon",
+      effect_summon:"summon",place:"placement",kourin_from_soul:"kourin"})[entryEvent] || entryEvent;
+  }
+
+  function effectTimingMatches(firedTiming, printedTimings) {
+    return ["summon","manifestation","kourin","placement","transform","magic_use",
+      "on_attack","on_block","on_destroy"].includes(firedTiming) && printedTimings.includes(firedTiming);
+  }
+
   function groupEffectInstances(cardNo, uid, timing, triggerEventId, effects,
-                                orderOffset = 0) {
+                                orderOffset = 0, entryEvent = "summon") {
     const grouped = new Map();
     for (const [index, effect] of effects.entries()) {
       const blockId = effect.effect_block_id
@@ -6407,6 +6419,7 @@
       source_uid: uid ?? null,
       controller: "self",
       timing,
+      fired_timing: firedEffectTiming(timing, clauses[0].entry_trigger, entryEvent),
       trigger_event_id: triggerEventId,
       clauses,
       effect_tag: clauses.find((clause) => clause.effect_tag)?.effect_tag || null,
@@ -6433,6 +6446,7 @@
       kinds: instance.clauses.map((clause) => clause.kind),
       optional: instance.optional,
       priority_depth: instance.priority_depth,
+      fired_timing: instance.fired_timing ?? null,
     };
   }
 
@@ -7095,8 +7109,13 @@
     const entryMatches = (effect) => effect.entry_trigger === "manifestation"
       ? playedAsManifestation : !effect.entry_trigger
         || (effect.entry_trigger === "kourin") === (watchEventKind === "kourin");
-    const ownOpponentEffects = suppressOwnSummonEffects
-      ? [] : (card.on_play_opponent_effects || []).filter(entryMatches)
+    const entryEvent = watchEventKind || ((card.card_type || "").includes("ネクサス")
+      ? "placement" : (card.card_type || "").includes("マジック") ? "on_play" : "summon");
+    const firedTiming = effect => firedEffectTiming("on_play", effect.entry_trigger, entryEvent);
+    const ownEffectAllowed = effect => !suppressOwnSummonEffects
+      || !effectTimingMatches(firedTiming(effect), ["summon"]);
+    const ownOpponentEffects = (card.on_play_opponent_effects || []).filter(effect =>
+        entryMatches(effect) && ownEffectAllowed(effect))
         .map(effect => ({...effect,source_card_no:effect.source_card_no || card.card_no}));
     // 「Aするか、Bする」(2026-10-13): 解いてみて良い方の枝だけ(Python同一)。
     const chosenAlternatives = new Set();
@@ -7113,25 +7132,25 @@
       }
     };
     const gameClaims = new Set();
-    for (const effect of ownOpponentEffects) {
-      if (!usableOpponentEffect(effect)) continue;
+    const resolveOpponentEffect = (effect) => {
+      if (!usableOpponentEffect(effect)) return false;
       if (effect.block_game_limit === "once_per_game_name") {
         const key = `${card.name}\u0000${effect.game_limit_key}`;
         if (!gameClaims.has(key)) {
-          if (state.blockGameUsed.has(key) || !opponent || !effectActive(effect, state, cards, uid)) continue;
+          if (state.blockGameUsed.has(key) || !opponent || !effectActive(effect, state, cards, uid)) return false;
           state.blockGameUsed.add(key);
           gameClaims.add(key);
         }
       }
       const group = effect.exclusive_group ?? null;
-      if (group !== null && chosenAlternatives.has(group)) continue;
+      if (group !== null && chosenAlternatives.has(group)) return false;
       if (group !== null && skipUnchosen(state, effect, decidedAlternatives, group,
         () => ownOpponentEffects.filter((row) => row.exclusive_group === group
           && usableOpponentEffect(row)),
-        resolveAgainst, opponent)) continue;
+        resolveAgainst, opponent)) return false;
       const beforeUids = new Set(opponent ? opponent.field().map((row) => row.uid) : []);
       record(state, cards, "effect_start", { card_no: card.card_no, uid,
-        effect_kind: effect.kind, target_side: "opponent" });
+        effect_kind: effect.kind, fired_timing: firedTiming(effect), target_side: "opponent" });
       const previous = state.combatOpponent || null;
       state.combatOpponent = opponent;
       let resolved = false;
@@ -7145,9 +7164,13 @@
       const drawAmount = vanished ? (effect.draw_if_vanished || 0) : 0;
       if (drawAmount) draw(state, cards, drawAmount, "opponent_unit_vanished");
       record(state, cards, "effect_complete", { card_no: card.card_no, uid,
-        effect_kind: effect.kind, target_side: "opponent", resolved,
+        effect_kind: effect.kind, fired_timing: firedTiming(effect), target_side: "opponent", resolved,
         unit_vanished: vanished, followup_draw: drawAmount });
       if (effect.exclusive_group && resolved) chosenAlternatives.add(effect.exclusive_group);
+      return resolved;
+    };
+    for (const effect of ownOpponentEffects) {
+      if (effect.entry_trigger !== "manifestation") resolveOpponentEffect(effect);
     }
     // 召喚時のアルティメットトリガーのヒット/ガードを配る(Python同一)。
     if (state.uTriggerEvents.length) dispatchUTriggerEvents(state, cards, targets, opponent);
@@ -7162,11 +7185,20 @@
         effect_kind: special.kind, resolved });
       replacedEffectKind = special.replaces_effect_kind || null;
     }
-    const active = (card.enablers || []).filter((effect) => !suppressOwnSummonEffects
+    const active = (card.enablers || []).filter((effect) => ownEffectAllowed(effect)
       && effect.mode === "on_play"
       && entryMatches(effect)
       && effect.kind !== replacedEffectKind
       && !(braveMode === "spirit" && effect.combine_only));
+    const groupedOpponentEffects = new Set();
+    for (const effect of ownOpponentEffects) {
+      if (effect.entry_trigger === "manifestation" && usableOpponentEffect(effect)) {
+        active.push(effect);
+        groupedOpponentEffects.add(effect);
+      }
+    }
+    active.sort((a,b) => (a.entry_trigger === "manifestation" ? a.clause_order || 0 : 0)
+      - (b.entry_trigger === "manifestation" ? b.clause_order || 0 : 0));
     const triggerEventId = `turn${state.turn}:play:${card.card_no}#${uid}:`
       + `${state.effectWindowSeq + 1}`;
     const watcherInstances = [];
@@ -7201,7 +7233,7 @@
       }
     }
     const instances = [...watcherInstances, ...groupEffectInstances(
-      card.card_no, uid, "on_play", triggerEventId, active, watcherInstances.length)];
+      card.card_no, uid, "on_play", triggerEventId, active, watcherInstances.length, entryEvent)];
     const resolveInstance = (instance) => {
       state.derivedEffectBuffer = [];
       if (instance.runtime_kind === "oracle_watch") {
@@ -7220,6 +7252,13 @@
           resolved: placed > 0 });
         return [];
       }
+      const resolveClause = effect => {
+        if (groupedOpponentEffects.has(effect)) return resolveOpponentEffect(effect);
+        const previous = state.combatOpponent || null;
+        state.combatOpponent = opponent;
+        try { return resolveEffect(state, cards, targets, effect, uid); }
+        finally { state.combatOpponent = previous; }
+      };
       let predecessor = { resolved: true, changed: true, kind: null };
       let gatesNext = false;
       const processedSimultaneous = new Set();
@@ -7243,14 +7282,14 @@
           const members = instance.clauses.filter((candidate) =>
             candidate.simultaneous_group === effect.simultaneous_group);
           record(state, cards, "effect_start", { card_no: card.card_no, uid,
-            effect_kind: "simultaneous", effect_kinds: members.map((row) => row.kind),
+            effect_kind: "simultaneous", fired_timing: instance.fired_timing, effect_kinds: members.map((row) => row.kind),
             simultaneous_group: effect.simultaneous_group });
           const traceMark = state.events.length;
           const results = members.map((member) =>
             effectActive(member, state, cards, uid)
-              ? resolveEffect(state, cards, targets, member, uid) : false);
+              ? resolveClause(member) : false);
           record(state, cards, "effect_complete", { card_no: card.card_no, uid,
-            effect_kind: "simultaneous", effect_kinds: members.map((row) => row.kind),
+            effect_kind: "simultaneous", fired_timing: instance.fired_timing, effect_kinds: members.map((row) => row.kind),
             simultaneous_group: effect.simultaneous_group,
             resolved: results.every(Boolean) });
           if (state.trace) {
@@ -7280,12 +7319,12 @@
         }
         // `effect_id`は載せない——Python `_record("effect_start", ...)`が持たない
         // フィールドで、載せると**詳細モードだけ**が最初のon_playで割れる(実測)。
-        record(state, cards, "effect_start", { card_no: card.card_no, uid,
-          effect_kind: effect.kind, effect_tag: effect.effect_tag || null });
-        const changed = resolveEffect(state, cards, targets, effect, uid);
+        if (!groupedOpponentEffects.has(effect)) record(state, cards, "effect_start", { card_no: card.card_no, uid,
+          effect_kind: effect.kind, fired_timing: instance.fired_timing, effect_tag: effect.effect_tag || null });
+        const changed = resolveClause(effect);
         const resolved = effect.kind === "exchange" ? true : changed;
-        record(state, cards, "effect_complete", { card_no: card.card_no, uid,
-          effect_kind: effect.kind, effect_tag: effect.effect_tag || null, resolved });
+        if (!groupedOpponentEffects.has(effect)) record(state, cards, "effect_complete", { card_no: card.card_no, uid,
+          effect_kind: effect.kind, fired_timing: instance.fired_timing, effect_tag: effect.effect_tag || null, resolved });
         if (effect.exclusive_group && resolved) chosenAlternatives.add(effect.exclusive_group);
         predecessor = { resolved, changed, kind: effect.kind };
         gatesNext = Boolean(effect.gates_next_effect);
@@ -10937,6 +10976,7 @@
               source_uid: group.source.uid,
               controller: "self",
               timing: window,
+              fired_timing: firedEffectTiming(window),
               trigger_event_id: triggerEventId,
               clauses: group.clauses,
               effect_tag: group.clauses.find((effect) => effect.effect_tag)?.effect_tag || null,
@@ -10965,10 +11005,10 @@
                 (row) => resolveEffect(state, cards, targets, row, uid),
                 state.combatOpponent || null)) continue;
               record(state, cards, "effect_start", { card_no: instance.source_card_no, uid,
-                effect_kind: effect.kind, effect_tag: effect.effect_tag || null, window });
+                effect_kind: effect.kind, fired_timing: instance.fired_timing, effect_tag: effect.effect_tag || null, window });
               const ok = resolveEffect(state, cards, targets, effect, uid);
               record(state, cards, "effect_complete", { card_no: instance.source_card_no, uid,
-                effect_kind: effect.kind, effect_tag: effect.effect_tag || null,
+                effect_kind: effect.kind, fired_timing: instance.fired_timing, effect_tag: effect.effect_tag || null,
                 window, resolved: ok });
               resolved.push({ kind: effect.kind, effect_id: effect.effect_id ?? null,
                 resolved: Boolean(ok) });
@@ -11706,6 +11746,7 @@
     // 公開札の反応の発生源(テストがPythonと突き合わせる、T88の3)。
     openReactionMatches,
     winningBlockValue, selectBounceTargets,
+    firedEffectTiming, effectTimingMatches,
     // 「BP合計Nまで好きなだけ」の組(テストがPythonと突き合わせる、2026-10-11)。
     selectTotalCappedTargets,
     opponentChoiceOrder,
