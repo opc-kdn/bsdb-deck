@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v215-v1";
-  const STAGE_VERSION = "v215";
+  const ENGINE_SLICE = "stage4-v216-v1";
+  const STAGE_VERSION = "v216";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v215-portable-v161";
+  const RUNTIME_VERSION = "stage4-v216-portable-v162";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3436,6 +3436,88 @@
 
   /** 合体先になれるユニット(uid昇順)。Python `brave_combine_host_uids`と同一で、
    *  **待機中は除く**。合体先は1体に決まるので、可否だけでなく相手も返す。 */
+  function capacityFilterMatches(card, filter) {
+    if (filter.has_kourin && !card.has_kourin) return false;
+    if (filter.keyword_any && !filter.keyword_any.some(key => (card.keywords || []).includes(key))) return false;
+    const { has_kourin, keyword_any, ...predicate } = filter;
+    return cardMatchesSlot(card, { alternatives: [predicate] });
+  }
+
+  function combineCapacityAssignment(hostUid, state, cards, incoming = null,
+                                     beforeField = state.summonGroup?.combine_before ?? state.field) {
+    const hostUnit = state.field.find(unit => unit.uid === hostUid);
+    if (!hostUnit || hostUnit.waiting || !beforeField.some(unit => unit.uid === hostUid && !unit.waiting)) return null;
+    const host = unitInfo(state, cards, hostUnit);
+    const braves = combinedBraves(state, hostUid).map(unit => [unit.uid, cards[unit.card_no], unit]);
+    if (incoming) braves.push([null, incoming, {}]);
+    if (braves.length > 1 && braves.some(([,card]) => (card.lineages || []).includes('異魔神'))) return null;
+    const permissions = [{ max: 1, brave_filter: {} }], extras = [];
+    for (const source of [...beforeField].sort((a,b) => a.uid-b.uid)) {
+      const live = state.field.find(unit => unit.uid === source.uid);
+      if (source.waiting || !live || live.waiting || effectsSuppressed(state, live)) continue;
+      const sourceCard = unitInfo(state, cards, live);
+      for (const grant of sourceCard.combine_capacity_grants || []) {
+        if (!['self','ally','attached_host'].includes(grant.scope)) continue;
+        if (grant.levels && !grant.levels.includes(levelFor(live, cards, state))) continue;
+        if (grant.scope === 'self' && source.uid !== hostUid) continue;
+        if (grant.scope === 'ally' && (live.brave_mode === 'combine'
+            || !host.card_type.includes('スピリット') || !capacityFilterMatches(host, grant.ally_filter))) continue;
+        if (grant.scope === 'attached_host' && (source.brave_mode !== 'combine'
+            || source.combined_host_uid !== hostUid || live.combined_host_uid !== hostUid)) continue;
+        (grant.uncounted ? extras : permissions).push(grant);
+      }
+    }
+    function fits(indices, permission) {
+      const buckets = permission.buckets || [permission], remaining = buckets.map(row => row.max);
+      function assign(position) {
+        if (position === indices.length) return true;
+        const card = braves[indices[position]][1];
+        for (let i=0; i<buckets.length; i++) {
+          if (remaining[i] && capacityFilterMatches(card, buckets[i].brave_filter)) {
+            remaining[i]--;
+            if (assign(position+1)) return true;
+            remaining[i]++;
+          }
+        }
+        return false;
+      }
+      return assign(0);
+    }
+    function* subsets(size, start = 0, chosen = []) {
+      if (!size) { yield chosen; return; }
+      for (let i=start; i<=braves.length-size; i++) yield* subsets(size-1, i+1, [...chosen, i]);
+    }
+    const alwaysUncounted = new Set(braves.flatMap(([,card,unit], index) => {
+      const rule = card.uncounted_combine;
+      return !unit.effects_suppressed_this_turn && rule && !rule.once_per_name && rule.requires_host
+        && host.card_type.includes('スピリット') && capacityFilterMatches(host, rule.requires_host) ? [index] : [];
+    }));
+    for (let size=0; size<=braves.length; size++) for (const counted of subsets(size)) {
+      if (counted.some(index => alwaysUncounted.has(index))) continue;
+      if (!permissions.some(permission => fits(counted, permission))) continue;
+      const names = new Set(), excluded = new Set(braves.map((_,i) => i).filter(i => !counted.includes(i)));
+      let valid = true;
+      for (const index of excluded) {
+        const [,card,unit] = braves[index], rules = [...extras];
+        // C1/C3 are the Brave's own abilities, independent of host suppression.
+        if (!unit.effects_suppressed_this_turn && card.uncounted_combine) rules.push(card.uncounted_combine);
+        const rule = rules.find(rule => (!rule.once_per_name || !names.has(normalizeCardName(card.name)))
+          && (!rule.brave_filter || capacityFilterMatches(card, rule.brave_filter))
+          && (!rule.requires_host || (host.card_type.includes('スピリット') && capacityFilterMatches(host, rule.requires_host)))
+          && (!rule.requires_attached_brave || (host.card_type.includes('スピリット') && counted.some(other => {
+            const [otherUid, otherCard] = braves[other];
+            return beforeField.some(unit => unit.uid === otherUid && !unit.waiting && unit.brave_mode === 'combine'
+              && unit.combined_host_uid === hostUid)
+              && capacityFilterMatches(otherCard, rule.requires_attached_brave);
+          }))));
+        if (!rule) { valid = false; break; }
+        if (rule.once_per_name) names.add(normalizeCardName(card.name));
+      }
+      if (valid) return excluded;
+    }
+    return null;
+  }
+
   function braveCombineHosts(card, state, cards) {
     if (!card.is_brave) return [];
     const conditions = card.combine_conditions || [];
@@ -3448,7 +3530,8 @@
       if (nexus) {
         if (!(candidate.lineages || []).includes('創界神') || !eligible.length
           || combinedBraves(state,unit.uid).length >= (candidate.combine_slots || 1)) return false;
-      } else if (!["スピリット", "アルティメット"].some(type => (candidate.card_type || '').includes(type))) return false;
+      } else if (!["スピリット", "アルティメット"].some(type => (candidate.card_type || '').includes(type))
+          || combineCapacityAssignment(unit.uid, state, cards, card) === null) return false;
       // 「このスピリットは、アタックと合体ができず」(X015)。Python同一。
       if ((candidate.combine_forbidden_levels || []).includes(levelFor(unit, cards, state))) {
         return false;
@@ -3457,8 +3540,13 @@
       return eligible.some((condition) => {
         // An unresolved ID or unclosed compound condition is not a named lineage.
         if (condition.required_lineage_id != null) return false;
+        const before = state.summonGroup?.combine_before;
+        const basis = before ? { ...state, field: before } : state;
+        const previousHost = before?.find(row => row.uid === unit.uid) || unit;
+        const hostCost = nexus ? candidate.cost : unitInfo(basis, cards, previousHost).cost
+          + combinedBraves(basis, unit.uid).reduce((sum, brave) => sum + (cards[brave.card_no].cost || 0), 0);
         if (condition.min_cost !== null && condition.min_cost !== undefined
-            && candidate.cost < condition.min_cost) return false;
+            && hostCost < condition.min_cost) return false;
         if (condition.required_color && !(candidate.colors || []).includes(condition.required_color)) return false;
         if (condition.required_card_name && !normalizeCardName(candidate.name || '').includes(normalizeCardName(condition.required_card_name))) return false;
         if (condition.required_keywords?.length
@@ -3487,6 +3575,36 @@
       ? "spirit" : hosts.length ? "combine" : "spirit";
   }
 
+  function combinePayment(state, cards, card, pay, allowSacrifice) {
+    const hosts = braveCombineHosts(card, state, cards);
+    if (pay <= state.reserve && (!pay || !reserveCostBanned(state))) {
+      return hosts.length ? { host: hosts[0], floors: {} } : null;
+    }
+    for (const host of hosts) {
+      const projected = { ...state, field: state.field.map(unit => ({ ...unit })) }, floors = {};
+      for (const unit of projected.field) {
+        if (unit.creator_core || unit.waiting) continue;
+        const minimum = allowSacrifice && !sacrificeProtected(unit, cards) ? 0 : unitFloor(state, cards, unit);
+        let kept = unit.cores;
+        for (let cores=unit.cores-1; cores>=minimum; cores--) {
+          unit.cores = cores;
+          unit.waiting = cores < unitFloor(projected, cards, unit);
+          if (!braveCombineHosts(card, projected, cards).some(row => row.uid === host.uid)) break;
+          kept = cores;
+        }
+        unit.cores = kept;
+        unit.waiting = kept < unitFloor(projected, cards, unit);
+        floors[unit.uid] = kept;
+      }
+      const available = state.field.reduce((sum,unit) => sum
+        + (floors[unit.uid] === undefined ? 0 : unit.cores-floors[unit.uid]), 0);
+      if (pay <= state.reserve+available && (!pay || !reserveCostBanned(state) || pay <= available)) {
+        return { host, floors };
+      }
+    }
+    return null;
+  }
+
   // **契約カードは自壊させない**(2026-08-21 ユーザー裁定、Python同一)。契約カードは
   // デッキの中核システムで、支払いのために自分で失う不利は普通のスピリットを整理する
   // 場合と比べ物にならない——相手の除去に対して魂状態が用意されているのも、そこを
@@ -3513,11 +3631,11 @@
     return total <= reserve + field && (!pay || !reserveCostBanned(state, reserve) || pay <= field);
   }
 
-  function fundCost(state, cards, targets, pay, total, allowSacrifice) {
+  function fundCost(state, cards, targets, pay, total, allowSacrifice, combineFloors = null) {
     const banned = Boolean(pay && reserveCostBanned(state));
     const origin = banned ? [state.reserve, state.reserveHasSoul] : null;
     const deficit = Math.max(total-state.reserve, banned ? pay : 0);
-    const funded = deficit <= 0 || fundPayment(state, cards, targets, deficit, allowSacrifice);
+    const funded = deficit <= 0 || fundPayment(state, cards, targets, deficit, allowSacrifice, combineFloors);
     state.costPaymentOrigin = origin;
     return funded;
   }
@@ -3586,7 +3704,7 @@
           manifestationPossible(state, cards, unit, entryMaintenance(state, cards, card), allowSacrifice));
       if (!creator && !summonConditionsMet(card, state, cards)) return;
       if (!creator && !may("use")) return;
-      const mode = braveMode(card, state, cards);
+      let mode = braveMode(card, state, cards);
       const cost = creator
         ? { pay: 0, total: entryMaintenance(state, cards, card), maintenance: entryMaintenance(state, cards, card) }
         : paymentForState(state, cards, card);
@@ -3597,6 +3715,9 @@
         cost.total = cost.pay;
       }
       if (mode === "combine") cost.total = cost.pay;
+      if (mode === 'combine' && !combinePayment(state, cards, card, cost.pay, allowSacrifice)) {
+        mode = 'spirit'; cost.total = cost.pay + entryMaintenance(state, cards, card);
+      }
       // 自壊なしで払えるならそこで通す。自壊が要るときだけ、トークン破壊で先に
       // 減る原資(bugDiscountFundingPenalty)を足して判定する。Python側と同じ順序。
       if (!costAffordable(state, cards, cost.pay, cost.total, false)) {
@@ -3717,6 +3838,15 @@
   // 棋譜のターン番号は、相手のターンの間だけ直前の自分のターンに固定する
   // (`state.traceTurn`、Python `trace_turn`と同一)。
   function record(state, cards, type, details = {}, turn = state.traceTurn ?? state.turn) {
+    if (type === 'card_entered') {
+      const unit = state.field.find(row => row.uid === details.uid);
+      const host = state.field.find(row => row.uid === unit?.combined_host_uid);
+      if (unit?.brave_mode === 'combine' && host && !cards[host.card_no].card_type.includes('ネクサス')) {
+        const assigned = combineCapacityAssignment(host.uid, state, cards);
+        details = { ...details, uncounted: Boolean(assigned?.has(
+          combinedBraves(state, host.uid).findIndex(row => row.uid === unit.uid))) };
+      }
+    }
     syncLifeCapObservers(state, cards);
     if (state.trace) state.events.push({
       seq: state.events.length + 1,
@@ -3950,8 +4080,9 @@
       { reason: "face_up_top_cycle", source_uid: sourceUid });
     let pendingSummon = null;
     if (canReplace) {
-      const brave = braveMode(revealedCard, state, cards);
+      let brave = braveMode(revealedCard, state, cards);
       const pay = effect.summon_cost || 0;
+      if (brave === 'combine' && !combinePayment(state, cards, revealedCard, pay, true)) brave = 'spirit';
       const total = pay + (brave === "combine" ? 0 : entryMaintenance(state, cards, revealedCard));
       if (costAffordable(state, cards, pay, total, true)) {
         takeTopCard(state);
@@ -5821,7 +5952,7 @@
     return effect.kind === "oracle_watch";
   }
 
-  function fundPayment(state, cards, targets, needed, allowSacrifice) {
+  function fundPayment(state, cards, targets, needed, allowSacrifice, combineFloors = null) {
     let remaining = needed;
     // **リザーブへの反映はこの関数を出るとき**。Pythonは`_fund_deficit`が捻出量を
     // 返すだけで、加算するのは呼び出し元(`reserve += _fund_deficit(...)`)なので、
@@ -5837,10 +5968,11 @@
     };
     for (const unit of state.field) {
       if (unit.creator_core || unit.waiting) continue;
-      const free = Math.max(0, unit.cores - unitFloor(state, cards, unit));
+      const floor = Math.max(unitFloor(state, cards, unit), combineFloors?.[unit.uid] || 0);
+      const free = Math.max(0, unit.cores - floor);
       const take = Math.min(free, remaining);
       const ordinaryFree = Math.max(
-        0, unit.cores - Number(Boolean(unit.soul_core)) - unitFloor(state, cards, unit));
+        0, unit.cores - Number(Boolean(unit.soul_core)) - floor);
       if (take > ordinaryFree) {
         unit.soul_core = false;
         state.reserveHasSoul = true;
@@ -5866,7 +5998,7 @@
           > paymentForState(state, cards, cards[cardNo]).pay);
     };
     const ordered = [...state.field].filter((unit) => unit.cores > 0 && !unit.creator_core
-        && !unit.waiting && !sacrificeProtected(unit, cards))
+        && !unit.waiting && !sacrificeProtected(unit, cards) && !combineFloors?.[unit.uid])
       .sort((left, right) =>
         Number(unitPreservesHandReduction(left)) - Number(unitPreservesHandReduction(right))
         || accessTier(right.card_no, cards, targets) - accessTier(left.card_no, cards, targets)
@@ -6404,7 +6536,7 @@
   /** 効果で手元（と印字に並ぶゾーン）から召喚する(v66)。Python `resolve_zone_summon`と同一。 */
   function resolveZoneSummon(state, cards, targets, effect, sourceUid = null) {
     const previousGroup = state.summonGroup;
-    state.summonGroup = previousGroup || { fired: [] };
+    state.summonGroup = { fired: previousGroup?.fired || [], combine_before: structuredClone(state.field) };
     try {
       return resolveZoneSummonCards(state, cards, targets, effect, sourceUid);
     } finally {
@@ -6454,7 +6586,8 @@
   function effectSummonPlan(state, cards, cardNo, pay) {
     const candidate = cards[cardNo];
     if (!candidate || !summonConditionsMet(candidate, state, cards)) return null;
-    const mode = braveMode(candidate, state, cards);
+    let mode = braveMode(candidate, state, cards);
+    if (mode === 'combine' && !combinePayment(state, cards, candidate, pay, false)) mode = 'spirit';
     const total = mode === "combine" ? pay : pay + entryMaintenance(state,cards,candidate);
     // 自分の場を壊してまでは出さない(Python同一)。
     if (!costAffordable(state, cards, pay, total, false)) return null;
@@ -6523,7 +6656,7 @@
     const firedNames = new Set();
     // 割り込んで手札から出す札は、別々の効果でも破棄と同時の召喚(裁定3947)。
     // 召喚時の神託は組で1回(Python同一)。
-    const group = { fired: [] };
+    const group = { fired: [], combine_before: structuredClone(state.field) };
     const usable = (cardNo, entry) => entry
       && !(entry.limit === "no_duplicate" && firedNames.has(cards[cardNo].name));
     for (const cardNo of cardNos) {
@@ -7759,6 +7892,9 @@
       return playKourinFromSoul(state, cards, targets, candidate);
     }
     const card = unitInfo(state, cards, candidate);
+    const combinePlan = candidate.brave_mode === 'combine'
+      ? combinePayment(state, cards, card, candidate.pay, candidate.allow_sacrifice) : null;
+    if (candidate.brave_mode === 'combine' && !combinePlan) throw new Error('direct combination was selected without legal funding');
     if (candidate.total === card.token_sacrifice_summon_cost) {
       // 払えないと分かっているなら、**バグを消費する前に**断る。消費してから
       // 失敗すると、成立しなかったプレイが盤面を壊したまま戻ってしまう。
@@ -7803,7 +7939,7 @@
     if (!costAffordable(state, cards, candidate.pay, candidate.total, candidate.allow_sacrifice)) return false;
     const funding = candidate.total > state.reserve || (candidate.pay && reserveCostBanned(state));
     if (funding) beginEffectFrame(state);
-    if (!fundCost(state, cards, targets, candidate.pay, candidate.total, candidate.allow_sacrifice)) {
+    if (!fundCost(state, cards, targets, candidate.pay, candidate.total, candidate.allow_sacrifice, combinePlan?.floors)) {
       if (funding) endEffectFrame(state);
       return false;
     }
@@ -7865,7 +8001,8 @@
     const staysOnField = !isMagic || Boolean(card.stays_on_field);
     // 合体先は**場に出す前**に決める(出してから探すと自分自身が候補に混じる)。
     const combinedHost = candidate.brave_mode === "combine"
-      ? braveCombineHosts(card, state, cards)[0] : null;
+      ? braveCombineHosts(card, state, cards).find(unit => unit.uid === combinePlan.host.uid) : null;
+    if (candidate.brave_mode === 'combine' && !combinedHost) throw new Error('direct combination became illegal before field entry');
     if (!isMagic) state.uid += 1;
     let uid = !isMagic ? state.uid : null;
     if (!isMagic) {
