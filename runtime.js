@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v203-v1";
-  const STAGE_VERSION = "v203";
+  const ENGINE_SLICE = "stage4-v215-v1";
+  const STAGE_VERSION = "v215";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v203-portable-v150";
+  const RUNTIME_VERSION = "stage4-v215-portable-v161";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -756,8 +756,42 @@
       level_thresholds:Object.fromEntries(Object.entries(card.level_thresholds || {})
         .map(([lv,value]) => [lv,value === null ? null : value+bonus]))};
   }
+  const READING_LEVEL_COST = new WeakSet();
+  function timedLevelCostBonus(state, cards, unit) {
+    if (!state.timedLevelCostIncreases?.length || READING_LEVEL_COST.has(state)
+        || unit.brave_mode === 'combine') return 0;
+    READING_LEVEL_COST.add(state);
+    try {
+      const card = unitInfo(state, cards, unit);
+      const kind = card.is_brave ? 'スピリット' : card.card_type || '';
+      const rows = state.timedLevelCostIncreases.filter(row=>row.target_types.some(type=>kind.endsWith(type)));
+      if (!rows.length) return 0;
+      const resist = activeResistances(state, cards, unit).resist || [];
+      return rows.reduce((sum,row) => sum + (
+        row.target_types.some(type => kind.endsWith(type))
+        && !resistanceBlocks(resist,'level_cost_increase',row.source.card_type,
+          row.source.colors,row.source.cost,row.source.context,row.pierce) ? row.amount : 0), 0);
+    } finally { READING_LEVEL_COST.delete(state); }
+  }
+  function unitFloor(state, cards, unit) {
+    return unit.floor + timedLevelCostBonus(state, cards, unit);
+  }
+  function entryInfo(state, cards, card) {
+    if (!state.timedLevelCostIncreases?.length || !card) return card;
+    const no = card.card_no || Object.keys(cards).find(no => cards[no] === card);
+    if (!cards[no]) return card;
+    card = cards[no];
+    const bonus = timedLevelCostBonus(state,cards,{card_no:no,cores:card.maintenance || 0,
+      floor:card.maintenance || 0,brave_mode:card.is_brave?'spirit':null});
+    return bonus ? levelCostCardInfo(card,{level_cost_bonus:bonus}) : card;
+  }
+  function entryMaintenance(state, cards, card) {
+    return entryInfo(state,cards,card)?.maintenance || 0;
+  }
   function unitInfo(state, cards, unit) {
     let card = levelCostCardInfo(cards[unit.card_no], unit);
+    const bonus = timedLevelCostBonus(state, cards, unit);
+    if (bonus) card = levelCostCardInfo(card, {level_cost_bonus:bonus});
     if ((card?.card_type || '').includes('ネクサス')) {
       const braves = state.field.filter(other => !other.waiting && other.brave_mode === 'combine'
         && other.combined_host_uid === unit.uid).map(other => cards[other.card_no]);
@@ -835,7 +869,7 @@
     "search", "recover", "self_recover", "side_recover", "stash_top", "opponent_deck_discard",
     "oracle_mill", "oracle_pickup", "oracle_watch", "deck_discard_draw",
     "hand_filter", "core_to_trash", "life_core_move", "token_spawn",
-    "creator_core_transfer", "driving_force", "zone_summon",
+    "reserve_payment_ban", "creator_core_transfer", "driving_force", "zone_summon",
     "exchange", "reveal_play_remainder", "face_up_top_cycle",
     // 自己反応の続き(「そうしたとき、…」、2026-10-03)。
     "creator_core_gain", "hand_to_deck_bottom",
@@ -947,7 +981,7 @@
           unsupported.push(`${definition.card_no}:burst-${effect.kind}`);
         }
       }
-      for (const effect of card.enablers || []) {
+      for (const effect of [...(card.enablers || []), ...(card.trash_effects || [])]) {
         if (!SUPPORTED_EFFECTS.has(effect.kind)) {
           unsupported.push(`${definition.card_no}:${effect.kind}`);
         }
@@ -983,11 +1017,8 @@
     if (alternative.color_exact
         && (colors.size !== alternative.color_exact.length
           || !alternative.color_exact.every((value) => colors.has(value)))) return false;
-    // 《煌臨》は《F契約煌臨》等の変種すべてを含む(Python `keyword_predicate_matches`)。
-    // keywordsは変種名で入っているので、集合の積だけで見ると1枚も一致しない。
-    const keywordMatches = (expected) => hasAny(keywords, expected)
-      || ((expected || []).includes("煌臨")
-        && [...keywords].some((held) => held.endsWith("煌臨")));
+    // keywordsはローダーが包含関係で展開済み(Python `keyword_predicate_matches`同一)。
+    const keywordMatches = (expected) => hasAny(keywords, expected);
     if (alternative.keyword_any && !keywordMatches(alternative.keyword_any)) return false;
     if (alternative.card_type_any
         && !alternative.card_type_any.some((value) => cardType.includes(value))) return false;
@@ -995,6 +1026,8 @@
         && card.cost < alternative.cost_min) return false;
     if (alternative.cost_max !== undefined && alternative.cost_max !== null
         && card.cost > alternative.cost_max) return false;
+    if (alternative.cost_exclude
+        && [...alternative.cost_exclude].includes(card.cost)) return false;
     if (alternative.name_exact
         && name !== normalizeCardName(alternative.name_exact)) return false;
     const nameContains = alternative.name_contains_any || alternative.name_contains;
@@ -1003,6 +1036,9 @@
     if (alternative.exclude_name_contains
         && [...alternative.exclude_name_contains].some(
           (value) => name.includes(normalizeCardName(value)))) return false;
+    if (alternative.exclude_name_exact
+        && [...alternative.exclude_name_exact].some(
+          (value) => name === normalizeCardName(value))) return false;
     return true;
   }
 
@@ -1394,7 +1430,9 @@
   }
 
   function levelFor(unit, cards, state) {
-    const card = levelCostCardInfo(cards[unit.card_no], unit);
+    let card = levelCostCardInfo(cards[unit.card_no], unit);
+    const bonus = timedLevelCostBonus(state, cards, unit);
+    if (bonus) card = levelCostCardInfo(card, {level_cost_bonus:bonus});
     const level = levelFromThresholds(unit.cores, card?.level_thresholds);
     return card?.count_level_thresholds
       ? Math.max(level,levelFromThresholds(state.count,card.count_level_thresholds)) : level;
@@ -1441,7 +1479,7 @@
             && !(gate.flash_level_min <= level && level <= gate.flash_level_max)) continue;
         const cost = gate.flash_cost_cores || 0;
         const ordinary = unit.cores - Number(Boolean(unit.soul_core));
-        if (cost && (ordinary < cost || unit.cores - cost < unit.floor)) continue;
+        if (cost && (ordinary < cost || unit.cores - cost < unitFloor(state, cards, unit))) continue;
         sources.push({ card_no: cardNo, cost, effects: group, key,
           technique: techniqueId !== null });
       }
@@ -1643,7 +1681,8 @@
     const other = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
     const attackStep = state.ownAttackActive || Boolean(other?.in_attack_step?.());
     return state.field.filter(unit => !unit.waiting).flatMap(unit =>
-      (unitInfo(state, cards, unit)?.field_life_protections || []).filter(rule =>
+      (unitInfo(state, cards, unit)?.field_life_protections || []).map((rule, index) =>
+        ({...rule, _life_cap_id: `${unit.uid}:${unit.card_no}:${index}`})).filter(rule =>
         ["per_source_turn", "per_source_attack"].includes(rule.protection)
         && (!rule.both_attack_steps || attackStep)
         && (rule.scope === "both" || ownLife && rule.scope === "self")
@@ -1651,6 +1690,43 @@
         && (!rule.requires_burst_set || state.burst != null)
         && (!rule.requires_combined || combinedBraves(state, unit.uid).length)
         && effectActive(rule, state, cards, unit.uid)));
+  }
+
+  // Retain a start receipt for each uninterrupted live protection/source pair.
+  function syncLifeCapStarts(state, cards) {
+    const other = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
+    if (!state.hasLifeSourceCaps && !other?.has_life_source_caps?.()) return;
+    const caps = [...lifeSourceCaps(state, cards).map(rule => ["self", rule]),
+      ...(other?.life_source_caps?.(false) || []).map(rule => ["opponent", rule])];
+    const active = {};
+    if (caps.length) {
+      const sources = [...combatFieldRows(state, cards).map(row =>
+        ["self", row, uid => Boolean(combinedBraves(state, uid).length)]),
+        ...(other?.field?.() || []).map(row => ["opponent", row, other.is_combined])];
+      for (const [side, rule] of caps) {
+        for (const [sourceSide, source, combined] of sources) {
+          const sourceType = source.spirit_state ? "スピリット"
+            : lifeSourceType({...source, damage_kind: "effect"});
+          if (!(rule.attacker_types || ["スピリット"]).includes(sourceType)
+              || rule.scope === "self" && sourceSide === "self"
+              || (source.symbol_count || 0) < (rule.attacker_symbol_min || 0)
+              || (rule.attacker_uncombined_types || []).includes(sourceType)
+                && (!combined || combined(source.uid))) continue;
+          const sourceKey = `${sourceSide}:${source.uid}`;
+          const capKey = `${side}:${rule._life_cap_id}|${sourceKey}`;
+          const ledger = rule.protection === "per_source_attack" ? state.spiritLifeTakenAttack : state.spiritLifeTaken;
+          active[capKey] = state.lifeSourceCapStarts[capKey] || {
+            protection: rule.protection, start: ledger[sourceKey] || 0};
+        }
+      }
+    }
+    state.lifeSourceCapStarts = active;
+  }
+
+  function syncLifeCapObservers(state, cards) {
+    syncLifeCapStarts(state, cards);
+    const other = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
+    other?.sync_life_cap_starts?.();
   }
 
   function lifeSourceType(source) {
@@ -1707,7 +1783,7 @@
       if (!trashEffectAllowed(state, cards, cardNo, state.combatOpponent || MAIN_STEP_OPPONENTS.get(state))) continue;
       if (route.once_per_game_same_name && state.trashFlashNamesUsed.has(card.name)) continue;
       const cost = paymentForState(state, cards, card, "outside");
-      if (cost.total - state.spent > reclaimable(state, false, cards)) continue;
+      if (!costAffordable(state, cards, cost.pay, cost.total, false, state.reserve + state.spent)) continue;
       for (const effect of card.flash_effects || []) {
         if (effect.kind !== "flash_life_protection") continue;
         options.push({ card_no: cardNo, kind: effect.kind,
@@ -1893,6 +1969,8 @@
   }
 
   function effectActive(effect, state, cards, sourceUid) {
+    if (effect.opponent_spirit_absent
+        && (!state.combatOpponent || state.combatOpponent.has_spirit())) return false;
     const activated = activatedUClause(state, effect, sourceUid);
     if (effect.mode === "on_destroy" && !state.field.find(row => row.uid === sourceUid)?.destroying) return false;
     if (effect.kind === "attack_step_end" && !state.combatOpponent?.can_end_attack_step?.()) return false;
@@ -2089,13 +2167,26 @@
     return state.field
       .filter((unit) => paymentUnitMatches(unit, cards, payment)
         && unit.cores - Number(Boolean(unit.soul_core)) >= amount
-        && unit.cores - amount >= unit.floor)
+        && unit.cores - amount >= unitFloor(state, cards, unit))
       .sort((left, right) => right.cores - left.cores || left.uid - right.uid);
   }
 
   function paymentSourceUnit(state, sourceUid) {
     const unit = state.field.find((row) => row.uid === sourceUid);
     return (!unit || unit.waiting) ? null : unit;
+  }
+
+  function creatorCorePlan(state, cards, donors, amount, ordinaryOnly = false) {
+    const plan = [];
+    let remaining = amount;
+    for (const unit of [...donors].sort((a,b) => b.cores-a.cores || a.uid-b.uid)) {
+      const available = Math.max(0, Math.min(unit.cores-unitFloor(state, cards, unit),
+        ordinaryOnly ? unit.cores-Number(Boolean(unit.soul_core)) : unit.cores));
+      const take = Math.min(remaining, available);
+      if (take) { plan.push({donor:unit, amount:take}); remaining -= take; }
+      if (!remaining) return plan;
+    }
+    return null;
   }
 
   /** 対価として壊せる自分のネクサス。発揮元自身は壊さない。 */
@@ -2144,8 +2235,13 @@
       const unit = paymentSourceUnit(state, sourceUid);
       if (!unit) return null;
       if (unit.cores - Number(Boolean(unit.soul_core)) < amount
-        || unit.cores - amount < unit.floor) return null;
+        || unit.cores - amount < unitFloor(state, cards, unit)) return null;
       return { donor: unit, amount };
+    }
+    if (kind === "trash_core_to_reserve") {
+      // 「トラッシュの[ソウルコア]以外のコア」(T19、Python同一)。ソウルコアは払えない。
+      const amount = Number(payment.amount || 1);
+      return state.spent - Number(state.trashHasSoul) >= amount ? {trashToReserve: amount} : null;
     }
     if (kind === "trash_core_to_self") {
       const amount = Number(payment.amount || 1);
@@ -2155,8 +2251,8 @@
     if (kind === "flag_core_void" || kind === "flag_core_move") {
       const amount = Number(payment.amount || 1);
       if (kind === "flag_core_move" && !paymentSourceUnit(state, sourceUid)) return null;
-      const donors = paymentCoreDonors(state, cards, payment, amount);
-      return donors.length ? { donor: donors[0], amount } : null;
+      const donors = creatorCorePlan(state, cards, paymentCoreDonors(state, cards, payment, 1), amount, true);
+      return donors ? {donors} : null;
     }
     if (kind === "reserve_core_to_flag") {
       const amount = Number(payment.amount || 1);
@@ -2187,7 +2283,7 @@
       const holder = [...state.field].sort((left, right) => left.uid - right.uid)
         .find((unit) => unit.soul_core && !unit.waiting) || null;
       if (holder && isCreatorNexus(cards, holder)) return null;
-      if (holder && holder.uid===sourceUid && holder.cores-1<holder.floor) return null;
+      if (holder && holder.uid===sourceUid && holder.cores-1<unitFloor(state, cards, holder)) return null;
       const targetUnits = state.field
         .filter((unit) => paymentUnitMatches(unit, cards, payment) && creatorCoreRoom(state,cards,unit)>0)
         .sort((left, right) => left.uid - right.uid);
@@ -2241,6 +2337,12 @@
         reason, target_uid:sourceUid});
       if (plan.takeSoul) notifySoulCorePlaced(state, cards, targets, sourceUid);
     }
+    if (plan.trashToReserve) {
+      state.spent -= plan.trashToReserve;
+      state.reserve += plan.trashToReserve;
+      recordCoreMove(state, cards, {amount: plan.trashToReserve, source: "trash",
+        destination: "reserve", reason, source_card_no: effect.source_card_no ?? null});
+    }
     state.lastPaymentCount = (plan.cards || []).length;
     for (const cardNo of plan.cards || []) {
       // 破棄は記録の後にまとめて（割り込んで出る札があるため。Python同一）。
@@ -2261,6 +2363,13 @@
     if (kind === "hand_discard") {
       discardHandCards(state, cards, targets, plan.cards || [],
         discardSourceCardNo(state, effect, sourceUid));
+    }
+    for (const {donor, amount} of plan.donors || []) {
+      donor.cores -= amount;
+      if (kind === 'flag_core_move') paymentSourceUnit(state, sourceUid).cores += amount;
+      recordCoreMove(state, cards, {amount, source:'field',
+        destination:kind === 'flag_core_move' ? 'field' : 'void', reason,
+        source_uid:donor.uid, ...(kind === 'flag_core_move' ? {target_uid:sourceUid} : {})});
     }
     if (plan.donor) {
       plan.donor.cores -= plan.amount;
@@ -2324,7 +2433,7 @@
           source: origin, destination: "field", reason,
           source_uid: holder ? holder.uid : null, target_uid: plan.soulTo.uid });
         if (holder !== plan.soulTo) notifySoulCorePlaced(state, cards, targets, plan.soulTo.uid);
-        if (holder && holder.cores<holder.floor) finalizeFieldLeave(state,cards,holder,"own_effect");
+        if (holder && holder.cores<unitFloor(state, cards, holder)) finalizeFieldLeave(state,cards,holder,"own_effect");
       } else {
         state.spent += 1;
         state.trashHasSoul = true;
@@ -2460,6 +2569,7 @@
   }
 
   function handCostInfo(state, cards, card, origin = "use") {
+    card = entryInfo(state, cards, card);
     if (!state.handCostBonus || card.hand_effect_immune || origin === "outside"
         || (origin === "use" && (!state.hand.includes(card.card_no)
           || (state.sideCards.includes(card.card_no) && sidePermissions(state, cards, card.card_no).has("use"))))
@@ -2563,8 +2673,9 @@
     return String(value || "").replace(/[\s・]/gu, "");
   }
 
+  // keywordsは包含関係で展開済み(Python `is_kourin_card`同一)。名前の部分一致で読まない。
   function isKourinCard(card) {
-    return (card.keywords || []).some((keyword) => keyword.includes("煌臨"));
+    return (card.keywords || []).includes("煌臨");
   }
 
   function isFKourin(card) {
@@ -2656,16 +2767,16 @@
    *  維持コアは「フィールド/リザーブのコアを好きなだけ置く」で載せる分。 */
   function soulKourinPaymentPossible(card, state, cards, destination) {
     if (kourinWaiverOk(card, state, cards, destination)) {
-      return reclaimable(state, false, cards) >= (card.maintenance || 0);
+      return reclaimable(state, false, cards) >= entryMaintenance(state, cards, card);
     }
     const fromField = !state.reserveHasSoul
-      && !(state.lifeHasSoul && destination !== "life") && Boolean(soulFieldHolder(state));
+      && !(state.lifeHasSoul && destination !== "life") && Boolean(soulFieldHolder(state, cards));
     if (!(state.reserveHasSoul || (state.lifeHasSoul && destination !== "life") || fromField)) {
       return false;
     }
     const available = state.reserve - (state.reserveHasSoul ? 1 : 0)
       + reclaimable(state, false, cards) - state.reserve - (fromField ? 1 : 0);
-    return available >= (card.maintenance || 0);
+    return available >= entryMaintenance(state, cards, card);
   }
 
   /** ソウルコアを払わずに煌臨してよいか。Python `_kourin_waiver_ok` と同一。 */
@@ -2686,7 +2797,7 @@
       if (card.kourin_soul_waiver.once_per_turn_name) state.kourinWaiverNames.add(card.name);
       return "soul_waived";
     }
-    return moveKourinSoul(state, host, destination) ? "soul_core" : null;
+    return moveKourinSoul(state, cards, host, destination) ? "soul_core" : null;
   }
 
   // アタックステップのフラッシュタイミングで、払わずに乗る許可が開く窓。
@@ -2720,8 +2831,8 @@
       if (!normal && !waived) return;
       const hosts = kourinHosts(card, state, cards)
         .filter((unit) => !unit.waiting
-          && (waived || kourinSoulSource(state, unit, destination))
-          && kourinMaintenancePossible(card, state, unit, destination, waived))
+          && (waived || kourinSoulSource(state, cards, unit, destination))
+          && kourinMaintenancePossible(card, state, cards, unit, destination, waived))
         .map((unit) => unit.uid).sort((left, right) => left - right);
       if (hosts.length) {
         options.push({ card_no: cardNo, hand_index: handIndex, hosts,
@@ -2743,7 +2854,7 @@
           || !summonConditionsMet(card, state, cards)) return;
       seen.add(cardNo);
       const creators = manifestationCreators(card, state, cards)
-        .filter(unit => manifestationPossible(state, cards, unit, card.maintenance || 0, false))
+        .filter(unit => manifestationPossible(state, cards, unit, entryMaintenance(state, cards, card), false))
         .map(unit => unit.uid).sort((a,b) => a-b);
       if (creators.length) {
         const option = {card_no:cardNo,hand_index:handIndex,creators};
@@ -2874,12 +2985,12 @@
       const effect=(unitInfo(state,cards,unit)?.triggered_effects || []).find(e=>refreshIds.has(e.effect_id));
       if (!effect || eventTriggerLimitKeys(cards,effect,unit.uid,unit.card_no).some(k=>state.blockTurnUsed.has(k))) continue;
       const donors=awakeningDonors(state,cards,unit.uid);
-      const holder=donors.find(u=>u.soul_core && u.cores>u.floor);
+      const holder=donors.find(u=>u.soul_core && u.cores>unitFloor(state, cards, u));
       if (!holder) continue;
       let need=Math.max(0,Math.min(...effect.levels.map(lv=>cards[unit.card_no].level_thresholds[lv]))-unit.cores-1);
       const moves=new Map([[holder.uid,{uid:holder.uid,amount:1,soul:true}]]);
       for (const donor of donors) {
-        const take=Math.min(need,Math.max(0,donor.cores-donor.floor-Number(!!donor.soul_core)));
+        const take=Math.min(need,Math.max(0,donor.cores-unitFloor(state, cards, donor)-Number(!!donor.soul_core)));
         if (take) {
           if (!moves.has(donor.uid)) moves.set(donor.uid,{uid:donor.uid,amount:0,soul:false});
           moves.get(donor.uid).amount+=take;need-=take;
@@ -2915,7 +3026,7 @@
       }
       for (const donorUid of seen) {
         const donor=donors.get(donorUid);
-        if (donor.cores<donor.floor) finalizeFieldLeave(state,cards,donor,'own_effect');
+        if (donor.cores<unitFloor(state, cards, donor)) finalizeFieldLeave(state,cards,donor,'own_effect');
       }
       if (moves.some(row=>row.soul)) notifySoulCorePlaced(state,cards,targets,uid);
       record(state,cards,'effect_complete',{card_no:unit.card_no,uid,effect_kind:'awakening',window:'awakening_flash',resolved:true});
@@ -2987,7 +3098,7 @@
       if (!(card.on_play_opponent_effects || []).some(
         (effect) => FLASH_REMOVAL_KINDS.has(effect.kind))) return;
       const cost = paymentForState(state, cards, card);
-      if (cost.total > reclaimable(state, false, cards)) return;
+      if (!costAffordable(state, cards, cost.pay, cost.total, false)) return;
       options.push({ card_no: cardNo, hand_index: handIndex, cost: cost.total });
     });
     return options;
@@ -2996,17 +3107,17 @@
   /** ソウルコアが乗っている場の体のうち、取り出しても維持コアを割らないもの。
    *  支払いは場のどのカードのコアからでも盛り込める(2026-10-02)。煌臨先が先。
    *  Python `_soul_field_holder` と同一。 */
-  function soulFieldHolder(state, prefer = null) {
+  function soulFieldHolder(state, cards, prefer = null) {
     const ordered = [...(prefer ? [prefer] : []),
       ...[...state.field].sort((left, right) => left.uid - right.uid)];
     return ordered.find((unit) => unit && unit.soul_core && !unit.waiting
-      && unit.cores > unit.floor) || null;
+      && unit.cores > unitFloor(state, cards, unit)) || null;
   }
 
-  function kourinSoulSource(state, host, destination) {
+  function kourinSoulSource(state, cards, host, destination) {
     if (state.reserveHasSoul) return "reserve";
     if (state.lifeHasSoul && destination !== "life") return "life";
-    if (soulFieldHolder(state, host)) return "field";
+    if (soulFieldHolder(state, cards, host)) return "field";
     return null;
   }
 
@@ -3054,9 +3165,50 @@
   // トークンはどこへ戻す印字でも消滅する。契約煌臨元の置き換えが起きる枝は従来
   // どおり(置き換えが移り先を決める効果そのものなので上書きしない)。
   function finalizeFieldLeave(state, cards, unit, cause, destination = "trash") {
+    const braves = combinedBraves(state,unit.uid);
+    if (!braves.length || !['スピリット','アルティメット'].some(type =>
+      (cards[unit.card_no].card_type || '').includes(type))) {
+      return finalizeFieldLeaveImpl(state,cards,unit,cause,destination);
+    }
+    beginEffectFrame(state);
+    try {
+      const traceMark=state.events.length;
+      const result = finalizeFieldLeaveImpl(state,cards,unit,cause,destination);
+      if (!['trash','hand','deck_top','deck_bottom','vanish'].includes(result)) return result;
+      const survivors=[];
+      for (const brave of braves) {
+        if ((cards[brave.card_no].lineages || []).includes('異魔神')) continue;
+        brave.brave_mode='spirit';brave.combined_host_uid=null;
+        brave.floor=(cards[brave.card_no].maintenance || 0)+(brave.level_cost_bonus || 0);
+        const maintenance=unitFloor(state,cards,brave);
+        if (state.reserve<maintenance) {
+          finalizeFieldLeaveImpl(state,cards,brave,cause,result==='vanish'?destination:result);continue;
+        }
+        brave.soul_core=payFromReserve(state,0,maintenance);state.reserve-=maintenance;
+        brave.cores=maintenance;brave.exhausted=Boolean(unit.exhausted);
+        brave.heavy_exhausted=Boolean(unit.heavy_exhausted);survivors.push(brave);
+        record(state,cards,'brave_remained',{uid:brave.uid,card_no:brave.card_no,host_uid:unit.uid,
+          cores:maintenance,soul_core:brave.soul_core,exhausted:brave.exhausted});
+      }
+      if (state.battleActive && [state.attackingUid,state.battlingUid].includes(unit.uid)) {
+        const successor=survivors.find(brave=>!cards[brave.card_no].cannot_battle_as_spirit)?.uid ?? null;
+        state.battleReplacements[unit.uid]=successor;
+        if (state.attackingUid===unit.uid) state.attackingUid=successor;
+        if (state.battlingUid===unit.uid) state.battlingUid=successor;
+        record(state,cards,'battle_unit_changed',{host_uid:unit.uid,uid:successor});
+      }
+      if(state.trace){const finalState=stateView(state,cards);for(const event of state.events.slice(traceMark))event.state=clone(finalState);}
+      return result;
+    } finally { endEffectFrame(state); }
+  }
+  function battleUid(state,uid) {
+    while (Object.hasOwn(state.battleReplacements,uid)) uid=state.battleReplacements[uid];
+    return uid;
+  }
+  function finalizeFieldLeaveImpl(state, cards, unit, cause, destination = "trash") {
     const replacement = unitInfo(state, cards, unit)?.field_leave_return;
     if (cause === "effect" && replacement && !unit.effects_suppressed_this_turn
-        && replacement.levels.includes(levelFor({...unit, cores:Math.max(unit.cores, unit.floor)}, cards, state))) {
+        && replacement.levels.includes(levelFor({...unit, cores:Math.max(unit.cores, unitFloor(state, cards, unit))}, cards, state))) {
       // 方針は再利用できる手札。消滅時もLv1の離れる効果は有効(Python同一)。
       destination = replacement.destinations[0];
     }
@@ -3142,11 +3294,11 @@
   /** ソウルコアは維持の判定より先に払うので、宿主自身・リザーブから払う1個は
    *  新しいLv1に数えない(2026-10-17)。`waived`は同じ窓の`kourinWaiverOk`。
    *  Python `_fara_kourin_maintenance_possible` と同一。 */
-  function kourinMaintenancePossible(card, state, host, destination, waived = false) {
-    const maintenance = (card.maintenance || 0) + (host.level_cost_bonus || 0);
-    const source = waived ? null : kourinSoulSource(state, host, destination);
+  function kourinMaintenancePossible(card, state, cards, host, destination, waived = false) {
+    const maintenance = entryMaintenance(state, cards, card) + (host.level_cost_bonus || 0);
+    const source = waived ? null : kourinSoulSource(state, cards, host, destination);
     const hostCores = host.cores - Number(source === "field"
-      && soulFieldHolder(state, host) === host);
+      && soulFieldHolder(state, cards, host) === host);
     if (hostCores >= maintenance) return true;
     if (!isFKourin(card) || !hasContractBase(host, state.fieldCoreKourinNo)) return false;
     const reserveAfterSoul = state.reserve - Number(source === "reserve");
@@ -3303,13 +3455,15 @@
       }
       if (!conditions.length) return true;
       return eligible.some((condition) => {
+        // An unresolved ID or unclosed compound condition is not a named lineage.
+        if (condition.required_lineage_id != null) return false;
         if (condition.min_cost !== null && condition.min_cost !== undefined
             && candidate.cost < condition.min_cost) return false;
         if (condition.required_color && !(candidate.colors || []).includes(condition.required_color)) return false;
         if (condition.required_card_name && !normalizeCardName(candidate.name || '').includes(normalizeCardName(condition.required_card_name))) return false;
         if (condition.required_keywords?.length
             && !condition.required_keywords.some(keyword => (candidate.keywords || []).includes(keyword))) return false;
-        const requiredLineage = condition.required_lineage ?? condition.required_lineage_id;
+        const requiredLineage = condition.required_lineage;
         if (requiredLineage
             && !(candidate.lineages || []).includes(requiredLineage)) return false;
         if (condition.required_card_type) {
@@ -3345,9 +3499,27 @@
     for (const unit of state.field) {
       if (unit.creator_core || unit.waiting) continue;
       total += allowSacrifice && !sacrificeProtected(unit, cards)
-        ? unit.cores : Math.max(0, unit.cores - unit.floor);
+        ? unit.cores : Math.max(0, unit.cores - unitFloor(state, cards, unit));
     }
     return total;
+  }
+
+  function reserveCostBanned(state, count = state.reserve) {
+    return state.paymentRestrictions.some(row => count >= row.min_reserve);
+  }
+
+  function costAffordable(state, cards, pay, total, allowSacrifice, reserve = state.reserve) {
+    const field = reclaimable(state, allowSacrifice, cards) - state.reserve;
+    return total <= reserve + field && (!pay || !reserveCostBanned(state, reserve) || pay <= field);
+  }
+
+  function fundCost(state, cards, targets, pay, total, allowSacrifice) {
+    const banned = Boolean(pay && reserveCostBanned(state));
+    const origin = banned ? [state.reserve, state.reserveHasSoul] : null;
+    const deficit = Math.max(total-state.reserve, banned ? pay : 0);
+    const funded = deficit <= 0 || fundPayment(state, cards, targets, deficit, allowSacrifice);
+    state.costPaymentOrigin = origin;
+    return funded;
   }
 
   /** バグ割引を選ぶと支払い前に減る原資。Python `_bug_discount_funding_penalty` と同一。 */
@@ -3358,7 +3530,7 @@
     const target = fContractWhiteSpiritTarget(state, cards, bug.uid);
     // すでに煌臨元を持つユニットはもともと自壊対象外なので原資は減らない。
     if (!target || (target.kourin_stack || []).length) return 0;
-    return target.cores - Math.max(0, target.cores - target.floor);
+    return target.cores - Math.max(0, target.cores - unitFloor(state,cards,target));
   }
 
   function legalCandidates(state, cards, targets, only = null) {
@@ -3384,9 +3556,9 @@
         Number(!(isFKourin(card) && left.card_no === state.flagNo))
           - Number(!(isFKourin(card) && right.card_no === state.flagNo))
         || left.uid - right.uid);
-      const host = hosts.find((unit) => (kourinSoulSource(state, unit, destination)
+      const host = hosts.find((unit) => (kourinSoulSource(state, cards, unit, destination)
         || kourinWaiverOk(card, state, cards, destination))
-        && kourinMaintenancePossible(card, state, unit, destination,
+        && kourinMaintenancePossible(card, state, cards, unit, destination,
           kourinWaiverOk(card, state, cards, destination)));
       // 場に宿主がいないなら**魂状態のカードへ乗り直せないか**(Python同一)。
       const soulHost = host ? null
@@ -3405,18 +3577,18 @@
         rows.push({ hand_index: handIndex, card_no: cardNo, brave_mode: null,
           allow_sacrifice: false, mode: "kourin_from_soul",
           kourin_soul_card_no: soulHost,
-          pay: 0, total: card.maintenance || 0, maintenance: card.maintenance || 0 });
+          pay: 0, total: entryMaintenance(state, cards, card), maintenance: entryMaintenance(state, cards, card) });
         return;
       }
       const creator = (may("manifestation") && ["main", "self_turn"].includes(card.manifestation_timing)
         ? manifestationCreators(card, state, cards) : [])
         .find((unit) =>
-          manifestationPossible(state, cards, unit, card.maintenance || 0, allowSacrifice));
+          manifestationPossible(state, cards, unit, entryMaintenance(state, cards, card), allowSacrifice));
       if (!creator && !summonConditionsMet(card, state, cards)) return;
       if (!creator && !may("use")) return;
       const mode = braveMode(card, state, cards);
       const cost = creator
-        ? { pay: 0, total: card.maintenance || 0, maintenance: card.maintenance || 0 }
+        ? { pay: 0, total: entryMaintenance(state, cards, card), maintenance: entryMaintenance(state, cards, card) }
         : paymentForState(state, cards, card);
       const tokenCost = card.token_sacrifice_summon_cost;
       if (!creator && tokenCost !== null && tokenCost !== undefined
@@ -3427,11 +3599,11 @@
       if (mode === "combine") cost.total = cost.pay;
       // 自壊なしで払えるならそこで通す。自壊が要るときだけ、トークン破壊で先に
       // 減る原資(bugDiscountFundingPenalty)を足して判定する。Python側と同じ順序。
-      if (cost.total > reclaimable(state, false, cards)) {
+      if (!costAffordable(state, cards, cost.pay, cost.total, false)) {
         if (!allowSacrifice) return;
         const need = cost.total + (cost.total === tokenCost
           ? bugDiscountFundingPenalty(state, cards) : 0);
-        if (need > reclaimable(state, true, cards)) return;
+        if (!costAffordable(state, cards, cost.pay, need, true)) return;
       }
       rows.push({ hand_index: handIndex, card_no: cardNo, brave_mode: mode,
         allow_sacrifice: allowSacrifice, mode: creator ? "manifestation" : "normal",
@@ -3483,7 +3655,7 @@
         const symbolBonus = flagSymbolBonus(state, cards, unit, "main", staticMain);
         return ({
         uid: unit.uid, card_no: unit.card_no, cores: unit.cores,
-        floor: unit.floor, soul_core: Boolean(unit.soul_core), level: levelFor(unit, cards, state),
+        floor: unitFloor(state, cards, unit), soul_core: Boolean(unit.soul_core), level: levelFor(unit, cards, state),
         waiting: Boolean(unit.waiting), brave_mode: unit.brave_mode,
         combined_host_uid: unit.combined_host_uid ?? null,
         kourin_stack: [...(unit.kourin_stack || [])],
@@ -3545,6 +3717,7 @@
   // 棋譜のターン番号は、相手のターンの間だけ直前の自分のターンに固定する
   // (`state.traceTurn`、Python `trace_turn`と同一)。
   function record(state, cards, type, details = {}, turn = state.traceTurn ?? state.turn) {
+    syncLifeCapObservers(state, cards);
     if (state.trace) state.events.push({
       seq: state.events.length + 1,
       type,
@@ -3779,13 +3952,13 @@
     if (canReplace) {
       const brave = braveMode(revealedCard, state, cards);
       const pay = effect.summon_cost || 0;
-      const total = pay + (brave === "combine" ? 0 : (revealedCard.maintenance || 0));
-      if (total <= reclaimable(state, true, cards)) {
+      const total = pay + (brave === "combine" ? 0 : entryMaintenance(state, cards, revealedCard));
+      if (costAffordable(state, cards, pay, total, true)) {
         takeTopCard(state);
         state.seen.add(revealed);
         state.dig += 1;
         pendingSummon = { card_no: revealed, pay, total,
-          maintenance: revealedCard.maintenance || 0, brave_mode: brave,
+          maintenance: entryMaintenance(state, cards, revealedCard), brave_mode: brave,
           allow_sacrifice: true, mode: "face_up_draw_replacement" };
       }
     }
@@ -3820,6 +3993,10 @@
       const before = picked.length;
       const limit = slot.limit;
       let taken = 0;
+      // 「コスト合計Nまで好きなだけ」(BS12-016、T15)。合計を超える札は飛ばす(Python同一)。
+      const totalCap = slot.total_cap;
+      const fits = (cardNo) => !totalCap || picked.slice(before).reduce(
+        (sum, no) => sum + (cards[no]?.cost || 0), 0) + (cards[cardNo]?.cost || 0) <= totalCap.cap;
       const take = (predicate) => {
         while ((limit === null || limit === undefined || taken < limit)) {
           // Pythonは (priority, プール内の位置) の最小を取る。priorityが無ければ
@@ -3827,7 +4004,7 @@
           let index = -1;
           let best = null;
           work.forEach((cardNo, position) => {
-            if (!predicate(cardNo)) return;
+            if (!predicate(cardNo) || !fits(cardNo)) return;
             const rank = [priorityKey ? priorityKey(cardNo) : 0, position];
             if (best === null || rank[0] < best[0] || (rank[0] === best[0] && rank[1] < best[1])) {
               best = rank;
@@ -4186,10 +4363,10 @@
       const printed = reaction.cost_mode === "printed";
       const cost = printed ? paymentForState(state, cards, { ...card, card_no: cardNo }, "outside").pay
         : reaction.cost || 0;
-      const total = cost + (reaction.destination === "field" ? card.maintenance || 0 : 0);
+      const total = cost + (reaction.destination === "field" ? entryMaintenance(state, cards, card) : 0);
       if (reaction.destination === "field" && !summonConditionsMet(card, state, cards)) continue;
       // 方針: 通常のコストを払う出し方は、自分の場を壊してまでは出さない(Python同一)。
-      if (total > reclaimable(state, !printed, cards)) continue;
+      if (!costAffordable(state, cards, cost, total, !printed)) continue;
       record(state, cards, "open_reaction_queued", { card_no: cardNo,
         source_card_no: sourceCardNo, destination: reaction.destination,
         ...(printed ? { pay: cost } : {}) });
@@ -4207,8 +4384,7 @@
         resolved = setBurst(state, cards, targets, cardNo, "effect");
       } else if (reaction.destination === "hand") {
         if (total) {
-          const deficit = total - state.reserve;
-          if (deficit > 0) fundPayment(state, cards, targets, deficit, true);
+          fundCost(state, cards, targets, cost, total, true);
           payFromReserve(state, cost, 0);
           state.reserve -= total;
           state.spent += cost;
@@ -4221,19 +4397,18 @@
         resolved = true;
       } else if (reaction.destination === "field") {
         if (total) {
-          const deficit = total - state.reserve;
-          if (deficit > 0) fundPayment(state, cards, targets, deficit, !printed);
+          fundCost(state, cards, targets, cost, total, !printed);
         }
         pool.splice(pool.indexOf(cardNo), 1);
-        const soulCore = total ? payFromReserve(state, cost, card.maintenance || 0) : false;
+        const soulCore = total ? payFromReserve(state, cost, entryMaintenance(state, cards, card)) : false;
         state.reserve -= total;
         state.spent += cost;
         // 召喚時の神託は場に先にいた創界神(Python `watch=(watchers, ...)`、2026-10-03)。
         const watcherUnits = [...state.field];
         state.uid += 1;
         const uid = state.uid;
-        state.field.push({ uid, card_no: cardNo, cores: card.maintenance || 0,
-          floor: card.maintenance || 0, symbols: card.symbols || {}, brave_mode: null,
+        state.field.push({ uid, card_no: cardNo, cores: entryMaintenance(state, cards, card),
+          floor: cards[card.card_no].maintenance || 0, symbols: card.symbols || {}, brave_mode: null,
           creator_core: (card.lineages || []).includes("創界神"), waiting: false,
           // 疲労状態。戦闘(6B)でだけ動き、combat無効なら常にfalseのまま。
           exhausted: false,
@@ -4616,6 +4791,12 @@
     if (effect.kind === "hand_cost_increase") {
       return Boolean(state.combatOpponent?.increase_hand_cost?.(effect.amount, combatBoard(state, cards, targets)));
     }
+    if (effect.kind === 'reserve_payment_ban') {
+      const board = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
+      if (!board || !(state.battleActive || board.in_battle())) return false;
+      board.restrict_reserve_payment(effect.min_reserve);
+      return true;
+    }
     if (effect.kind === "level_cost_increase") {
       const amount = effect.level_cost_delta * (effect.own_hand_divisor
         ? Math.floor(state.hand.length / effect.own_hand_divisor) : 1);
@@ -4626,8 +4807,9 @@
       try {
         const rows = limitTargetRows(combatTargetRows(state, cards, effect, sourceUid), effect);
         const selected = unguardedTargets(board, rows, effect);
-        return Boolean(selected.length && board?.increase_level_cost?.(
-          selected.map(row => row.uid), amount, combatBoard(state, cards, targets, effect, sourceUid)));
+        return Boolean((selected.length || effect.target_all) && board?.increase_level_cost?.(
+          selected.map(row => row.uid), amount, combatBoard(state, cards, targets, effect, sourceUid),
+          effect.target_all ? effect : null));
       } finally { state.combatOpponent = previous; }
     }
     if (effect.kind === "guard_battle_refresh") {
@@ -4645,7 +4827,7 @@
       board.add_attack_ban({scope:effect.scope,target_under_min:effect.target_under_min,
         source_type:card.card_type,source_colors:[...(card.colors || [])].sort(),
         source_cost:card.cost,pierce:activePierces(state,cards,effect,unit),
-        context:{own_turn:state.ownTurnActive,source_level:levelFor(unit,cards),
+        context:{own_turn:state.ownTurnActive,source_level:levelFor(unit,cards,state),
           source_has_soul:Boolean(unit.soul_core),
           controller_symbol_colors:Object.entries(effectiveSymbols(state,cards))
             .filter(([,n])=>n>0).map(([c])=>c).sort()}});
@@ -4804,7 +4986,7 @@
         .filter((slot) => countRequirementsMet(slot.count_requirements, state.count)
           && stateConditionsMet(slot.state_conditions, state, cards)
           && (!slot.requires_source_kourin || (sourceUnit?.kourin_stack || []).length)
-          && (slot.additional_cost || 0) <= reclaimable(state, true, cards));
+          && costAffordable(state, cards, slot.additional_cost || 0, slot.additional_cost || 0, true));
       // Python `resolve_search` と同じ優先規則。
       // ①手札/狙い札にF契約煌臨があるなら、その**煌臨先になれる公開札**を優先
       //   （カード番号で名指しせず、「その札が場にあったら」という仮の盤面を
@@ -4833,8 +5015,7 @@
       const additionalCost = result.picked_slots.reduce((sum, row) =>
         sum + (row.cards.length ? row.slot.additional_cost || 0 : 0), 0);
       if (additionalCost) {
-        const deficit = additionalCost - state.reserve;
-        if (deficit > 0) fundPayment(state, cards, targets, deficit, true);
+        fundCost(state, cards, targets, additionalCost, additionalCost, true);
         payFromReserve(state, additionalCost, 0);
         state.reserve -= additionalCost;
         state.spent += additionalCost;
@@ -4861,10 +5042,9 @@
       state.openPoolStack.pop();
       const repeatCost = effect.repeat_cost || 0;
       if ((effect.repeat_times || 0) > 0 && state.deck.length
-          && repeatCost <= reclaimable(state, true, cards)) {
+          && costAffordable(state, cards, repeatCost, repeatCost, true)) {
         if (repeatCost) {
-          const deficit = repeatCost - state.reserve;
-          if (deficit > 0) fundPayment(state, cards, targets, deficit, true);
+          fundCost(state, cards, targets, repeatCost, repeatCost, true);
           payFromReserve(state, repeatCost, 0);
           state.reserve -= repeatCost;
           state.spent += repeatCost;
@@ -5011,7 +5191,10 @@
       // 種別照合にも並べ替えにも乗らない。Python `_resolve_life_core_remove`と同一。
       const board = state.combatOpponent;
       if (!board) return false;
-      return Boolean(board.damage_life(amount, effect.core_destination || "reserve",
+      const value = effect.amount_per_source_symbol
+        ? Math.min(effect.amount_max, amount * combatUnitRow(state, cards,
+          state.field.find(unit => unit.uid === sourceUid), sourceUid).symbol_count) : amount;
+      return Boolean(board.damage_life(value, effect.core_destination || "reserve",
         lifeLossSource(state, cards, effect, sourceUid)));
     }
     if (effect.kind === "reserve_core_remove") {
@@ -5385,8 +5568,14 @@
           });
         }
       } else {
-        const returnExchangeGroup = (group, destination, reason) => {
-          if (!group.length) return;
+        const groups = [
+          [unpicked, revealedDestination, "exchange_open_remainder"],
+          [returned, returnedDestination, "exchange_hand_return"],
+        ];
+        // Python resolves both placements before recording either group.
+        // A snapshot must not leave returned hand cards in the old zone.
+        for (const [group, destination] of groups) {
+          if (!group.length) continue;
           if (destination === "trash") state.trashCards.push(...group);
           else if (destination === "top") {
             state.deck.push(...group);
@@ -5395,15 +5584,14 @@
             state.deck.unshift(...group);
             noteDeckPlacement(state, group, "bottom");
           }
+        }
+        for (const [group, destination, reason] of groups) {
+          if (!group.length) continue;
           record(state, cards, "cards_returned_to_deck", {
             cards: group, destination, order: "bottom_to_top", reason,
             source_card_no: effect.source_card_no,
           });
-        };
-        returnExchangeGroup(
-          unpicked, revealedDestination, "exchange_open_remainder");
-        returnExchangeGroup(
-          returned, returnedDestination, "exchange_hand_return");
+        }
       }
       if (state.openPoolStack.at(-1) !== pool) {
         throw new Error("open pool resolution order mismatch");
@@ -5442,7 +5630,7 @@
         for (const cardNo of selection.picked) {
           const index = remaining.indexOf(cardNo);
           if (index < 0 || !summonConditionsMet(cards[cardNo], state, cards)) continue;
-          const maintenance = cards[cardNo].maintenance || 0;
+          const maintenance = entryMaintenance(state, cards, cards[cardNo]);
           if (maintenance > reclaimable(state, true, cards)) continue;
           remaining.splice(index, 1);
           state.hand.push(cardNo);
@@ -5490,7 +5678,7 @@
     if (effect.kind === "token_spawn") {
       const token = state.bugNo ? cards[state.bugNo] : null;
       if (!token || !String(effect.token_name || "").includes(token.name)) return false;
-      const maintenance = token.maintenance || 0;
+      const maintenance = entryMaintenance(state, cards, token);
       const source = state.field.find((unit) => unit.uid === sourceUid);
       // 生成元が場を離れていたらトークンは出ない(Python `_create_platinum_bug`の
       // `source_uid not in field_units`と同じガード)。これが無いと、離れた後でも
@@ -5519,7 +5707,7 @@
       }
       state.uid += 1;
       state.field.push({ uid: state.uid, card_no: state.bugNo, cores: maintenance,
-        floor: maintenance, symbols: token.symbols || {}, brave_mode: null,
+        floor: token.maintenance || 0, symbols: token.symbols || {}, brave_mode: null,
         creator_core: false, waiting: false, exhausted: false,
         soul_core: soulCore, kourin_stack: [] });
       recordCoreMove(state, cards, { amount: maintenance,
@@ -5535,7 +5723,7 @@
       if (effect.requires_successful_followup === "reveal_play_remainder" && !state.deck.length) return false;
       const donors = state.field.filter((unit) => {
         const donor = unitInfo(state, cards, unit);
-        if (unit.waiting || unit.cores - unit.floor < amount
+        if (unit.waiting || unit.cores <= unitFloor(state, cards, unit)
             || !(donor.lineages || []).includes("創界神")) return false;
         if (effect.source_requirement === "blue") return (donor.colors || []).includes("青");
         if (effect.source_requirement === "six_color") {
@@ -5546,7 +5734,8 @@
         }
         return effect.source_requirement === "any";
       }).sort((left, right) => right.cores - left.cores || left.uid - right.uid);
-      if (!donors.length) return false;
+      const plan = creatorCorePlan(state, cards, donors, amount);
+      if (!plan) return false;
       let target = null;
       if (effect.destination !== "reserve") {
         if (effect.destination_scope === "self") {
@@ -5559,9 +5748,20 @@
           if (!target) return false;
         }
       }
-      donors[0].cores -= amount;
+      let movedSoul = false;
+      for (const {donor, amount:take} of plan) {
+        const takesSoul = donor.soul_core && take > donor.cores - 1;
+        donor.cores -= take;
+        if (takesSoul) {
+          movedSoul = true;
+          donor.soul_core = false;
+          if (target) target.soul_core = true;
+          else state.reserveHasSoul = true;
+        }
+      }
       if (target) target.cores += amount;
       else state.reserve += amount;
+      if (movedSoul && target) notifySoulCorePlaced(state, cards, targets, target.uid);
       return true;
     }
     // rz7_kourin_searchは2026-08-16に削除(汎用searchが印字どおりに解く)。
@@ -5610,7 +5810,7 @@
         }
         if (deploy) {
           play(state, cards, targets, { card_no: deploy, pay: 0, total: 0,
-            maintenance: cards[deploy].maintenance || 0, brave_mode: null,
+            maintenance: entryMaintenance(state, cards, cards[deploy]), brave_mode: null,
             allow_sacrifice: false, mode: "free_deploy",
             source_zone: stackHost ? "kourin" : "trash",
             source_host_uid: stackHost?.uid ?? null });
@@ -5632,25 +5832,15 @@
     const queued = [];
     const finalizeQueued = () => {
       for (const unit of queued.splice(0)) {
-        deferFieldLeave(state, () => {
-          const stack = [...(unit.kourin_stack || []), unit.card_no];
-          state.trashCards.push(...stack.filter((cardNo) => !cards[cardNo]?.is_token));
-          state.field.splice(state.field.indexOf(unit), 1);
-          state.recurring = state.recurring.filter((entry) => entry.uid !== unit.uid);
-          record(state, cards, "field_left", { card_no: unit.card_no,
-            uid: unit.uid, cause: "cost",
-            destination: unitInfo(state, cards, unit)?.is_token ? "vanish" : "trash",
-            moved_card_nos: stack.filter((cardNo) => !cards[cardNo]?.is_token),
-            cores_returned: unit.cores });
-        });
+        deferFieldLeave(state, () => finalizeFieldLeave(state,cards,unit,'cost'));
       }
     };
     for (const unit of state.field) {
       if (unit.creator_core || unit.waiting) continue;
-      const free = Math.max(0, unit.cores - unit.floor);
+      const free = Math.max(0, unit.cores - unitFloor(state, cards, unit));
       const take = Math.min(free, remaining);
       const ordinaryFree = Math.max(
-        0, unit.cores - Number(Boolean(unit.soul_core)) - unit.floor);
+        0, unit.cores - Number(Boolean(unit.soul_core)) - unitFloor(state, cards, unit));
       if (take > ordinaryFree) {
         unit.soul_core = false;
         state.reserveHasSoul = true;
@@ -5707,6 +5897,19 @@
   }
 
   function payFromReserve(state, pay, maintenance, preferSoulForPay = false) {
+    const origin = state.costPaymentOrigin;
+    state.costPaymentOrigin = null;
+    if (origin) {
+      const fundedReserve = state.reserve;
+      state.reserve = fundedReserve-origin[0];
+      state.reserveHasSoul = state.reserveHasSoul && !origin[1];
+      payFromReserve(state, pay, 0, preferSoulForPay);
+      state.reserveHasSoul = origin[1] || state.reserveHasSoul;
+      state.reserve = fundedReserve-pay;
+      const soulToMaintenance = payFromReserve(state, 0, maintenance);
+      state.reserve = fundedReserve;
+      return soulToMaintenance;
+    }
     let ordinary = state.reserve - Number(state.reserveHasSoul);
     const forcedSoulPay = Number(Boolean(preferSoulForPay && state.reserveHasSoul
       && pay > 0 && ordinary >= (pay - 1) + maintenance));
@@ -5739,10 +5942,10 @@
     const card = cards[cardNo];
     if (!(card.enablers || []).some((row) => row.mode === "on_play")) return false;
     const cost = paymentForState(state, cards, card, "outside");
-    if (cost.total > reclaimable(state, false, cards)) return false;
+    if (!costAffordable(state, cards, cost.pay, cost.total, false)) return false;
     return play(state, cards, targets, {
       card_no: cardNo, pay: cost.pay, total: cost.total,
-      maintenance: card.maintenance || 0, brave_mode: null,
+      maintenance: entryMaintenance(state, cards, card), brave_mode: null,
       allow_sacrifice: false, mode: "burst_paid_followup",
       followup_timing: effect.followup_timing ?? null,
     });
@@ -5911,7 +6114,7 @@
         // 直接合体は維持コアが要らない（裁定3616、Python同一）。以前は合体させても
         // 維持コアぶんをリザーブから払い、どこにも置かずに消していた。
         const mode = braveMode(card, state, cards);
-        const total = mode === "combine" ? 0 : card.maintenance || 0;
+        const total = mode === "combine" ? 0 : entryMaintenance(state, cards, card);
         // 召喚条件と維持コアの原資は`play`へ入る**前**に見る(Python
         // `resolve_burst_effects`の`_summon_condition_met`・`_affordable(total, True)`
         // と同一)。⚠️ 2026-10-11まで両方とも見ておらず、`play`が「提示」「コスト確定」
@@ -5921,7 +6124,7 @@
             || total > reclaimable(state, true, cards)) continue;
         selfPlayed = play(state, cards, targets, {
           card_no: cardNo, pay: 0, total,
-          maintenance: card.maintenance || 0, brave_mode: mode,
+          maintenance: entryMaintenance(state, cards, card), brave_mode: mode,
           allow_sacrifice: true, mode: "burst_free_play",
         });
       } else if (effect.kind === "burst_return_self_to_hand") {
@@ -6010,11 +6213,11 @@
       const card = cards[summoned.cardNo];
       const brave = braveMode(card, state, cards);
       const pay = effect.summon_cost || 0;
-      const total = pay + (brave === "combine" ? 0 : (card.maintenance || 0));
-      if (total <= reclaimable(state, true, cards)) {
+      const total = pay + (brave === "combine" ? 0 : entryMaintenance(state, cards, card));
+      if (costAffordable(state, cards, pay, total, true)) {
         opened.splice(opened.indexOf(summoned.cardNo), 1);
         pending = { card_no: summoned.cardNo, pay, total,
-          maintenance: card.maintenance || 0, brave_mode: brave,
+          maintenance: entryMaintenance(state, cards, card), brave_mode: brave,
           allow_sacrifice: true, mode: "after_burst_open" };
       }
     }
@@ -6083,12 +6286,12 @@
           row.event === event && (event!=='count_increased' || requirementMet(row, payload.new_count)));
         if (!state.hand.includes(cardNo) || !reaction || (reaction.name_restriction
             && state.handReactionNames.has(reaction.name_restriction))) continue;
-        const total = reaction.summon_cost + (card.maintenance || 0);
+        const total = reaction.summon_cost + entryMaintenance(state, cards, card);
         if (!summonConditionsMet(card, state, cards)
-            || total > reclaimable(state, false, cards)) continue;
+            || !costAffordable(state, cards, reaction.summon_cost, total, false)) continue;
         if(event==='soul_core_to_count')record(state,cards,'event_trigger_effect',{event,card_no:cardNo,uid:null,effect_kind:'zone_summon'});
         if (play(state, cards, targets, { card_no: cardNo, pay: reaction.summon_cost,
-          total, maintenance: card.maintenance || 0, brave_mode: null,
+          total, maintenance: entryMaintenance(state, cards, card), brave_mode: null,
           allow_sacrifice: false, mode: "hand_reaction",
           ...(event==='soul_core_to_count'?{completion_sink:state.deferredPlayCompletions}:{}) })) {
           if (reaction.name_restriction) state.handReactionNames.add(reaction.name_restriction);
@@ -6144,8 +6347,8 @@
     }
   }
 
-  function moveKourinSoul(state, host, destination) {
-    const source = kourinSoulSource(state, host, destination);
+  function moveKourinSoul(state, cards, host, destination) {
+    const source = kourinSoulSource(state, cards, host, destination);
     if (source === "reserve") {
       state.reserve -= 1;
       state.reserveHasSoul = false;
@@ -6154,7 +6357,7 @@
       state.lifeReducedThisTurn = true;
       state.lifeHasSoul = false;
     } else if (source === "field") {
-      const holder = soulFieldHolder(state, host);
+      const holder = soulFieldHolder(state, cards, host);
       holder.cores -= 1;
       holder.soul_core = false;
     } else return false;
@@ -6252,9 +6455,9 @@
     const candidate = cards[cardNo];
     if (!candidate || !summonConditionsMet(candidate, state, cards)) return null;
     const mode = braveMode(candidate, state, cards);
-    const total = mode === "combine" ? pay : pay + (candidate.maintenance || 0);
+    const total = mode === "combine" ? pay : pay + entryMaintenance(state,cards,candidate);
     // 自分の場を壊してまでは出さない(Python同一)。
-    if (total > reclaimable(state, false, cards)) return null;
+    if (!costAffordable(state, cards, pay, total, false)) return null;
     return { mode, total };
   }
 
@@ -6267,7 +6470,7 @@
       brave_mode: mode, printed_cost_waived: pay === 0, pay,
       ...(trigger ? { trigger } : {}) });
     return play(state, cards, targets, { card_no: cardNo, pay, total,
-      maintenance: cards[cardNo].maintenance || 0,
+      maintenance: entryMaintenance(state, cards, cards[cardNo]),
       brave_mode: mode, allow_sacrifice: false, mode: "normal",
       manifestation_creator_uid: null, source_zone_name: zoneName,
       derived_play: true, suppress_summon_effects: suppressSummonEffects });
@@ -6364,7 +6567,7 @@
         const candidate = cards[cardNo];
         if (!candidate?.is_brave || !summonConditionsMet(candidate, state, cards)) return;
         const mode = braveMode(candidate, state, cards);
-        const total = mode === "combine" ? 0 : (candidate.maintenance || 0);
+        const total = mode === "combine" ? 0 : entryMaintenance(state,cards,candidate);
         if (total > reclaimable(state, true, cards)) return;
         choices.push({ cardNo, zoneName, index, mode, total,
           zoneRank: zoneName === "trash" ? 0 : 1,
@@ -6386,7 +6589,7 @@
       source: selected.zoneName, source_card_no: sourceCardNo,
       brave_mode: selected.mode, printed_cost_waived: true });
     return play(state, cards, targets, { card_no: selected.cardNo,
-      pay: 0, total: selected.total, maintenance: cards[selected.cardNo].maintenance || 0,
+      pay: 0, total: selected.total, maintenance: entryMaintenance(state, cards, cards[selected.cardNo]),
       brave_mode: selected.mode, allow_sacrifice: true,
       mode: "soul_paid_free_summon" });
   }
@@ -6866,7 +7069,17 @@
     state.effectWindowSeq += 1;
     const windowId = `turn${state.turn}:effect-window:${state.effectWindowSeq}`;
     const completed = new Set();
+    const ready = new Map(instances.filter(instance => candidateLegal
+      && instance.clauses.some(effect => effect.opponent_spirit_absent))
+      .map(instance => [instance.instance_id, Boolean(candidateLegal(instance))]));
+    let lastDepth = 0;
     while (completed.size < instances.length) {
+      for (const instance of instances) {
+        if (!ready.has(instance.instance_id) || completed.has(instance.instance_id)) continue;
+        const legalNow = Boolean(candidateLegal(instance));
+        if (legalNow && !ready.get(instance.instance_id)) instance.priority_depth = lastDepth + 1;
+        ready.set(instance.instance_id, legalNow);
+      }
       // 解決のたびに残候補を取り直す。後続で誘発収集を共通化しても、
       // この選択契約を変えずに候補を追加できる形にしておく。
       const completedBlocks = new Set(instances
@@ -6952,6 +7165,7 @@
         }
         return (selected.run || resolveInstance)(selected);
       };
+      lastDepth = selected.priority_depth;
       const generated = [...(executeDestroyEffect(state, () => executeHandEffect(state,
         runSelected)) || [])];
       if (options.stop?.()) return;
@@ -6961,6 +7175,10 @@
           state.uTriggerHits.get(`${clause.requires_u_hit}@${selected.source_uid}`) || [])) state.blockTurnUsed.add(key);
       }
       const discards = mergeDerived ? state.pendingDiscardSummons.splice(discardMark) : [];
+      for (let i=0; i<state.deferredFieldLeaves.length;) {
+        if (state.deferredFieldLeaves[i].effectBoundary) state.deferredFieldLeaves.splice(i,1)[0]();
+        else i++;
+      }
       flushCountReactions(state, cards, targets);
       if (mergeDerived) {
         const depth = selected.priority_depth + 1;
@@ -6999,6 +7217,16 @@
               return [];
             },
           });
+        }
+        // 窓の中で条件を読み直す候補(T19、Q30415)。この効果で満たしたら、この効果の
+        // 派生として1段深く入れ、見張りから外す(Python `collect_derived`同一)。
+        const watchers = options.watchers || [];
+        for (const watch of [...watchers]) {
+          const instance = watch(selected, depth, derived.length);
+          if (instance) {
+            watchers.splice(watchers.indexOf(watch), 1);
+            derived.push(instance);
+          }
         }
         if (derived.length) {
           // 選んだ効果の続き(「そうしたとき」が見出しの読み違いで別ブロックに割れ、
@@ -7376,7 +7604,7 @@
     const soulCardNo = candidate.kourin_soul_card_no;
     if (!state.soulCards.includes(soulCardNo)) return false;
     const destination = isSealedKourin(card) ? "life" : "trash";
-    const maintenance = card.maintenance || 0;
+    const maintenance = entryMaintenance(state, cards, card);
     const traceDetails = { mode: "kourin_from_soul", soul_card_no: soulCardNo,
       pay: 0, total: maintenance };
     record(state, cards, "play_presented", { card_no: candidate.card_no, ...traceDetails });
@@ -7394,7 +7622,7 @@
     state.uid += 1;
     const uid = state.uid;
     state.field.push({ uid, card_no: candidate.card_no, cores: maintenance,
-      floor: maintenance, symbols: card.symbols || {}, brave_mode: null,
+      floor: cards[card.card_no].maintenance || 0, symbols: card.symbols || {}, brave_mode: null,
       creator_core: (card.lineages || []).includes("創界神"), waiting: false,
       exhausted: false, soul_core: false, kourin_stack: [soulCardNo] });
     if (maintenance) {
@@ -7441,9 +7669,9 @@
     host.card_no = candidate.card_no;
     host.symbols = card.symbols || {};
     host.brave_mode = null;
-    host.floor = (card.maintenance || 0) + (host.level_cost_bonus || 0);
+    host.floor = (cards[candidate.card_no].maintenance || 0) + (host.level_cost_bonus || 0);
     if (isFKourin(card) && hasContractBase(host, state.fieldCoreKourinNo)) {
-      while (host.cores < host.floor) {
+      while (host.cores < unitFloor(state, cards, host)) {
         const source = state.field.filter((unit) => unit.uid !== host.uid
           && !unit.waiting && !unit.soul_core && unit.cores > 0)
           .sort((left, right) => Number(left.card_no !== state.bugNo)
@@ -7451,7 +7679,7 @@
         if (source) {
           source.cores -= 1;
           host.cores += 1;
-          if (source.cores < source.floor) {
+          if (source.cores < unitFloor(state, cards, source)) {
             // コア移動はファラ自身の効果。離れたバグは新しくF契約煌臨した白の
             // スピリットの契約土台として下へ入る。
             if (source.card_no === state.bugNo) {
@@ -7572,8 +7800,13 @@
     if (candidate.manifestation_creator_uid !== null
         && candidate.manifestation_creator_uid !== undefined
         && !payManifestation(state, cards, candidate.manifestation_creator_uid)) return false;
-    const deficit = candidate.total - state.reserve;
-    if (deficit > 0 && !fundPayment(state, cards, targets, deficit, candidate.allow_sacrifice)) return false;
+    if (!costAffordable(state, cards, candidate.pay, candidate.total, candidate.allow_sacrifice)) return false;
+    const funding = candidate.total > state.reserve || (candidate.pay && reserveCostBanned(state));
+    if (funding) beginEffectFrame(state);
+    if (!fundCost(state, cards, targets, candidate.pay, candidate.total, candidate.allow_sacrifice)) {
+      if (funding) endEffectFrame(state);
+      return false;
+    }
     // 手札を経由しない配置(ドライビングフォースのフラッグネクサス、バーストの
     // 自己召喚)は手札を触らない。経由させると、同名カードが手札にもあるとき
     // **別の1枚が消えて並びがずれる**(Python側はどちらもゾーンから直接出す)。
@@ -7596,16 +7829,20 @@
     const preferSoulForPay = Boolean(card.soul_paid_on_play && state.reserveHasSoul
       && candidate.pay > 0
       && [...state.hand, ...state.trashCards].some((cardNo) => cards[cardNo]?.is_brave));
-    const soulCoreUsedForSummonCost = Boolean(preferSoulForPay
+    let soulCoreUsedForSummonCost = Boolean(preferSoulForPay
       || (state.reserveHasSoul
         && candidate.pay > state.reserve - Number(state.reserveHasSoul)));
     if (card.soul_paid_on_play) {
       traceDetails.soul_core_used_for_summon_cost = soulCoreUsedForSummonCost;
     }
+    const soulInTrashBefore = state.trashHasSoul;
     const soulForUnit = payFromReserve(state, candidate.pay,
       candidate.total - candidate.pay, preferSoulForPay);
+    soulCoreUsedForSummonCost = Boolean(state.trashHasSoul && !soulInTrashBefore);
+    if (card.soul_paid_on_play) traceDetails.soul_core_used_for_summon_cost = soulCoreUsedForSummonCost;
     state.reserve -= candidate.total;
     state.spent += candidate.pay;
+    if (funding) endEffectFrame(state);
     record(state, cards, "cost_paid", { card_no: candidate.card_no,
       payment: mode === "free_deploy" ? "none"
         : candidate.mode === "manifestation" ? "soul_core_and_cores" : "cores",
@@ -7634,7 +7871,7 @@
     if (!isMagic) {
       state.field.push({ uid, card_no: candidate.card_no,
         cores: candidate.brave_mode === "combine" ? 0 : candidate.maintenance,
-        floor: candidate.brave_mode === "combine" ? 0 : candidate.maintenance,
+        floor: candidate.brave_mode === "combine" ? 0 : (cards[candidate.card_no].maintenance || 0),
         symbols: card.symbols || {}, brave_mode: candidate.brave_mode,
         // 合体先。Python `combined_host_uid` と同一。
         combined_host_uid: combinedHost ? combinedHost.uid : null,
@@ -7810,14 +8047,17 @@
     const fromHand = state.hand.includes(cardNo);
     if (total === null || total === undefined
         || !(fromHand || sidePool(state, cards, "mirage_set").includes(cardNo))
-        || total > reclaimable(state, true, cards)) return false;
-    const deficit = total - state.reserve;
-    if (deficit > 0 && !fundPayment(state, cards, targets, deficit, true)) return false;
+        || !costAffordable(state, cards, total, total, true)) return false;
+    beginEffectFrame(state);
+    if (!fundCost(state, cards, targets, total, total, true)) {
+      endEffectFrame(state);return false;
+    }
     const zone = fromHand ? state.hand : state.sideCards;
     zone.splice(zone.indexOf(cardNo), 1);
     payFromReserve(state, total, 0);
     state.reserve -= total;
     state.spent += total;
+    endEffectFrame(state);
     if (state.mirage) {
       zone.push(state.mirage);
       if (fromHand) {
@@ -7932,7 +8172,7 @@
         trash_has_soul: state.trashHasSoul,
         field_cores: state.field.filter((unit) => !unit.waiting)
           .slice().sort((left, right) => left.uid - right.uid)
-          .map((unit) => [unit.uid, unit.card_no, unit.cores, unit.floor,
+          .map((unit) => [unit.uid, unit.card_no, unit.cores, unitFloor(state, cards, unit),
             Boolean(unit.soul_core)]),
       };
     }
@@ -8193,7 +8433,7 @@
       field: state.field.filter((unit) => !unit.waiting)
         .slice().sort((left, right) => left.uid - right.uid)
         .map((unit) => ({ uid: unit.uid, card_no: unit.card_no, cores: unit.cores,
-          floor: unit.floor, soul_core: Boolean(unit.soul_core),
+          floor: unitFloor(state, cards, unit), soul_core: Boolean(unit.soul_core),
           brave_mode: unit.brave_mode ?? null })),
     });
     const choiceMode = (candidate) => candidate.mode || "normal";
@@ -8354,15 +8594,19 @@
    *  対象選択と除去見込みが共有する。Python `target_lower_bounds_admit` と同一。 */
   const TARGET_LOWER_BOUND_KEYS = ["target_bp_min", "target_cost_min",
     "target_symbols_min", "target_cost_in"];
+  function targetCost(spec, row) {
+    return row.cost - (spec.ignore_brave_cost ? row.brave_cost || 0 : 0);
+  }
   function targetLowerBoundsAdmit(spec, row) {
     for (const [key, field] of [["target_bp_min", "bp"], ["target_cost_min", "cost"],
       ["target_symbols_min", "symbol_count"]]) {
-      if (spec[key] !== null && spec[key] !== undefined && row[field] < spec[key]) {
+      const value = field === "cost" ? targetCost(spec, row) : row[field];
+      if (spec[key] !== null && spec[key] !== undefined && value < spec[key]) {
         return false;
       }
     }
     const listed = spec.target_cost_in;
-    return listed === null || listed === undefined || listed.includes(row.cost);
+    return listed === null || listed === undefined || listed.includes(targetCost(spec, row));
   }
 
   /** 相手の除去(`removal_threats`の1件)がこの体を対象に取れるか。耐性は見ない。
@@ -8374,7 +8618,8 @@
     }
     for (const [key, field] of [["target_bp_max", "bp"], ["target_cost_max", "cost"],
       ["target_symbols_max", "symbol_count"], ["target_cores_max", "cores"]]) {
-      if (threat[key] !== null && threat[key] !== undefined && row[field] > threat[key]) {
+      const value = field === "cost" ? targetCost(threat, row) : row[field];
+      if (threat[key] !== null && threat[key] !== undefined && value > threat[key]) {
         return false;
       }
     }
@@ -8415,6 +8660,7 @@
       for (const key of TARGET_LOWER_BOUND_KEYS) {
         if (effect[key] !== null && effect[key] !== undefined) row[key] = effect[key];
       }
+      if (effect.ignore_brave_cost) row.ignore_brave_cost = true;
       for (const [key, field] of [["target_bp_max", "bp"], ["target_cost_max", "cost"],
         ["target_symbols_max", "symbol_count"]]) {
         if (effect[`${key}_ref`] !== "self") continue;
@@ -8462,7 +8708,7 @@
 
   /** ソウルコアをtargetへ動かす(メインステップ)。体の上からはリザーブの通常コアと
    *  入れ替えて体のコア数を保つ。Python `_move_soul_to` と同一。 */
-  function moveSoulTo(state, target) {
+  function moveSoulTo(state, cards, target) {
     const holder = soulHolder(state);
     if (holder === null || holder === target) return null;
     const moves = [];
@@ -8474,7 +8720,7 @@
       if (state.reserve - Number(state.reserveHasSoul) > 0) {
         state.reserve -= 1;
         moves.push(["reserve", "field", null, holder, "soul_position_swap"]);
-      } else if (unit.cores - 1 < unit.floor) {
+      } else if (unit.cores - 1 < unitFloor(state, cards, unit)) {
         return null;
       } else {
         unit.cores -= 1;
@@ -8530,7 +8776,7 @@
       const trial = clone(state);
       trial.trace = false;
       trial.events = [];
-      if (target !== current && moveSoulTo(trial, target) === null) continue;
+      if (target !== current && moveSoulTo(trial, cards, target) === null) continue;
       measured.set(target, {
         through: through(trial),
         rows: new Map(combatFieldRows(trial, cards).map((row) => [row.uid, row])),
@@ -8597,7 +8843,7 @@
   /** 選んだ場所へ実際に動かし、`core_moved`を書く。Python `_apply_soul_position` と同一。 */
   function applySoulPosition(state, cards, plan) {
     for (const [source, destination, sourceUid, targetUid, reason]
-      of moveSoulTo(state, plan.target) || []) {
+      of moveSoulTo(state, cards, plan.target) || []) {
       recordCoreMove(state, cards, { amount: 1, source, destination, reason,
         source_uid: sourceUid, target_uid: targetUid });
       if (destination === "field" && reason === "soul_position") {
@@ -8729,6 +8975,13 @@
   // ---- Stage6B の戦闘用インターフェース ---------------------------------
   // Python側 `stage4_sim.py` の `_combat_*` と同じ規約。片方だけ変えると
   // Python/Worker の棋譜が食い違うので、必ず両方そろえて直すこと。
+  function combatCostRow(state, cards, unit, card) {
+    const braveCost = combinedBraves(state, unit.uid)
+      .reduce((sum, brave) => sum + (unitInfo(state, cards, brave)?.cost || 0), 0);
+    // 神話Braveと合体中のネクサスはunitInfoで既に加算している。
+    return {cost:(card.cost || 0) + ((card.card_type || '').includes('ネクサス') ? 0 : braveCost),
+      ...(braveCost ? {brave_cost:braveCost} : {})};
+  }
   function combatUnitRow(state, cards, unit) {
     const card = unitInfo(state, cards, unit) || {};
     const view = stateView(state, cards).field.find((row) => row.uid === unit.uid);
@@ -8745,9 +8998,8 @@
       card_no: unit.card_no,
       card_type: card.card_type,
       ...(effectsSuppressed(state, unit) ? {effects_suppressed:true} : {}),
-      // 印字のコスト(軽減前)。『ライフ保護』の「コストN以上のアタックでは」が
-      // これで判定する(6C-2B)。Python `_combat_unit_row` と同一。
-      cost: card.cost || 0,
+      // 現在のコスト(合体中のBrave込み)。Pythonの対象行と同じ値。
+      ...combatCostRow(state, cards, unit, card),
       bp: view ? view.bp : (card.base_bp || 0),
       // ライフ減少量は「アタックしたスピリットやアルティメットのシンボルと
       // 同じ数だけ」(公式ルール eternal page08)。旗のシンボル追加も数える。
@@ -8862,7 +9114,7 @@
         ...(effectsSuppressed(state, unit) ? {effects_suppressed:true} : {}),
           ...(card.is_brave && unit.brave_mode !== "combine" ? {spirit_state: true} : {}),
           bp: row ? row.bp : (card.base_bp || 0),
-          cost: card.cost || 0,
+          ...combatCostRow(state, cards, unit, card),
           // 今のLv(公開情報、「Lv合計4まで」用、2026-10-12、Python同一)。
           level: levelFor(unit, cards, state),
           // 「シンボル2つ以下の相手のスピリット」用。数え方も窓も打点と同じ
@@ -8874,7 +9126,7 @@
           soul_core: Boolean(unit.soul_core),
           cores: unit.cores,
           // Lv1維持コア。「あと何個抜けば消滅するか」の計算に要る。
-          floor: unit.floor,
+          floor: unitFloor(state, cards, unit),
           ...(unit.brave_mode === 'combine' && (cards[state.field.find(h => h.uid === unit.combined_host_uid)?.card_no]?.card_type || '').includes('ネクサス') ? {nexus_combined:true} : {}),
           // 今効いている耐性(v66、Python `_active_resistances`)。耐性があるカードだけ。
           ...activeResistances(state, cards, unit),
@@ -9124,7 +9376,7 @@
       }
       if (effect.target_levels?.length && !effect.target_levels.includes(row.level)) return false;
       if (bpMax !== null && bpMax !== undefined && row.bp > bpMax) return false;
-      if (costMax !== null && costMax !== undefined && row.cost > costMax) return false;
+      if (costMax !== null && costMax !== undefined && targetCost(effect, row) > costMax) return false;
       // 下限と列挙(「BP10000以上」「コスト6/7/8」、2026-10-11、Python同一)。
       if (!targetLowerBoundsAdmit(effect, row)) return false;
       // 「回復状態の」は疲労も重疲労もしていないもの。「疲労状態の」は重疲労を
@@ -9161,7 +9413,8 @@
       if (effect.kind === "unit_heavy_exhaust" && row.heavy_exhausted) return false;
       return true;
     });
-    rows.sort(COMBAT_TARGET_ORDERS[effect.target_order || "bp_desc"]);
+    const order = COMBAT_TARGET_ORDERS[effect.target_order || "bp_desc"];
+    rows.sort((a, b) => order({...a,cost:targetCost(effect,a)}, {...b,cost:targetCost(effect,b)}));
     // 「…を相手が破壊する」(2026-10-12)は相手が選ぶ。こちらの狙いは効かない(Python同一)。
     if (effect.target_chooser === "opponent") {
       rows.sort(opponentChoiceOrder(effect.kind));
@@ -9421,8 +9674,8 @@
         // Placement from trash is not a hand play or a second core payment.
         // Keep the same entry and trigger boundary as Python's redeploy path.
         const watcherUnits = [...state.field], uid = ++state.uid;
-        state.field.push({ uid, card_no: picked, cores: card.maintenance || 0,
-          floor: card.maintenance || 0, symbols: card.symbols || {}, brave_mode: null,
+        state.field.push({ uid, card_no: picked, cores: entryMaintenance(state, cards, card),
+          floor: cards[card.card_no].maintenance || 0, symbols: card.symbols || {}, brave_mode: null,
           combined_host_uid: null, creator_core: true, waiting: false,
           exhausted: false, soul_core: false, kourin_stack: [] });
         state.played.add(picked);
@@ -9457,7 +9710,7 @@
       const brave = braveMode(card, state, cards);
       const cost = paymentForState(state, cards, card, "outside");
       if (brave === "combine") cost.total = cost.pay;
-      if (cost.total > reclaimable(state, true, cards)) continue;
+      if (!costAffordable(state, cards, cost.pay, cost.total, true)) continue;
       const discarded = state.hand.map((candidate, index) => ({ candidate, index,
         tier: accessTier(candidate, cards, targets), cost: cards[candidate]?.cost || 0 }))
         .sort((a, b) => b.tier - a.tier || b.cost - a.cost || b.index - a.index)[0];
@@ -9471,7 +9724,7 @@
       record(state, cards, "trash_summon_declared", { card_no: cardNo,
         once_per_game_same_name: true, pays_normal_cost: true });
       return play(state, cards, targets, { card_no: cardNo, ...cost,
-        maintenance: card.maintenance || 0, brave_mode: brave,
+        maintenance: entryMaintenance(state, cards, card), brave_mode: brave,
         allow_sacrifice: true, mode: "trash_main_summon" });
     }
     return false;
@@ -9528,6 +9781,13 @@
         sources.push([null, soulEffect, soulNo, false]);
       }
     }
+    // トラッシュの実カード(T19、Python同一)。ステップに入った時点の札を1枚ずつ。
+    const trashSources = [];
+    for (const trashNo of [...state.trashCards]) {
+      for (const effect of cards[trashNo]?.trash_effects || []) {
+        if (wanted(effect, null)) trashSources.push([trashNo, effect]);
+      }
+    }
     const stacked = new Set();
     const chosen = new Set();
     const decidedAlternatives = new Map();
@@ -9579,6 +9839,28 @@
         }
         flushCountReactions(state, cards, targets);
         resolved.push({ card_no: cardNo, uid: uid ?? null, kind: effect.kind });
+        noteLegalCandidates(state, cards, targets);
+      }
+      // トラッシュの発揮元は場の後。解決の時点でまだトラッシュに在る札だけ。
+      // 〔ターンに1回：同名〕は同名の別の札とも共有する(Python同一)。
+      for (const [trashNo, effect] of trashSources) {
+        if (!state.trashCards.includes(trashNo)) continue;
+        const key = effect.block_turn_limit === "once_per_turn_name"
+          ? `trash_name\u0000${cards[trashNo].name}\u0000${effect.effect_block_id ?? ""}` : null;
+        if (key !== null && state.blockTurnUsed.has(key)) continue;
+        state.stepSourceOnField = false;
+        try {
+          if (!effectActive(effect, state, cards, null)) continue;
+          record(state, cards, "step_effect", {
+            step: recordStep, card_no: trashNo, uid: null, effect_kind: effect.kind,
+          });
+          resolveEffect(state, cards, targets, effect, null);
+        } finally {
+          state.stepSourceOnField = true;
+        }
+        if (key !== null) state.blockTurnUsed.add(key);
+        flushCountReactions(state, cards, targets);
+        resolved.push({ card_no: trashNo, uid: null, kind: effect.kind });
         noteLegalCandidates(state, cards, targets);
       }
     } finally {
@@ -9791,7 +10073,7 @@
     if (state.lifeHasSoul) return state.life>1 ? {source:"life",holder:null,target} : null;
     const unit = [...state.field].sort((a,b)=>a.uid-b.uid).find(row=>row.soul_core);
     if (!unit || unit.waiting || isCreatorNexus(cards,unit)
-        || (unit.uid===sourceUid && unit.cores-1<unit.floor)) return null;
+        || (unit.uid===sourceUid && unit.cores-1<unitFloor(state, cards, unit))) return null;
     return {source:"field",holder:unit.uid,target};
   }
 
@@ -9805,7 +10087,7 @@
     recordCoreMove(state,cards,{amount:1,source,destination:"field",reason:"deck_discard_protection",source_card_no:sourceNo,source_uid:holder,target_uid:target});
     notifySoulCorePlaced(state, cards, targets, target);
     const donor=state.field.find(row=>row.uid===holder);
-    if (donor && donor.cores<donor.floor) finalizeFieldLeave(state,cards,donor,"own_effect");
+    if (donor && donor.cores<unitFloor(state, cards, donor)) finalizeFieldLeave(state,cards,donor,"own_effect");
   }
 
   function resolveDeckDiscardInterrupt(state, cards, targets, opponent, sourceType, sourceUid) {
@@ -9887,7 +10169,7 @@
         record(state, cards, "card_moved", {card_no:no,source:"hand",destination:"trash",reason:"deck_discard_protection"});
       } else if (reaction.kind === "flash") {
         const cost = paymentForState(state, cards, cards[no], "hand");
-        if (cost.total > reclaimable(state, false, cards)) continue;
+        if (!costAffordable(state, cards, cost.pay, cost.total, false)) continue;
         play(state, cards, targets, {card_no:no,...cost,maintenance:0,allow_sacrifice:false,mode:"deck_discard_protection",brave_mode:null});
       } else continue;
       state.deckDiscardProtection = reaction.scope;
@@ -9933,6 +10215,11 @@
     // `board`に束ねてから返す。`remove_cores`がコア0のユニットを破壊するとき、
     // 同じ盤面の`destroy`を呼ぶため(毎回作り直すと意図が読みにくい)。
     const board = {
+      level_cost_source: effect?.kind === 'level_cost_increase' ? {card_type:source?.card_type ?? null,colors,cost:source?.cost ?? null,
+        context:{own_turn:state.ownTurnActive,source_has_soul:unit?Boolean(unit.soul_core):null,
+          source_level:unit?levelFor(unit,cards,state):null,
+          controller_symbol_colors:Object.entries(effectiveSymbols(state,cards)).filter(([,n])=>n>0).map(([c])=>c).sort()}} : null,
+      battle_uid: uid=>battleUid(state,uid),
       defer_opponent_effect_reaction: reaction => {
         const other=state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
         if (!other?.resolve_effect_reaction) return false;
@@ -9981,7 +10268,7 @@
           beginEffectFrame(state);
           try {
             play(state, cards, targets, {card_no: no, pay: cost.pay, total: plan.total,
-              maintenance: card.maintenance, brave_mode: plan.mode, allow_sacrifice: false,
+              maintenance: entryMaintenance(state,cards,card), brave_mode: plan.mode, allow_sacrifice: false,
               mode: "shadow", derived_play: true});
             const uid = state.uid;
             record(state, cards, "event_trigger_effect", {card_no: no, uid,
@@ -9999,6 +10286,16 @@
       units: () => combatUnits(state, cards),
       is_combined: uid => Boolean(combinedBraves(state, uid).length),
       in_battle: () => state.battleActive,
+      has_spirit: () => state.field.some(unit =>
+        (unitInfo(state, cards, unit).card_type || '').includes('スピリット')
+        || (unitInfo(state, cards, unit).is_brave && unit.brave_mode !== 'combine')),
+      defer_field_leave: callback => {
+        callback.effectBoundary = true;
+        deferFieldLeave(state, callback);
+      },
+      restrict_reserve_payment: minimum => {
+        state.paymentRestrictions = [{min_reserve:minimum, scope:'battle'}];
+      },
       battling_uid: () => state.battleActive ? state.battlingUid : null,
       resolve_main_activated: () => resolveMainActivatedEffects(state, cards, targets),
       suppress_effects: (uid) => {
@@ -10008,12 +10305,15 @@
         record(state, cards, "effects_suppressed", {card_no:unit.card_no,uid,scope:"turn"});
         return true;
       },
-      increase_level_cost: (uid, amount, opponent = null) => {
+      increase_level_cost: (uid, amount, opponent = null, allEffect = null) => {
         const uids = Array.isArray(uid) ? uid : [uid];
         const units = [...new Set(uids)].map(n => state.field.find(row => row.uid === n))
           .filter(unit => unit && !unit.waiting);
-        if (!units.length || amount <= 0) return false;
-        for (const unit of units) {
+        if ((!units.length && !allEffect) || amount <= 0) return false;
+        if (allEffect) {
+          state.timedLevelCostIncreases.push({amount,scope:'turn',target_types:[...allEffect.target_types],
+            source:structuredClone(opponent.level_cost_source),pierce:structuredClone(allEffect.pierce || [])});
+        } else for (const unit of units) {
           unit.level_cost_bonus = (unit.level_cost_bonus || 0) + amount;
           unit.floor += amount;
         }
@@ -10021,9 +10321,16 @@
           record(state, cards, "level_cost_changed", {card_no:unit.card_no,uid:unit.uid,amount,scope:"turn"});
         }
         for (const unit of units) {
-          if (unit.cores < unit.floor) {
-            notifyOwnRemovedByOpponentEffect(state,cards,targets,unit,opponent);
-            finalizeFieldLeave(state,cards,unit,"effect");
+          if (unit.cores < unitFloor(state, cards, unit)) {
+            const completeLeave = () => {
+              notifyOwnRemovedByOpponentEffect(state,cards,targets,unit,opponent);
+              finalizeFieldLeave(state,cards,unit,"effect");
+            };
+            if (opponent?.defer_field_leave) {
+              unit.waiting = true;
+              record(state, cards, 'field_leave_queued', {card_no:unit.card_no, uid:unit.uid, cause:'effect'});
+              opponent.defer_field_leave(completeLeave);
+            } else completeLeave();
           }
         }
         return true;
@@ -10037,6 +10344,7 @@
         state.opponentView = summary ? { ...summary } : null;
         if (opponentBoard) MAIN_STEP_OPPONENTS.set(state, opponentBoard);
         else MAIN_STEP_OPPONENTS.delete(state);
+        syncLifeCapObservers(state, cards);
       },
       // 相手の効果が対象にできる場のカード全部(ネクサスも含む)。`units`は
       // アタック/ブロックの候補なのでスピリット系しか並べないが、破壊の対象には
@@ -10077,7 +10385,7 @@
         else if (destination === "trash") state.spent += taken;
         recordCoreMove(state, cards, { amount: taken, source: "field",
           destination, reason: "unit_core_remove", source_uid: uid });
-        if (unit.cores < unit.floor) {
+        if (unit.cores < unitFloor(state, cards, unit)) {
           notifyOwnRemovedByOpponentEffect(state,cards,targets,unit);
           finalizeFieldLeave(state, cards, unit, "effect");
         }
@@ -10101,7 +10409,11 @@
       },
       // バトル／ターンの終わりに、その期間のBP修正を捨てる。
       end_battle: () => {
+        state.paymentRestrictions = [];
+        state.battleReplacements = {};
         state.spiritLifeTakenAttack = {};
+        state.lifeSourceCapStarts = Object.fromEntries(Object.entries(state.lifeSourceCapStarts)
+          .filter(([, row]) => row.protection !== "per_source_attack"));
         state.attackingUid = null;
         state.battlingUid = null;
         state.battleActive = false;
@@ -10120,14 +10432,19 @@
         }
         state.lifeProtections = state.lifeProtections.filter(
           (row) => row.scope !== "battle");
+        syncLifeCapObservers(state, cards);
       },
       // 「次の自分のエンドステップまで」の保護(`own_end_step`)は残す。Stage6は
       // どちらの手番の終わりでも両方の盤面を叩くので、消すのは自分のエンドステップ
       // (`expireOwnEndStepProtections`)。Python `_combat_end_turn_modifiers` と同一。
       end_turn_modifiers: () => {
+        state.paymentRestrictions = [];
+        state.timedLevelCostIncreases = [];
+        state.battleReplacements = {};
         state.mirageFlashUsed.clear();
         state.spiritLifeTaken = {};
         state.spiritLifeTakenAttack = {};
+        state.lifeSourceCapStarts = {};
         for (const unit of state.field) delete unit.u_reflected_battle;
         state.timedAttackBans = [];
         state.attackStepLocks = [];
@@ -10151,6 +10468,7 @@
         }
         state.lifeProtections = state.lifeProtections.filter(
           (row) => row.scope === "own_end_step");
+        syncLifeCapObservers(state, cards);
       },
       // 『ライフ保護』を1つ効かせる(6C-2B)。期限は`scope`。保護は**盤面の状態**で
       // ユニットには紐づかないので、発揮元が場を離れても切れない。
@@ -10201,7 +10519,7 @@
         const { total } = paymentFor(card, symbols, state.count, grantHit);
         const nextTurnPublicCores = state.reserve + state.trash + 1 + unit.cores
           + state.field.filter((other) => other.uid !== uid && !other.waiting)
-            .reduce((sum, other) => sum + Math.max(0, other.cores - other.floor), 0);
+            .reduce((sum, other) => sum + Math.max(0, other.cores - unitFloor(state, cards, other)), 0);
         const onPlay = (card.enablers || []).filter(
           (effect) => effect.mode === "on_play").length;
         return 20 + (total <= nextTurnPublicCores ? 60 : 15)
@@ -10251,7 +10569,7 @@
         recordCoreMove(state, cards, { amount: 1,
           source: holder === "reserve" ? "reserve" : "field", destination,
           reason: "soul_core_remove", source_uid: holder === "reserve" ? null : holder });
-        if (unit && unit.cores < unit.floor) {
+        if (unit && unit.cores < unitFloor(state, cards, unit)) {
           notifyOwnRemovedByOpponentEffect(state,cards,targets,unit);
           finalizeFieldLeave(state, cards, unit, "effect");
         }
@@ -10403,7 +10721,7 @@
             beginEffectFrame(state);
             try {
               play(state, cards, targets, { card_no: cardNo, pay: cost.pay, total: plan.total,
-                maintenance: card.maintenance, brave_mode: plan.mode, allow_sacrifice: false,
+                maintenance: entryMaintenance(state,cards,card), brave_mode: plan.mode, allow_sacrifice: false,
                 mode: "trigger_counter", derived_play: true });
               const uid = state.uid;
               const effect = { kind: "unit_destroy", amount: 1, target_types: ["アルティメット"],
@@ -10426,12 +10744,11 @@
             if (!source || source.card_type !== "アルティメット" || opponent?.battling_uid?.() !== uSourceUid) continue;
           } else if (!(counter[suppress ? "hit_colors" : "guard_colors"] || []).some((color) => colors.has(color))) continue;
           const cost = paymentForState(state, cards, card, "hand");
-          if (cost.total > reclaimable(state, false, cards)) continue;
+          if (!costAffordable(state, cards, cost.pay, cost.total, false)) continue;
           const traceDetails = { mode: "trigger_counter", pay: cost.pay, total: cost.total };
           record(state, cards, "play_presented", { card_no: cardNo, ...traceDetails });
           record(state, cards, "cost_calculated", { card_no: cardNo, ...traceDetails });
-          const deficit = cost.total - state.reserve;
-          if (deficit > 0) fundPayment(state, cards, targets, deficit, false);
+          fundCost(state, cards, targets, cost.pay, cost.total, false);
           payFromReserve(state, cost.pay, cost.total - cost.pay);
           state.reserve -= cost.total;
           state.spent += cost.pay;
@@ -10524,15 +10841,17 @@
         const protectedAmount = lifeDamageAfterProtection(
           state, Math.max(amount, 0), attacker, ownEffect);
         const key = lifeSourceKey(source, ownEffect);
+        syncLifeCapObservers(state, cards);
         const inBattle = state.battleActive || [source?.board, MAIN_STEP_OPPONENTS.get(state),
           state.combatOpponent].some(board => board?.in_battle?.());
         let cappedAmount = protectedAmount;
         if (key !== null) {
           const other = source.opponent_board || (!ownEffect ? source.board : null);
-          const caps = [...lifeSourceCaps(state, cards), ...(other?.life_source_caps?.(false) || [])];
-          const liveSource = caps.some(rule => rule.attacker_symbol_min)
+          const caps = [...lifeSourceCaps(state, cards).map(rule => ["self", rule]),
+            ...(other?.life_source_caps?.(false) || []).map(rule => ["opponent", rule])];
+          const liveSource = caps.some(([, rule]) => rule.attacker_symbol_min)
             ? source.board?.field?.().find(u => u.uid === source.uid) || source : source;
-          for (const rule of caps) {
+          for (const [side, rule] of caps) {
             if (!(rule.attacker_types || ["スピリット"]).includes(lifeSourceType(source))) continue;
             if (rule.protection === "per_source_attack" && !inBattle) continue;
             if (rule.scope === "self" && ownEffect) continue;
@@ -10541,7 +10860,11 @@
             }
             if ((liveSource.symbol_count || 0) < (rule.attacker_symbol_min || 0)) continue;
             const ledger = rule.protection === "per_source_attack" ? state.spiritLifeTakenAttack : state.spiritLifeTaken;
-            cappedAmount = Math.min(cappedAmount, Math.max(0, rule.amount - (ledger[key] || 0)));
+            const capKey = `${side}:${rule._life_cap_id}|${key}`;
+            const interval = state.lifeSourceCapStarts[capKey] ||= {
+              protection: rule.protection, start: ledger[key] || 0};
+            cappedAmount = Math.min(cappedAmount,
+              Math.max(0, rule.amount - ((ledger[key] || 0) - interval.start)));
           }
         }
         const ordinary = state.life - Number(Boolean(state.lifeHasSoul));
@@ -10568,6 +10891,8 @@
         return taken;
       },
       life_source_caps: (ownLife = true) => lifeSourceCaps(state, cards, ownLife),
+      has_life_source_caps: () => state.hasLifeSourceCaps,
+      sync_life_cap_starts: () => syncLifeCapStarts(state, cards),
       // 印字の『アタック時』『ブロック時』の窓(6B-1②)と、その下位の窓
       // (6C: 『ブロックされたとき』『バトル終了時』)。Python
       // `_combat_resolve_trigger`と同じで、**ここが唯一の入口**——メイン
@@ -10666,7 +10991,7 @@
           const card = cards[cardNo] || {};
           for (const effect of card.flash_effects || []) {
             const cost = paymentForState(state, cards, card);
-            if (cost.total > reclaimable(state, false, cards)) continue;
+            if (!costAffordable(state, cards, cost.pay, cost.total, false)) continue;
             options.push({ card_no: cardNo, hand_index: handIndex,
               kind: effect.kind, flash_when: effect.flash_when,
               // 『ライフ保護』の中身。方針は実際に減る量が減るかで選ぶ。
@@ -10689,13 +11014,12 @@
           (row) => (row.effect_id ?? null) === effectId);
         if (!effect) return null;
         const cost = paymentForState(state, cards, card);
-        if (cost.total > reclaimable(state, false, cards)) return null;
+        if (!costAffordable(state, cards, cost.pay, cost.total, false)) return null;
         const traceDetails = { mode: "flash", pay: cost.pay, total: cost.total,
           effect_kind: effect.kind };
         record(state, cards, "play_presented", { card_no: cardNo, ...traceDetails });
         record(state, cards, "cost_calculated", { card_no: cardNo, ...traceDetails });
-        const deficit = cost.total - state.reserve;
-        if (deficit > 0) fundPayment(state, cards, targets, deficit, false);
+        fundCost(state, cards, targets, cost.pay, cost.total, false);
         payFromReserve(state, cost.pay, cost.total - cost.pay);
         state.reserve -= cost.total;
         state.spent += cost.pay;
@@ -10749,8 +11073,7 @@
           effect_kind: effect.kind };
         record(state, cards, "play_presented", { card_no: cardNo, ...traceDetails });
         record(state, cards, "cost_calculated", { card_no: cardNo, ...traceDetails });
-        const deficit = cost.total - state.reserve;
-        if (deficit > 0) fundPayment(state, cards, targets, deficit, false);
+        fundCost(state, cards, targets, cost.pay, cost.total, false);
         payFromReserve(state, cost.pay, cost.total - cost.pay);
         state.reserve -= cost.total;
         state.spent += cost.pay;
@@ -10784,8 +11107,8 @@
         let uid;
         try {
           const before=state.uid;
-          play(state,cards,targets,{card_no:cardNo,pay:0,total:cards[cardNo].maintenance||0,
-            maintenance:cards[cardNo].maintenance||0,
+          play(state,cards,targets,{card_no:cardNo,pay:0,total:entryMaintenance(state, cards, cards[cardNo]),
+            maintenance:entryMaintenance(state, cards, cards[cardNo]),
             mode:"manifestation",manifestation_creator_uid:creatorUid,allow_sacrifice:false,brave_mode:null});
           uid=state.field.find(unit => unit.uid>before && unit.card_no===cardNo)?.uid ?? null;
         } finally {
@@ -10883,6 +11206,7 @@
         state.lifeReducedThisTurn = false;
         state.spiritLifeTaken = {};
         state.spiritLifeTakenAttack = {};
+        state.lifeSourceCapStarts = {};
       },
       resolve_field_flash: (uid) => {
         // `uid`がnullなら魂状態のカードの分(Python同一。Stage6は行のuidを
@@ -10929,6 +11253,21 @@
         // 合体中のブレイヴはホストと1体。宣言するのはホストなので、この窓で発揮する。
         for (const brave of combinedBraves(state, uid)) {
           rows.push(...windowRows(brave.card_no, brave));
+        }
+        // トラッシュの実カードの「自分の合体スピリットがアタックしたとき」(T19、Python同一)。
+        // 発揮元はアタックした時点でトラッシュに在る札だけ(Q30414)。同名縛りは同名で1つ。
+        const trashRows = [];
+        if (window === "attack" && combinedBraves(state, uid).length
+            && (unitInfo(state, cards, unit)?.card_type || "").includes("スピリット")) {
+          for (const trashNo of [...state.trashCards]) {
+            for (const effect of cards[trashNo]?.trash_effects || []) {
+              if (effect.attacker === "own_union_spirit"
+                  && !(effect.block_turn_limit === "once_per_turn_name"
+                    && trashRows.some(([no, row]) => no === trashNo && row === effect))) {
+                trashRows.push([trashNo, effect]);
+              }
+            }
+          }
         }
         // 並べ替えるのは**別の印字効果どうしの既定順**だけ(Python同一)。1つの
         // 印字効果の中の節順は印字のまま保つ——`rows`を並べ替えて束ねると、
@@ -11031,9 +11370,73 @@
               // 任意の自己回復は回復状態なら対価/同名回数を温存(Python同一)。
               && (effect.kind !== "self_refresh"
                 || state.field.find((unit) => unit.uid === uid)?.exhausted)));
+          // トラッシュの発揮元(T19、Python `trash_available`/`resolve_trash_attack`同一)。
+          // 窓を開いた時点で条件を満たせば最初からの候補、満たさなければ効果を1つ解くたびに
+          // 読み直し、満たしたら満たさせた効果の派生として先に置く(Q30415、D27)。
+          const trashAvailable = (instance) => {
+            if (!state.trashCards.includes(instance.source_card_no)
+                || !turnLimitAvailable(state, cards, instance)) return false;
+            state.stepSourceOnField = false;
+            try {
+              return effectActive(instance.clauses[0], state, cards, null);
+            } finally {
+              state.stepSourceOnField = true;
+            }
+          };
+          const resolveTrashAttack = (instance) => {
+            const effect = instance.clauses[0];
+            let ok;
+            state.stepSourceOnField = false;
+            try {
+              record(state, cards, "effect_start", { card_no: instance.source_card_no, uid: null,
+                effect_kind: effect.kind, fired_timing: instance.fired_timing, effect_tag: null, window });
+              ok = resolveEffect(state, cards, targets, effect, null);
+              record(state, cards, "effect_complete", { card_no: instance.source_card_no, uid: null,
+                effect_kind: effect.kind, fired_timing: instance.fired_timing, effect_tag: null,
+                window, resolved: ok });
+            } finally {
+              state.stepSourceOnField = true;
+            }
+            resolved.push({ kind: effect.kind, effect_id: effect.effect_id ?? null,
+              resolved: Boolean(ok) });
+            return [];
+          };
+          const watchers = [];
+          const trashOrder = instances.length;
+          trashRows.forEach(([trashNo, effect], index) => {
+            const base = {
+              instance_id: `${triggerEventId}:${trashNo}#trash:${index}`,
+              effect_block_id: effect.effect_block_id,
+              source_card_no: trashNo,
+              source_uid: null,
+              controller: "self",
+              timing: window,
+              fired_timing: firedEffectTiming(window),
+              trigger_event_id: triggerEventId,
+              clauses: [effect],
+              effect_tag: null,
+              optional: true,
+              dependencies: [],
+              legacy_order: trashOrder + index,
+              priority_depth: 0,
+              runtime_kind: "trash_attack",
+              source_label: `${trashNo}#trash`,
+              run: resolveTrashAttack,
+            };
+            base.legal = () => trashAvailable(base);
+            if (trashAvailable(base)) {
+              instances.push(base);
+              return;
+            }
+            watchers.push((selected, depth, offset) => {
+              const derived = { ...base, priority_depth: depth,
+                legacy_order: selected.legacy_order + 2000 + offset };
+              return trashAvailable(derived) ? derived : null;
+            });
+          });
           resolvePendingEffectWindow(
             state, cards, targets, instances, resolveCombatInstance,
-            combatCandidateLegal, {mergeDerived: true, stop: () => resolved.some(row => row.kind === "attack_step_end" && row.resolved)});
+            combatCandidateLegal, {mergeDerived: true, watchers, stop: () => resolved.some(row => row.kind === "attack_step_end" && row.resolved)});
           // カウント反応など、この窓で増えたぶんの派生を先に流し、待機中の
           // 場離れは`endEffectFrame`で最後に確定する(Python runtime.end同一)。
           flushCountReactions(state, cards, targets);
@@ -11161,8 +11564,14 @@
       // 効いている『ライフ保護』(6C-2B)。盤面の状態でユニットには紐づかない。
       // Python `life_protections` と同一。
       lifeProtections: [],
+      paymentRestrictions: [],
+      timedLevelCostIncreases: [],
+      battleReplacements: {},
+      costPaymentOrigin: null,
       spiritLifeTaken: {},
       spiritLifeTakenAttack: {},
+      lifeSourceCapStarts: {},
+      hasLifeSourceCaps: Object.values(cards).some(card => card.field_life_protections?.length),
       timedAttackBans: [],
       attackStepLocks: [],
       pendingRefreshSteps: [],
@@ -11370,7 +11779,7 @@
         return card?.mirage_cost !== null && card?.mirage_cost !== undefined
           && (card.enablers || []).some((effect) => effect.mode === "on_set"
             && ["draw", "coreboost", "core_to_trash"].includes(effect.kind))
-          && card.mirage_cost <= reclaimable(state, true, cards);
+          && costAffordable(state, cards, card.mirage_cost, card.mirage_cost, true);
       }).sort((left, right) => accessTier(left, cards, targets) - accessTier(right, cards, targets)
         || cards[left].mirage_cost - cards[right].mirage_cost || left.localeCompare(right));
       if (mirageChoices.length
@@ -11505,6 +11914,7 @@
         }
         resolveOwnStepEffects(state, cards, targets, "attack_end", options.going_first);
         state.ownAttackActive = false;
+        syncLifeCapObservers(state, cards);
         while (state.pendingRefreshSteps.length) {
           refreshedAfterAttack = true;
           runRefreshStep(state, cards, targets, options.going_first, state.pendingRefreshSteps.shift());
@@ -11535,6 +11945,7 @@
       // ターン終了。エンドステップの処理まで終わった後(公式の並び)。
       record(state, cards, "turn_end");
       state.ownTurnActive = false;
+      syncLifeCapObservers(state, cards);
       yield { turn, step: "turn_end",
         ...(state.combat ? { board: combatBoard(state, cards, targets) } : {}) };
     }
@@ -11749,6 +12160,8 @@
     firedEffectTiming, effectTimingMatches,
     // 「BP合計Nまで好きなだけ」の組(テストがPythonと突き合わせる、2026-10-11)。
     selectTotalCappedTargets,
+    // サーチ/回収の枠の選択(テストがPython `pick_condition_slots`と突き合わせる、T15)。
+    chooseFromPool,
     opponentChoiceOrder,
     // アルティメットトリガーの区切りの縛り(テストがPythonと突き合わせる、2026-10-12)。
     uHitGateMet, blockerCanBlock, forcedBlockerRows,
@@ -11894,7 +12307,7 @@
   // イベントで、`detail`を指定した棋譜だけが載せる。片方に足し忘れると
   // 詳細モードの棋譜がPython/Workerで食い違う。
   const MAIN_EVENT_TYPES = new Set([
-    "bp_changed", "level_cost_changed",
+    "bp_changed", "level_cost_changed", "brave_remained", "battle_unit_changed",
     "branch_sampled", "burst_replaced", "burst_set", "card_entered", "card_moved",
     "cards_opened", "cards_returned_to_deck", "cards_selected", "core_moved",
     "cost_calculated", "cost_paid", "count_gained", "draw", "effect_complete",
@@ -12830,6 +13243,8 @@
   function endBattle(emit, actor, defenderId, boards, attackerUid, blockerUid) {
     const attackerBoard = boards[actor];
     const defenderBoard = boards[defenderId];
+    attackerUid = attackerBoard.battle_uid ? attackerBoard.battle_uid(attackerUid) : attackerUid;
+    blockerUid = defenderBoard.battle_uid ? defenderBoard.battle_uid(blockerUid) : blockerUid;
     const attacker = attackerBoard.units().find((row) => row.uid === attackerUid);
     if (attacker) {
       emitTrigger(emit, attackerBoard, actor, attackerUid, attacker,
@@ -13036,7 +13451,17 @@
   // 手順4の煌臨で動く戦闘値。行ごと差し替えない。Python `_KOURIN_OVERLAY_KEYS` と同一。
   const KOURIN_OVERLAY_KEYS = ["card_no", "bp", "symbol_count", "cost"];
 
+  function adoptBattleSuccessor(row,board) {
+    if (!row) return;
+    const uid=board.battle_uid?board.battle_uid(row.uid):row.uid;
+    if (uid===row.uid) return;
+    const fresh=board.units().find(unit=>unit.uid===uid),exhausted=row.exhausted || false;
+    if (!fresh) Object.assign(row,{battle_absent:true,symbol_count:0,bp:0});
+    else {for(const key of Object.keys(row))delete row[key];Object.assign(row,fresh,{exhausted});}
+  }
   function overlayRow(row, board) {
+    adoptBattleSuccessor(row,board);
+    if(row.battle_absent)return row;
     const fresh = board.units().find((unit) => unit.uid === row.uid);
     const result = { ...row };
     for (const key of KOURIN_OVERLAY_KEYS) result[key] = fresh[key];
@@ -13050,8 +13475,9 @@
   /** 手順4の煌臨時効果でアタッカー/ブロッカーが場を離れていたらバトルを閉じる。
    *  Python `_battle_left` と同一。 */
   function battleLeft(emit, actor, defenderId, boards, attacker, blocker) {
-    const attackerHere = boards[actor].units().some((row) => row.uid === attacker.uid);
-    const blockerHere = !blocker
+    adoptBattleSuccessor(attacker,boards[actor]);adoptBattleSuccessor(blocker,boards[defenderId]);
+    const attackerHere = attacker.battle_absent || boards[actor].units().some((row) => row.uid === attacker.uid);
+    const blockerHere = !blocker || blocker.battle_absent
       || boards[defenderId].units().some((row) => row.uid === blocker.uid);
     if (attackerHere && blockerHere) return false;
     emit("battle_resolved", actor, { attacker, blocker,
@@ -13102,7 +13528,7 @@
     const order = attackOrder(
       attackerBoard, defenderBoard, profiles, gift, publicPlanDamage, ownPreview);
     for (let index = 0; index < order.length; index += 1) {
-      const uid = order[index];
+      let uid = order[index];
       let attacker = attackerBoard.units().find((row) => row.uid === uid);
       if (!attacker || attacker.exhausted) continue;
       const blockers = defenderBoard.units().filter((row) => !row.exhausted);
@@ -13146,6 +13572,7 @@
         attack_reasons: rowProfile(profiles, attacker).attack_reasons });
       // 公式手順1(アタック宣言)の直後、手順2(ブロック)より前(page08)。
       emitTrigger(emit, attackerBoard, actor, uid, attacker, "attack", defenderBoard);
+      adoptBattleSuccessor(attacker,attackerBoard);uid=attacker.uid;
       // 「相手のスピリット/アルティメットのアタック後」のバースト(Python同一)。
       openBurst(emit, defenderId, defenderBoard, BURST_OPPONENT_ATTACK, attackerBoard,
         { pendingAttackerUid: uid });
@@ -13163,6 +13590,7 @@
         () => attacker.symbol_count > 0 && defenderBoard.life() > 0,order).length) {
         if (battleLeft(emit,actor,defenderId,boards,attacker,null)) continue;
         attacker = overlayRow(attacker,attackerBoard);
+        uid = attacker.uid;
       }
       // 公式手順2(ブロック宣言の前)のフラッシュタイミング(2026-10-01、Python同一)。
       if (flashRemoval(emit, actor, defenderId, boards, 2,
@@ -13171,11 +13599,13 @@
         { own: [], opponent: [uid] }, order,index).length) {
         if (battleLeft(emit, actor, defenderId, boards, attacker, null)) continue;
         attacker = overlayRow(attacker, attackerBoard);
+        uid = attacker.uid;
       }
       // ブロッカー候補は**アタック時効果とアタック後バーストの解決後**に
       // 取り直す(Python同一)。宣言前の一覧を使うと、そこで疲労／重疲労した体や
       // 場を離れた体が、そのままブロックできてしまう。
-      const currentBlockers = defenderBoard.units().filter((row) => !row.exhausted);
+      uid=attacker.uid;
+      const currentBlockers = defenderBoard.units().filter((row) => !row.exhausted && !attacker.battle_absent);
       const currentAttacker = attackerBoard.units().find(row=>row.uid===uid);
       if(currentAttacker?.block_restriction)attacker={...attacker,block_restriction:currentAttacker.block_restriction};
       else delete attacker.block_restriction;
@@ -13193,6 +13623,7 @@
           () => Math.min(attacker.symbol_count, defenderBoard.life()) > 0,order).length) {
           if (battleLeft(emit, actor, defenderId, boards, attacker, null)) continue;
           attacker = overlayRow(attacker, attackerBoard);
+          uid = attacker.uid;
         }
         // 手順4のフラッシュの除去(2026-10-01、Python同一)。守り手だけ。
         if (flashRemoval(emit, actor, defenderId, boards, 4,
@@ -13201,6 +13632,7 @@
           { own: [], opponent: [uid] }).length) {
           if (battleLeft(emit, actor, defenderId, boards, attacker, null)) continue;
           attacker = overlayRow(attacker, attackerBoard);
+          uid = attacker.uid;
         }
         // 公式手順4のフラッシュタイミング(6C-2B)。ブロックしないと決めた後、
         // ライフ減少より前。脅威は**通ればライフが減ること**そのもので、
@@ -13272,6 +13704,9 @@
         for (const board of [attackerBoard, defenderBoard]) board.end_battle();
         return false;
       }
+      adoptBattleSuccessor(attacker, attackerBoard);
+      adoptBattleSuccessor(blocker, defenderBoard);
+      uid = attacker.uid;
       let freshAttacker = attackerBoard.units().find((row) => row.uid === uid) || attacker;
       let freshBlocker = defenderBoard.units().find(
         (row) => row.uid === blocker.uid) || blocker;
@@ -13279,29 +13714,31 @@
       // 破壊されるときだけ(アタック側の煌臨の後のBPで測る)。
       const blockerThreatened = () => {
         const nowAttacker = attackerBoard.units().find((row) => row.uid === uid);
-        const nowBlocker = defenderBoard.units().find((row) => row.uid === blocker.uid);
+        const nowBlocker = defenderBoard.units().find((row) => row.uid === freshBlocker.uid);
         return Boolean(nowAttacker && nowBlocker && ["blocker_destroyed", "both_destroyed"]
           .includes(battleOutcome(nowAttacker.bp, nowBlocker.bp)));
       };
-      if (flashKourin(emit, actor, defenderId, boards, uid, blocker.uid,
+      if (flashKourin(emit, actor, defenderId, boards, uid, freshBlocker.uid,
         blockerThreatened,order).length) {
         if (battleLeft(emit, actor, defenderId, boards, freshAttacker, freshBlocker)) continue;
         freshAttacker = overlayRow(freshAttacker, attackerBoard);
+        uid = freshAttacker.uid;
         freshBlocker = overlayRow(freshBlocker, defenderBoard);
       }
       // 手順4のフラッシュの除去(2026-10-01、Python同一)。アタック側はアタッカーが
       // 負けるならブロッカーを、守り手はブロッカーが負けるならアタッカーを狙う。
       const attackerThreatened = () => {
         const nowAttacker = attackerBoard.units().find((row) => row.uid === uid);
-        const nowBlocker = defenderBoard.units().find((row) => row.uid === blocker.uid);
+        const nowBlocker = defenderBoard.units().find((row) => row.uid === freshBlocker.uid);
         return Boolean(nowAttacker && nowBlocker && ["attacker_destroyed", "both_destroyed"]
           .includes(battleOutcome(nowAttacker.bp, nowBlocker.bp)));
       };
       if (flashRemoval(emit, actor, defenderId, boards, 4,
         { own: attackerThreatened, opponent: blockerThreatened },
-        { own: [blocker.uid], opponent: [uid] }, order,index).length) {
+        { own: [freshBlocker.uid], opponent: [uid] }, order,index).length) {
         if (battleLeft(emit, actor, defenderId, boards, freshAttacker, freshBlocker)) continue;
         freshAttacker = overlayRow(freshAttacker, attackerBoard);
+        uid = freshAttacker.uid;
         freshBlocker = overlayRow(freshBlocker, defenderBoard);
       }
       // 公式手順4のフラッシュタイミング(6C-2B)。ブロック時効果のあと、BP比較の
@@ -13317,6 +13754,11 @@
           freshBlocker, blockedFlash)) return false;
         continue;
       }
+      if(freshAttacker.battle_absent || freshBlocker.battle_absent){
+        emit('battle_resolved',actor,{attacker:freshAttacker,blocker:freshBlocker,
+          outcome:freshAttacker.battle_absent?'attacker_left_field':'blocker_left_field'});
+        endBattle(emit,actor,defenderId,boards,freshAttacker.uid,freshBlocker.uid);continue;
+      }
       const outcome = battleOutcome(freshAttacker.bp, freshBlocker.bp);
       const destroyed = outcome === "attacker_destroyed" ? [[actor, freshAttacker]]
         : outcome === "blocker_destroyed" ? [[defenderId, freshBlocker]]
@@ -13330,7 +13772,7 @@
       }
       emit("battle_resolved", actor,
         { attacker: freshAttacker, blocker: freshBlocker, outcome });
-      endBattle(emit, actor, defenderId, boards, uid, blocker.uid);
+      endBattle(emit, actor, defenderId, boards, uid, freshBlocker.uid);
       // 『このバトルが終了したとき、アタックステップを終了する』(Q17596)。
       if (flashEndsTheStepAfter(blockedFlash, stepLocked())) return false;
     }
