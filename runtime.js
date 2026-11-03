@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v216-v1";
-  const STAGE_VERSION = "v216";
+  const ENGINE_SLICE = "stage4-v222-v1";
+  const STAGE_VERSION = "v222";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v216-portable-v162";
+  const RUNTIME_VERSION = "stage4-v222-portable-v168";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -742,7 +742,8 @@
     "ir_version", "card_no", "name", "card_type", "cost", "colors", "lineages",
     "maintenance", "base_bp", "level_thresholds", "count_level_thresholds", "symbols", "reductions",
     "is_contract", "is_token", "is_brave", "cannot_battle_as_spirit",
-    "combine_conditions", "summon_conditions", "stays_on_field", "keywords",
+    "combine_conditions", "combine_condition_unread", "has_no_effect_text",
+    "summon_conditions", "stays_on_field", "keywords",
   ]);
   function effectsSuppressed(state, unit) {
     if (!unit) return false;
@@ -3166,8 +3167,11 @@
   // どおり(置き換えが移り先を決める効果そのものなので上書きしない)。
   function finalizeFieldLeave(state, cards, unit, cause, destination = "trash") {
     const braves = combinedBraves(state,unit.uid);
-    if (!braves.length || !['スピリット','アルティメット'].some(type =>
-      (cards[unit.card_no].card_type || '').includes(type))) {
+    if (!braves.length || !(['スピリット','アルティメット'].some(type =>
+      (cards[unit.card_no].card_type || '').includes(type))
+      || (cards[unit.card_no].is_brave && unit.brave_mode === 'spirit')
+      || (unit.creator_core && (cards[unit.card_no].card_type || '').includes('ネクサス')
+        && !cards[unit.card_no].is_contract))) {
       return finalizeFieldLeaveImpl(state,cards,unit,cause,destination);
     }
     beginEffectFrame(state);
@@ -3212,14 +3216,16 @@
       // 方針は再利用できる手札。消滅時もLv1の離れる効果は有効(Python同一)。
       destination = replacement.destinations[0];
     }
-    state.reserve += unit.cores;
-    if (unit.soul_core) state.reserveHasSoul = true;
+    const coresReturned = unit.creator_core ? 0 : unit.cores;
+    state.reserve += coresReturned;
+    if (!unit.creator_core && unit.soul_core) state.reserveHasSoul = true;
     let stack = [...(unit.kourin_stack || []), unit.card_no];
     const target = fContractWhiteSpiritTarget(state, cards, unit.uid);
     const moved = KOURIN_BASE_LEAVE_CAUSES.has(cause)
       ? kourinBaseSegment(stack, state.bugNo) : [];
     state.field.splice(state.field.indexOf(unit), 1);
-    if ((cards[unit.card_no]?.card_type || '').includes('ネクサス')) {
+    if ((cards[unit.card_no]?.card_type || '').includes('ネクサス')
+        && (!unit.creator_core || cards[unit.card_no].is_contract)) {
       for (const brave of [...combinedBraves(state, unit.uid)]) finalizeFieldLeave(state, cards, brave, cause, destination);
     }
     state.recurring = state.recurring.filter((entry) => entry.uid !== unit.uid);
@@ -3241,7 +3247,7 @@
       state.trashCards.push(...trashedRest);
       record(state, cards, "soul_state_entered", { card_no: unit.card_no, uid: unit.uid,
         cause, moved_card_nos: soulTaken, trash_card_nos: trashedRest,
-        cores_returned: unit.cores });
+        cores_returned: coresReturned });
       return "soul";
     }
     if (soulTaken.length) {
@@ -3250,7 +3256,7 @@
       // 魂状態になる場合は`soulCards`が黙って増えていた。
       record(state, cards, "soul_state_entered", { card_no: unit.card_no, uid: unit.uid,
         cause, moved_card_nos: soulTaken, trash_card_nos: [],
-        cores_returned: unit.cores });
+        cores_returned: coresReturned });
       stack = stack.filter((cardNo) => !soulTaken.includes(cardNo));
     }
     if (target && moved.length) {
@@ -3261,7 +3267,7 @@
       state.trashCards.push(...trashed);
       record(state, cards, "field_left", { card_no: unit.card_no, uid: unit.uid,
         cause, destination: "kourin_base", target_uid: target.uid,
-        moved_card_nos: moved, trash_card_nos: trashed, cores_returned: unit.cores });
+        moved_card_nos: moved, trash_card_nos: trashed, cores_returned: coresReturned });
       return "kourin_base";
     }
     const isToken = Boolean(unitInfo(state, cards, unit)?.is_token);
@@ -3280,14 +3286,14 @@
       }
       record(state, cards, "field_left", { card_no: unit.card_no, uid: unit.uid, cause,
         destination, moved_card_nos: [unit.card_no], trash_card_nos: bases,
-        cores_returned: unit.cores });
+        cores_returned: coresReturned });
       return destination;
     }
     const trashed = stack.filter((cardNo) => !cards[cardNo]?.is_token);
     state.trashCards.push(...trashed);
     record(state, cards, "field_left", { card_no: unit.card_no, uid: unit.uid, cause,
       destination: isToken ? "vanish" : "trash",
-      moved_card_nos: trashed, cores_returned: unit.cores });
+      moved_card_nos: trashed, cores_returned: coresReturned });
     return isToken ? "vanish" : "trash";
   }
 
@@ -3448,18 +3454,39 @@
     const hostUnit = state.field.find(unit => unit.uid === hostUid);
     if (!hostUnit || hostUnit.waiting || !beforeField.some(unit => unit.uid === hostUid && !unit.waiting)) return null;
     const host = unitInfo(state, cards, hostUnit);
+    const nexus = host.card_type.includes('ネクサス');
+    const braveHost = Boolean(host.is_brave);
+    if (braveHost && (hostUnit.brave_mode !== 'spirit'
+        || beforeField.find(unit => unit.uid === hostUid).brave_mode !== 'spirit')) return null;
+    const capacityHost = nexus && incoming ? {...host,
+      colors:[...new Set([...(host.colors || []),...(incoming.colors || [])])]} : host;
     const braves = combinedBraves(state, hostUid).map(unit => [unit.uid, cards[unit.card_no], unit]);
     if (incoming) braves.push([null, incoming, {}]);
     if (braves.length > 1 && braves.some(([,card]) => (card.lineages || []).includes('異魔神'))) return null;
-    const permissions = [{ max: 1, brave_filter: {} }], extras = [];
+    const permissions = braveHost ? [] : [{ max: 1, brave_filter: {} }], extras = [];
+    let braveHostAllowed = false;
     for (const source of [...beforeField].sort((a,b) => a.uid-b.uid)) {
+      if (nexus) break; // No closed Nexus capacity grants in this implementation.
       const live = state.field.find(unit => unit.uid === source.uid);
       if (source.waiting || !live || live.waiting || effectsSuppressed(state, live)) continue;
       const sourceCard = unitInfo(state, cards, live);
-      for (const grant of sourceCard.combine_capacity_grants || []) {
+      const grants = [...(sourceCard.combine_capacity_grants || [])];
+      const contractKinds = ['契約','超契約','F契約','封印F契約'];
+      if (source.uid === hostUid && sourceCard.card_type.includes('スピリット')
+          && contractKinds.includes(sourceCard.kourin_kind)
+          && contractKinds.includes(cards[source.card_no]?.kourin_kind)) {
+        for (const baseNo of source.kourin_stack || []) {
+          if (!(live.kourin_stack || []).includes(baseNo)) continue;
+          for (const grant of cards[baseNo]?.combine_capacity_grants || []) {
+            if (grant.scope === 'self' && grant.works_as_contract_base) grants.push(inheritedContractEffect(grant));
+          }
+        }
+      }
+      for (const grant of grants) {
         if (!['self','ally','attached_host'].includes(grant.scope)) continue;
         if (grant.levels && !grant.levels.includes(levelFor(live, cards, state))) continue;
         if (grant.scope === 'self' && source.uid !== hostUid) continue;
+        if (grant.scope === 'self' && grant.spirit_brave_host) braveHostAllowed = true;
         if (grant.scope === 'ally' && (live.brave_mode === 'combine'
             || !host.card_type.includes('スピリット') || !capacityFilterMatches(host, grant.ally_filter))) continue;
         if (grant.scope === 'attached_host' && (source.brave_mode !== 'combine'
@@ -3467,6 +3494,7 @@
         (grant.uncounted ? extras : permissions).push(grant);
       }
     }
+    if (braveHost && !braveHostAllowed) return null;
     function fits(indices, permission) {
       const buckets = permission.buckets || [permission], remaining = buckets.map(row => row.max);
       function assign(position) {
@@ -3487,10 +3515,17 @@
       if (!size) { yield chosen; return; }
       for (let i=start; i<=braves.length-size; i++) yield* subsets(size-1, i+1, [...chosen, i]);
     }
+    function hostRuleMatches(rule) {
+      if (!rule.requires_host) return !nexus;
+      const scope = rule.combine_scope || 'spirit';
+      return ((scope === 'nexus' && nexus && (host.lineages || []).includes('創界神'))
+        || (scope === 'spirit' && host.card_type.includes('スピリット')))
+        && (!rule.requires_host || capacityFilterMatches(capacityHost, rule.requires_host));
+    }
     const alwaysUncounted = new Set(braves.flatMap(([,card,unit], index) => {
       const rule = card.uncounted_combine;
       return !unit.effects_suppressed_this_turn && rule && !rule.once_per_name && rule.requires_host
-        && host.card_type.includes('スピリット') && capacityFilterMatches(host, rule.requires_host) ? [index] : [];
+        && hostRuleMatches(rule) ? [index] : [];
     }));
     for (let size=0; size<=braves.length; size++) for (const counted of subsets(size)) {
       if (counted.some(index => alwaysUncounted.has(index))) continue;
@@ -3502,8 +3537,8 @@
         // C1/C3 are the Brave's own abilities, independent of host suppression.
         if (!unit.effects_suppressed_this_turn && card.uncounted_combine) rules.push(card.uncounted_combine);
         const rule = rules.find(rule => (!rule.once_per_name || !names.has(normalizeCardName(card.name)))
+          && hostRuleMatches(rule)
           && (!rule.brave_filter || capacityFilterMatches(card, rule.brave_filter))
-          && (!rule.requires_host || (host.card_type.includes('スピリット') && capacityFilterMatches(host, rule.requires_host)))
           && (!rule.requires_attached_brave || (host.card_type.includes('スピリット') && counted.some(other => {
             const [otherUid, otherCard] = braves[other];
             return beforeField.some(unit => unit.uid === otherUid && !unit.waiting && unit.brave_mode === 'combine'
@@ -3524,40 +3559,66 @@
     return [...state.field].filter((unit) => {
       if (unit.waiting) return false;
       const candidate = unitInfo(state, cards, unit);
-      if (!candidate || candidate.is_brave) return false;
+      if (!candidate) return false;
       const nexus = (candidate.card_type || '').includes('ネクサス');
       const eligible = conditions.filter(c => nexus ? c.combine_scope === 'nexus' : c.combine_scope !== 'nexus');
       if (nexus) {
-        if (!(candidate.lineages || []).includes('創界神') || !eligible.length
-          || combinedBraves(state,unit.uid).length >= (candidate.combine_slots || 1)) return false;
-      } else if (!["スピリット", "アルティメット"].some(type => (candidate.card_type || '').includes(type))
-          || combineCapacityAssignment(unit.uid, state, cards, card) === null) return false;
+        if (!(candidate.lineages || []).includes('創界神') || !eligible.length) return false;
+      } else if (!candidate.is_brave && !["スピリット", "アルティメット"].some(type => (candidate.card_type || '').includes(type))) return false;
+      if (combineCapacityAssignment(unit.uid, state, cards, card) === null) return false;
       // 「このスピリットは、アタックと合体ができず」(X015)。Python同一。
       if ((candidate.combine_forbidden_levels || []).includes(levelFor(unit, cards, state))) {
         return false;
       }
-      if (!conditions.length) return true;
+      const before = state.summonGroup?.combine_before;
+      const basis = before ? { ...state, field: before } : state;
+      const previousHost = before?.find(row => row.uid === unit.uid) || unit;
+      const attached = combinedBraves(basis, unit.uid);
+      const rawHost = unitInfo(basis, cards, previousHost);
+      const conditionHost = rawHost.is_brave ? {...rawHost, card_type:'スピリット'} : rawHost;
+      const hostCost = conditionHost.cost + (nexus ? 0 : attached.reduce((sum,brave) => sum+(cards[brave.card_no].cost || 0),0));
+      const colors = nexus ? conditionHost.colors : [...new Set([...(conditionHost.colors || []),
+        ...attached.flatMap(brave => cards[brave.card_no].colors || [])])];
+      const symbols = fixedSymbols(previousHost) === null ? {} : {...fixedSymbols(previousHost)};
+      if (fixedSymbols(previousHost) === null) for (const part of [previousHost,...attached]) {
+        counterAdd(symbols,symbolBase(basis,cards,part));
+        if (fixedSymbols(part) === null) counterAdd(symbols,timedSymbolBonus(part,cards));
+      }
+      const host = {...conditionHost,cost:hostCost,colors,symbols};
+      if (conditions.some(c => c.symbol_colors) && fixedSymbols(previousHost) === null) {
+        const bonuses = staticSymbolBonuses(basis,cards);
+        for (const part of [previousHost,...attached]) {
+          if (fixedSymbols(part) === null) counterAdd(symbols,bonuses.get(part.uid) || {});
+        }
+      }
+      if (!nexus && (conditionHost.combine_condition_waivers || []).some(rule =>
+          rule.levels.includes(levelFor(previousHost, cards, basis))
+          && (!Object.keys(rule.brave_filter).length || capacityFilterMatches(card, rule.brave_filter)))) return true;
       return eligible.some((condition) => {
         // An unresolved ID or unclosed compound condition is not a named lineage.
         if (condition.required_lineage_id != null) return false;
-        const before = state.summonGroup?.combine_before;
-        const basis = before ? { ...state, field: before } : state;
-        const previousHost = before?.find(row => row.uid === unit.uid) || unit;
-        const hostCost = nexus ? candidate.cost : unitInfo(basis, cards, previousHost).cost
-          + combinedBraves(basis, unit.uid).reduce((sum, brave) => sum + (cards[brave.card_no].cost || 0), 0);
+        if (!Object.entries(condition).some(([key,value]) => key !== 'combine_scope'
+            && value != null && (!Array.isArray(value) || value.length))) return false;
         if (condition.min_cost !== null && condition.min_cost !== undefined
             && hostCost < condition.min_cost) return false;
-        if (condition.required_color && !(candidate.colors || []).includes(condition.required_color)) return false;
-        if (condition.required_card_name && !normalizeCardName(candidate.name || '').includes(normalizeCardName(condition.required_card_name))) return false;
+        if (condition.printed_cost_min != null && cards[unit.card_no].cost < condition.printed_cost_min) return false;
+        if (condition.has_no_effect_text && !cards[unit.card_no].has_no_effect_text) return false;
+        if (condition.is_contract && !host.is_contract) return false;
+        if (condition.symbol_colors && !condition.symbol_colors.some(color => (symbols || {})[color] > 0)) return false;
+        if (!cardMatchesAlternative(host, Object.fromEntries(
+            ['cost_max','color_exact','name_exact','lineage_groups'].filter(key => key in condition)
+              .map(key => [key,condition[key]])))) return false;
+        if (condition.required_color && !(host.colors || []).includes(condition.required_color)) return false;
+        if (condition.required_card_name && !normalizeCardName(host.name || '').includes(normalizeCardName(condition.required_card_name))) return false;
         if (condition.required_keywords?.length
-            && !condition.required_keywords.some(keyword => (candidate.keywords || []).includes(keyword))) return false;
+            && !condition.required_keywords.some(keyword => (host.keywords || []).includes(keyword))) return false;
         const requiredLineage = condition.required_lineage;
         if (requiredLineage
-            && !(candidate.lineages || []).includes(requiredLineage)) return false;
+            && !(host.lineages || []).includes(requiredLineage)) return false;
         if (condition.required_card_type) {
           const types = condition.required_card_type.split(/[／/]/).filter(Boolean);
           if (types.length && !types.some((type) =>
-            (candidate.card_type || "").includes(type))) return false;
+            (host.card_type || "").includes(type))) return false;
         }
         return true;
       });
