@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v251-v1";
-  const STAGE_VERSION = "v251";
+  const ENGINE_SLICE = "stage4-v253-v1";
+  const STAGE_VERSION = "v253";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v251-portable-v197";
+  const RUNTIME_VERSION = "stage4-v253-portable-v199";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3481,20 +3481,28 @@
     return (stack || []).filter((cardNo) => Boolean(cards[cardNo]?.is_contract));
   }
 
-  function kourinBaseSegment(stack, baseCardNo) {
+  /** 契約煌臨元を含む山が離れるとき、山全体（バグすべて・ほかの煌臨元・煌臨中の
+   *  スピリット）が一緒に移る(Q31679「以外も」、T121)。Python
+   *  `move_contract_base_pile` と同一。 */
+  function contractBasePile(stack, baseCardNo) {
     const rows = [...(stack || [])];
-    const index = rows.lastIndexOf(baseCardNo);
-    return index < 0 ? [] : rows.slice(index);
+    return rows.includes(baseCardNo) ? rows : [];
   }
 
+  // ファラの許可でコアを抜いている間だけ、いま煌臨した体を移り先に優先する
+  // (Python `preferred_contract_target`)。
+  let preferredContractTarget = null;
   function fContractWhiteSpiritTarget(state, cards, excludeUid) {
-    return [...state.field].sort((left, right) => left.uid - right.uid).find((unit) => {
+    const eligible = (unit) => {
       if (unit.uid === excludeUid || unit.waiting) return false;
       const card = unitInfo(state, cards, unit) || {};
       return (card.card_type || "").includes("スピリット")
         && (card.colors || []).includes("白")
         && ["F契約", "封印F契約"].includes(card.kourin_kind);
-    }) || null;
+    };
+    const preferred = state.field.find((unit) => unit.uid === preferredContractTarget);
+    if (preferred && eligible(preferred)) return preferred;
+    return [...state.field].sort((left, right) => left.uid - right.uid).find(eligible) || null;
   }
 
   /** 効果で場を離れる1体を確定する。Python `_finalize_field_leave` と同じ順序。 */
@@ -3700,7 +3708,7 @@
     let stack = [...(unit.kourin_stack || []), unit.card_no];
     const target = fContractWhiteSpiritTarget(state, cards, unit.uid);
     const moved = KOURIN_BASE_LEAVE_CAUSES.has(cause)
-      ? kourinBaseSegment(stack, state.bugNo) : [];
+      ? contractBasePile(stack, state.bugNo) : [];
     state.field.splice(state.field.indexOf(unit), 1);
     if ((cards[unit.card_no]?.card_type || '').includes('ネクサス')
         && !unit.creator_core) {
@@ -5358,10 +5366,11 @@
     if (bug.soul_core) state.reserveHasSoul = true;
     state.field.splice(state.field.indexOf(bug), 1);
     state.recurring = state.recurring.filter((entry) => entry.uid !== bug.uid);
-    if (target) target.kourin_stack = [state.bugNo, ...(target.kourin_stack || [])];
+    const moved = target ? contractBasePile([...(bug.kourin_stack || []), state.bugNo], state.bugNo) : [];
+    if (target) target.kourin_stack = [...moved, ...(target.kourin_stack || [])];
     record(state, cards, "field_left", { card_no: state.bugNo, uid: bug.uid,
       cause: "own_effect", destination: target ? "kourin_base" : "vanish",
-      target_uid: target?.uid ?? null, moved_card_nos: target ? [state.bugNo] : [],
+      target_uid: target?.uid ?? null, moved_card_nos: moved,
       cores_returned: bug.cores });
     return true;
   }
@@ -8664,6 +8673,48 @@
     return true;
   }
 
+  /** ファラの許可で新しく煌臨した体へLv1分のコアを移す。Python
+   *  `_fund_fara_kourin_maintenance` と同一——煌臨の`card_entered`の直後に呼び、
+   *  コアの移動→抜かれた体の離脱→その山の契約煌臨元への追加の順で記録する(T121)。
+   *  抜かれた体は自分のLv1を割るまで出し、割ったら共通の離脱境界へ(バグを含む山は
+   *  丸ごと契約煌臨元へ、Q31679・Q31739)。 */
+  function fundFaraKourinMaintenance(state, cards, host) {
+    preferredContractTarget = host.uid;
+    try {
+      return drainForFaraKourin(state, cards, host);
+    } finally {
+      preferredContractTarget = null;
+    }
+  }
+
+  function drainForFaraKourin(state, cards, host) {
+    while (host.cores < unitFloor(state, cards, host)) {
+      const need = unitFloor(state, cards, host) - host.cores;
+      const source = state.field.filter((unit) => unit.uid !== host.uid
+        && !unit.waiting && !unit.soul_core && unit.cores > 0)
+        .sort((left, right) => Number(left.card_no !== state.bugNo)
+          - Number(right.card_no !== state.bugNo) || left.uid - right.uid)[0];
+      if (source) {
+        const take = Math.max(1, Math.min(need,
+          source.cores - unitFloor(state, cards, source) + 1, source.cores));
+        source.cores -= take;
+        host.cores += take;
+        recordCoreMove(state, cards, { amount: take, source: "field", destination: "field",
+          reason: "fara_kourin_maintenance", source_uid: source.uid, target_uid: host.uid });
+        if (source.cores < unitFloor(state, cards, source)) {
+          finalizeFieldLeave(state, cards, source, "own_effect");
+        }
+      } else if (state.reserve > 0) {
+        const take = Math.min(need, state.reserve);
+        state.reserve -= take;
+        host.cores += take;
+        recordCoreMove(state, cards, { amount: take, source: "reserve", destination: "field",
+          reason: "fara_kourin_maintenance", target_uid: host.uid });
+      } else return false;
+    }
+    return true;
+  }
+
   function playKourin(state, cards, targets, candidate) {
     const card = unitInfo(state, cards, candidate);
     const watcherUnits = [...state.field];
@@ -8688,38 +8739,12 @@
     host.brave_mode = null;
     host.floor = (cards[candidate.card_no].maintenance || 0) + (host.level_cost_bonus || 0);
     if(superEntry)placeEffectKourinSoul(state,cards,targets,host);
-    if (isFKourin(card) && hasContractBase(host, state.fieldCoreKourinNo)) {
-      while (host.cores < unitFloor(state, cards, host)) {
-        const source = state.field.filter((unit) => unit.uid !== host.uid
-          && !unit.waiting && !unit.soul_core && unit.cores > 0)
-          .sort((left, right) => Number(left.card_no !== state.bugNo)
-            - Number(right.card_no !== state.bugNo) || left.uid - right.uid)[0];
-        if (source) {
-          source.cores -= 1;
-          host.cores += 1;
-          if (source.cores < unitFloor(state, cards, source)) {
-            // コア移動はファラ自身の効果。離れたバグは新しくF契約煌臨した白の
-            // スピリットの契約土台として下へ入る。
-            if (source.card_no === state.bugNo) {
-              host.kourin_stack = [state.bugNo, ...host.kourin_stack];
-              state.field.splice(state.field.indexOf(source), 1);
-              state.recurring = state.recurring.filter((entry) => entry.uid !== source.uid);
-            } else {
-              // バグ以外は共通の「場を離れる」境界へ。土台にバグを持っていれば
-              // その segment ごと別のF契約煌臨スピリットへ移る(Q31679)。
-              finalizeFieldLeave(state, cards, source, "own_effect");
-            }
-          }
-        } else if (state.reserve > 0) {
-          state.reserve -= 1;
-          host.cores += 1;
-        } else return false;
-      }
-    }
+    const faraFKourin = isFKourin(card) && hasContractBase(host, state.fieldCoreKourinNo);
     state.recurring = state.recurring.filter((entry) => entry.uid !== host.uid);
     settleBraveCapacity(state,cards);
     record(state, cards, "card_entered", { card_no: candidate.card_no, uid: host.uid,
       destination: "kourin_stack", ...traceDetails });
+    if (faraFKourin && !fundFaraKourinMaintenance(state, cards, host)) return false;
     state.played.add(candidate.card_no);
     state.playCounts[state.turn] = (state.playCounts[state.turn] || 0) + 1;
     let basiliskBonus = false;
@@ -13062,8 +13087,11 @@
           heldCards);
       }
       // メインステップの最後にLvを上げる(2026-10-02、Python同一)。アタック時効果の
-      // Lvはここで揃える。
-      if (state.combat && !(options.going_first && turn === 1)) {
+      // Lvはここで揃える。戦闘ありでは場の効果の再試行もここ(Lv配分の前)。
+      // アタックステップの後には自由なコア移動も第2メインも無い(T118、Python同一)。
+      if (state.combat) {
+        resolveAllFieldFlash(state, cards, targets);
+        noteLegalCandidates(state, cards, targets);
         allocateEndTurnLevelCores(state, cards, targets);
       }
       // ソウルコアの置き場所(2026-10-02、Python同一)。アタックステップの前に決める。
@@ -13106,7 +13134,7 @@
       // メインでコアやカードが動いた後なら撃てることがある。〔ターンに1回〕が
       // あるので、入口で撃てていればここは何もしない。Python同一。
       // Added refresh does not reopen a main/flash window (Python same).
-      if (!refreshedAfterAttack) {
+      if (!state.combat && !refreshedAfterAttack) {
         resolveAllFieldFlash(state, cards, targets);
         noteLegalCandidates(state, cards, targets);
         allocateEndTurnLevelCores(state, cards, targets);
