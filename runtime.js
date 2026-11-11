@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v253-v1";
-  const STAGE_VERSION = "v253";
+  const ENGINE_SLICE = "stage4-v257-v1";
+  const STAGE_VERSION = "v257";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v253-portable-v199";
+  const RUNTIME_VERSION = "stage4-v257-portable-v203";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -870,6 +870,7 @@
   const HAND_EFFECT_SCOPES = new WeakMap();
   const PENDING_HAND_NOTIFICATIONS = new WeakMap();
   const NOTIFICATION_TRIAL_DEPTHS = new WeakMap();
+  const TRACE_RECORD_OBSERVERS = new WeakMap();
 
   function executeDestroyEffect(state, run) {
     state.destroyEffectScopes.push(new Set());
@@ -910,8 +911,8 @@
   const BASIC_COLORS = ["赤", "紫", "緑", "白", "黄", "青"];
   const SUPPORTED_EFFECTS = new Set([
     "self_remain",
-    "attack_step_end",
-    "effect_text_grant",
+    "attack_step_end", "timed_attack_life_cap",
+    "effect_text_grant", "register_effect_grant",
     "draw", "coreboost", "self_coreboost", "self_core_move", "trash_core_return", "field_coreboost", "count_gain", "symbol_grant", "symbol_fix", "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_suppress", "life_core_gain", "u_trigger_invoke", "self_refresh", "ally_refresh", "guard_battle_refresh", "block_restriction", "force_block", "attack_ban", "u_trigger_step", "attack_step_lock", "extra_refresh_step",
     "search", "recover", "self_recover", "side_recover", "stash_top", "opponent_deck_discard",
     "oracle_mill", "oracle_pickup", "oracle_watch", "deck_discard_draw",
@@ -1632,7 +1633,7 @@
     const holder=[...state.field].sort((a,b)=>a.uid-b.uid).find(u=>u.soul_core);
     let origin;
     if(state.reserveHasSoul){origin='reserve';state.reserve--;state.reserveHasSoul=false;}
-    else if(state.lifeHasSoul){origin='life';state.life--;state.lifeHasSoul=false;state.lifeReducedThisTurn=true;}
+    else if(state.lifeHasSoul && attackLifeRoom(state,cards,1)){origin='life';subtractLife(state,1);state.lifeHasSoul=false;}
     else if(state.trashHasSoul){origin='trash';state.spent--;state.trashHasSoul=false;}
     else if(holder){origin='field';holder.cores--;holder.soul_core=false;}
     else throw Error('effect Contract Kourin selected without Soul Core');
@@ -1661,7 +1662,8 @@
         const common={brave_uid:source.brave_uid,card_no:cardNo,zone};
         const waived=zone==='hand' && kourinWaiverOk(card,state,cards,'trash');
         const superEntry=card.kourin_kind==='超契約';
-        const superOk=!state.sealedKourinNames.has(card.name) && Boolean(state.reserveHasSoul || state.lifeHasSoul || state.trashHasSoul || state.field.some(u=>u.soul_core));
+        const superOk=!state.sealedKourinNames.has(card.name) && Boolean(state.reserveHasSoul
+          || state.lifeHasSoul && attackLifeRoom(state,cards,1) || state.trashHasSoul || state.field.some(u=>u.soul_core));
         const countMet=[...(card.kourin_condition || '').matchAll(/C(\d+)以上/gu)].every(m=>state.count>=Number(m[1]));
         if((card.keywords || []).includes('契約煌臨') && countMet && (!superEntry || superOk)){
           for(const host of effectKourinHosts(state,cards,card)){
@@ -1946,6 +1948,7 @@
    *  `source_kind: unit`は発生源のスピリット/アルティメットで絞る(T89、Q31801)。 */
   function applicableLifeProtections(state, attacker, ownEffect = false, source = null) {
     return state.lifeProtections.filter((row) => {
+      if (row.protection === "attack_total") return false;
       if (ownEffect && !row.blocks_own_effects) return false;
       if (row.source_kind === "unit" && !lifeSourceMatches(row, source)) return false;
       if (row.source_kind === "attack" && !attacker) return false;
@@ -1959,20 +1962,36 @@
     });
   }
 
-  /** Re-read live field caps; source departure or an opened Burst disables them. */
+  function nexusDomainActive(state, cards, rule, unit) {
+    return !unit.waiting && effectActive(rule, state, cards, unit.uid)
+      && state.field.every(other => {
+        const card = unitInfo(state, cards, other);
+        return !card?.card_type.endsWith("ネクサス") || card.name.includes(rule.own_nexuses_only_name);
+      });
+  }
+
+  /** Re-read live field caps and include the Life caps already granted for the turn. */
   function lifeSourceCaps(state, cards, ownLife = true) {
     const other = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
     const attackStep = state.ownAttackActive || Boolean(other?.in_attack_step?.());
-    return state.field.filter(unit => !unit.waiting).flatMap(unit =>
+    const caps = state.field.flatMap(unit =>
       (unitInfo(state, cards, unit)?.field_life_protections || []).map((rule, index) =>
         ({...rule, _life_cap_id: `${unit.uid}:${unit.card_no}:${index}`})).filter(rule =>
-        ["per_source_turn", "per_source_attack"].includes(rule.protection)
+        ["per_source_turn", "per_source_attack", "attack_total"].includes(rule.protection)
+        && (rule.protection !== "attack_total" || !unit.waiting)
         && (!rule.both_attack_steps || attackStep)
         && (rule.scope === "both" || ownLife && rule.scope === "self")
         && (!rule.opponent_turn_only || !state.ownTurnActive)
         && (!rule.requires_burst_set || state.burst != null)
         && (!rule.requires_combined || combinedBraves(state, unit.uid).length)
+        && (!rule.own_nexuses_only_name || nexusDomainActive(state, cards, rule, unit))
         && effectActive(rule, state, cards, unit.uid)));
+    if (ownLife) {
+      for (const row of state.lifeProtections) {
+        if (row.protection === "attack_total") caps.push({...row, _life_cap_id: `timed:${row.amount}`});
+      }
+    }
+    return caps;
   }
 
   // Retain a start receipt for each uninterrupted live protection/source pair.
@@ -1987,6 +2006,13 @@
         ["self", row, uid => Boolean(combinedBraves(state, uid).length)]),
         ...(other?.field?.() || []).map(row => ["opponent", row, other.is_combined])];
       for (const [side, rule] of caps) {
+        if (rule.protection === "attack_total") {
+          const capKey = `${side}:${rule._life_cap_id}|attack_total`;
+          active[capKey] = state.lifeSourceCapStarts[capKey] || {
+            protection: "attack_total", start: state.spiritLifeTakenAttack.attack_total || 0,
+            amount: rule.amount};
+          continue;
+        }
         for (const [sourceSide, source, combined] of sources) {
           const sourceType = source.spirit_state ? "スピリット"
             : lifeSourceType({...source, damage_kind: "effect"});
@@ -2010,6 +2036,35 @@
     syncLifeCapStarts(state, cards);
     const other = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
     other?.sync_life_cap_starts?.();
+  }
+
+  function lifeInBattle(state, source = null) {
+    return state.battleActive || [source?.board, MAIN_STEP_OPPONENTS.get(state),
+      state.combatOpponent].some(board => board?.in_battle?.());
+  }
+
+  function attackLifeRoom(state, cards, amount, inBattle = lifeInBattle(state)) {
+    if (!state.hasAttackTotal || !inBattle) return amount;
+    syncLifeCapStarts(state, cards);
+    for (const interval of Object.values(state.lifeSourceCapStarts)) {
+      if (interval.protection === "attack_total") {
+        const taken = (state.spiritLifeTakenAttack.attack_total || 0) - interval.start;
+        amount = Math.min(amount, Math.max(0, interval.amount - taken));
+      }
+    }
+    return amount;
+  }
+
+  function canPayLife(state, cards, amount) {
+    return state.life - amount >= 1 && attackLifeRoom(state, cards, amount) === amount;
+  }
+
+  function subtractLife(state, amount, inBattle = lifeInBattle(state)) {
+    state.life -= amount;
+    state.lifeReducedThisTurn = true;
+    if (state.hasAttackTotal && inBattle) {
+      state.spiritLifeTakenAttack.attack_total = (state.spiritLifeTakenAttack.attack_total || 0) + amount;
+    }
   }
 
   function lifeSourceMatches(row, source) {
@@ -2296,11 +2351,14 @@
   }
 
   function effectActive(effect, state, cards, sourceUid) {
+    if (effect.kind === "life_core_move" && !canPayLife(state, cards, effect.amount)) return false;
     if (effect.opponent_spirit_absent
         && (!state.combatOpponent || state.combatOpponent.has_spirit())) return false;
     const activated = activatedUClause(state, effect, sourceUid);
     if (effect.mode === "on_destroy" && !state.field.find(row => row.uid === sourceUid)?.destroying) return false;
     if (effect.kind === "attack_step_end" && !state.combatOpponent?.can_end_attack_step?.()) return false;
+    if (effect.kind === "timed_attack_life_cap"
+        && state.count < (state.combatOpponent?.public_count?.() ?? Infinity)) return false;
     if (!activated && effect.requires_u_hit
         && !state.field.some(unit => unit.uid === sourceUid && !unit.waiting)) return false;
     if (effect.kind === "u_trigger_step" && !state.combatOpponent) return false;
@@ -2425,7 +2483,10 @@
     for (const cardNo of state.sideCards) {
       if (state.hand.includes(cardNo) || pool.includes(cardNo)) continue;
       const permissions = sidePermissions(state, cards, cardNo);
-      if (actions.some((action) => permissions.has(action))) pool.push(cardNo);
+      const card = cards[cardNo];
+      if (actions.some((action) => permissions.has(action))
+          || (actions.includes("manifestation") && manifestationWaiverAvailable(state, card)
+              && card.manifestation_soul_waiver.zones.includes("side"))) pool.push(cardNo);
     }
     return pool;
   }
@@ -2607,7 +2668,7 @@
     }
     if (kind === "life_core_trash") {
       const amount = Number(payment.amount || 1);
-      return state.life - amount >= 1 ? { life: amount } : null;
+      return canPayLife(state, cards, amount) ? { life: amount } : null;
     }
     if (kind === "soul_core_trash") {
       const unit = paymentSourceUnit(state, sourceUid);
@@ -2624,7 +2685,7 @@
         .filter((unit) => paymentUnitMatches(unit, cards, payment) && creatorCoreRoom(state,cards,unit)>0)
         .sort((left, right) => left.uid - right.uid);
       const origin = holder ? "field" : state.reserveHasSoul ? "reserve"
-        : state.trashHasSoul ? "trash" : state.lifeHasSoul && state.life>1 ? "life" : null;
+        : state.trashHasSoul ? "trash" : state.lifeHasSoul && canPayLife(state, cards, 1) ? "life" : null;
       if (!targetUnits.length || !origin) return null;
       return { soulFrom: holder, soulTo: targetUnits[0], soulSource:origin };
     }
@@ -2746,13 +2807,12 @@
         target_uid: plan.target.uid });
     }
     if (plan.life) {
-      if (state.life - plan.life < 1) return false;
+      if (!canPayLife(state, cards, plan.life)) return false;
       const ordinary = state.life - Number(state.lifeHasSoul);
       const sealedActive = state.field.some((unit) => !unit.waiting
         && unitInfo(state, cards, unit)?.has_sealed_effect);
       const takesSoul = state.lifeHasSoul && (!sealedActive || plan.life > ordinary);
-      state.life -= plan.life;
-      if (plan.life > 0) state.lifeReducedThisTurn = true;
+      subtractLife(state, plan.life);
       if (takesSoul) {
         state.lifeHasSoul = false;
         state.trashHasSoul = true;
@@ -2763,7 +2823,7 @@
       const holder = plan.soulFrom;
       const origin = plan.soulSource || (holder ? "field" : "reserve");
       if (origin === "trash") { state.spent--;state.trashHasSoul=false; }
-      else if (origin === "life") { state.life--;state.lifeHasSoul=false;state.lifeReducedThisTurn=true; }
+      else if (origin === "life") { subtractLife(state, 1);state.lifeHasSoul=false; }
       else if (holder) {
         holder.cores -= 1;
         holder.soul_core = false;
@@ -3106,9 +3166,9 @@
     if (kourinWaiverOk(card, state, cards, destination)) {
       return reclaimable(state, false, cards) >= entryMaintenance(state, cards, card);
     }
-    const fromField = !state.reserveHasSoul
-      && !(state.lifeHasSoul && destination !== "life") && Boolean(soulFieldHolder(state, cards));
-    if (!(state.reserveHasSoul || (state.lifeHasSoul && destination !== "life") || fromField)) {
+    const fromLife = state.lifeHasSoul && destination !== "life" && attackLifeRoom(state, cards, 1);
+    const fromField = !state.reserveHasSoul && !fromLife && Boolean(soulFieldHolder(state, cards));
+    if (!(state.reserveHasSoul || fromLife || fromField)) {
       return false;
     }
     const available = state.reserve - (state.reserveHasSoul ? 1 : 0)
@@ -3190,9 +3250,22 @@
           || !windows.includes(card.manifestation_timing)
           || !summonConditionsMet(card, state, cards)) return;
       seen.add(cardNo);
-      const creators = manifestationCreators(card, state, cards)
-        .filter(unit => manifestationPossible(state, cards, unit, entryMaintenance(state, cards, card), false))
-        .map(unit => unit.uid).sort((a,b) => a-b);
+      const maintenance = entryMaintenance(state, cards, card);
+      const payments = manifestationCreators(card, state, cards)
+        .sort((a, b) => a.uid - b.uid)
+        .flatMap(unit => manifestationPaymentOptions(state, cards, cardNo, unit, maintenance, false)
+          .map(payment => ({...payment, uid: unit.uid})));
+      if (card.manifestation_soul_waiver) {
+        for (const [soulPayment, sourceZone] of [["waived", "side"], ["waived", "hand"],
+          ["paid", "side"], ["paid", "hand"]]) {
+          const creators = payments.filter(row => row.soul_payment === soulPayment
+            && row.source_zone === sourceZone).map(row => row.uid);
+          if (creators.length) options.push({card_no: cardNo, hand_index: handIndex, creators,
+            soul_payment: soulPayment, source_zone: sourceZone});
+        }
+        return;
+      }
+      const creators = payments.map(row => row.uid);
       if (creators.length) {
         const option = {card_no:cardNo,hand_index:handIndex,creators};
         if (state.sideCards.includes(cardNo) && sidePermissions(state,cards,cardNo).has("manifestation")) {
@@ -3454,7 +3527,7 @@
 
   function kourinSoulSource(state, cards, host, destination) {
     if (state.reserveHasSoul) return "reserve";
-    if (state.lifeHasSoul && destination !== "life") return "life";
+    if (state.lifeHasSoul && destination !== "life" && attackLifeRoom(state, cards, 1)) return "life";
     if (soulFieldHolder(state, cards, host)) return "field";
     return null;
   }
@@ -3829,14 +3902,55 @@
 
   function manifestationSoulSource(state, cards) {
     if (state.reserveHasSoul) return { zone: "reserve", unit: null };
-    if (state.lifeHasSoul) return { zone: "life", unit: null };
+    if (state.lifeHasSoul && attackLifeRoom(state, cards, 1)) return { zone: "life", unit: null };
     const unit = [...state.field].sort((a, b) => a.uid - b.uid)
       .find((row) => row.soul_core && !row.waiting
         && (!isCreatorNexus(cards,row) || manifestationSoulPermissionKey(state,cards,row)!==null));
     return unit ? { zone: "field", unit } : null;
   }
 
-  function manifestationPossible(state, cards, creator, maintenance, allowSacrifice) {
+  function manifestationWaiverKey(card) {
+    return JSON.stringify(["manifestation_soul_waiver", card.name]);
+  }
+
+  function manifestationWaiverAvailable(state, card) {
+    return Boolean(card?.manifestation_soul_waiver
+      && state.count >= card.manifestation_soul_waiver.count_min
+      && !state.blockTurnUsed.has(manifestationWaiverKey(card)));
+  }
+
+  function manifestationPaymentOptions(state, cards, cardNo, creator, maintenance, allowSacrifice) {
+    const card = cards[cardNo];
+    const options = [];
+    if (manifestationWaiverAvailable(state, card)
+        && manifestationPossible(state, cards, creator, maintenance, allowSacrifice, true)) {
+      for (const [zone, pool] of [["side", state.sideCards], ["hand", state.hand]]) {
+        if (card.manifestation_soul_waiver.zones.includes(zone) && pool.includes(cardNo)) {
+          options.push({soul_payment: "waived", source_zone: zone});
+        }
+      }
+    }
+    const sidePaid = state.sideCards.includes(cardNo)
+      && sidePermissions(state, cards, cardNo).has("manifestation");
+    if ((sidePaid || state.hand.includes(cardNo))
+        && manifestationPossible(state, cards, creator, maintenance, allowSacrifice)) {
+      options.push({soul_payment: "paid", source_zone: sidePaid ? "side" : "hand"});
+    }
+    return options;
+  }
+
+  function manifestationPossible(state, cards, creator, maintenance, allowSacrifice, waived = false) {
+    if (waived) {
+      if (!creator || creator.waiting || creator.cores <= Number(Boolean(creator.soul_core))) return false;
+      let available = state.reserve - Number(state.reserveHasSoul);
+      for (const unit of state.field) {
+        if (unit.creator_core || unit.waiting) continue;
+        const protectedUnit = !allowSacrifice || unit.soul_core || sacrificeProtected(unit, cards);
+        const floor = protectedUnit ? unitFloor(state, cards, unit) : 0;
+        available += Math.max(0, unit.cores - floor - Number(Boolean(unit.soul_core)));
+      }
+      return maintenance <= available;
+    }
     const source = manifestationSoulSource(state, cards);
     if (!source || (source.zone === "life" && state.life <= 1)) return false;
     if (!creator || creator.waiting || creator.cores - Number(source.unit?.uid === creator.uid) < 1) return false;
@@ -4376,11 +4490,13 @@
     return total <= reserve + field && (!pay || !reserveCostBanned(state, reserve) || pay <= field);
   }
 
-  function fundCost(state, cards, targets, pay, total, allowSacrifice, combineFloors = null) {
+  function fundCost(state, cards, targets, pay, total, allowSacrifice, combineFloors = null, preserveSoul = false) {
     const banned = Boolean(pay && reserveCostBanned(state));
     const origin = banned ? [state.reserve, state.reserveHasSoul] : null;
-    const deficit = Math.max(total-state.reserve, banned ? pay : 0);
-    const funded = deficit <= 0 || fundPayment(state, cards, targets, deficit, allowSacrifice, combineFloors);
+    const deficit = Math.max(total - state.reserve + Number(preserveSoul && state.reserveHasSoul),
+      banned ? pay : 0);
+    const funded = deficit <= 0 || fundPayment(state, cards, targets, deficit,
+      allowSacrifice, combineFloors, preserveSoul);
     state.costPaymentOrigin = origin;
     return funded;
   }
@@ -4443,10 +4559,14 @@
           pay: 0, total: entryMaintenance(state, cards, card), maintenance: entryMaintenance(state, cards, card) });
         return;
       }
-      const creator = (may("manifestation") && ["main", "self_turn"].includes(card.manifestation_timing)
+      const manifestation = (["main", "self_turn"].includes(card.manifestation_timing)
+          && (may("manifestation") || manifestationWaiverAvailable(state, card))
         ? manifestationCreators(card, state, cards) : [])
-        .find((unit) =>
-          manifestationPossible(state, cards, unit, entryMaintenance(state, cards, card), allowSacrifice));
+        .flatMap(unit => manifestationPaymentOptions(state, cards, cardNo, unit,
+          entryMaintenance(state, cards, card), allowSacrifice).map(payment => ({unit, payment})));
+      const selectedManifestation = manifestation.find(row => row.payment.soul_payment === "waived")
+        || manifestation[0];
+      const creator = selectedManifestation?.unit;
       if (!creator && !summonConditionsMet(card, state, cards)) return;
       if (!creator && !may("use")) return;
       let mode = braveMode(card, state, cards);
@@ -4473,7 +4593,9 @@
       }
       rows.push({ hand_index: handIndex, card_no: cardNo, brave_mode: mode,
         allow_sacrifice: allowSacrifice, mode: creator ? "manifestation" : "normal",
-        manifestation_creator_uid: creator?.uid ?? null, ...cost });
+        manifestation_creator_uid: creator?.uid ?? null,
+        ...(creator && card.manifestation_soul_waiver ? selectedManifestation.payment : {}),
+        ...cost });
     });
     return rows;
   }
@@ -4598,24 +4720,27 @@
       }
     }
     syncLifeCapObservers(state, cards);
-    if (state.trace) state.events.push({
-      seq: state.events.length + 1,
-      type,
-      turn,
-      state: stateView(state, cards),
-      // Python `TraceRecorder.record`と同じく**その時点の値を写す**。参照のまま
-      // 積むと、後から中身を書き換える呼び出し元が過去のイベントまで書き換えて
-      // しまう。実際`cards_opened`は公開プールの配列をそのまま渡していたため、
-      // 直後の公開時反応が1枚抜くと**記録済みの「何を捲ったか」が2枚に減って
-      // いた**（Pythonは3枚のまま）。
-      // `undefined`は**`null`へ寄せる**。Pythonの`_record(**kwargs)`は渡された
-      // キーをNoneのまま載せるのに、JSは`undefined`のまま積むとJSONで**キーごと
-      // 消える**ので、詳細モードだけが「Python: null / Worker: undefined」で
-      // 割れ続けていた(2026-08-21、剣獣ヘルメスの検証デッキで露見)。
-      details: structuredClone(Object.fromEntries(
-        Object.entries(details).map(([key, value]) =>
-          [key, value === undefined ? null : value]))),
-    });
+    if (state.trace) {
+      state.events.push({
+        seq: state.events.length + 1,
+        type,
+        turn,
+        state: stateView(state, cards),
+        // Python `TraceRecorder.record`と同じく**その時点の値を写す**。参照のまま
+        // 積むと、後から中身を書き換える呼び出し元が過去のイベントまで書き換えて
+        // しまう。実際`cards_opened`は公開プールの配列をそのまま渡していたため、
+        // 直後の公開時反応が1枚抜くと**記録済みの「何を捲ったか」が2枚に減って
+        // いた**（Pythonは3枚のまま）。
+        // `undefined`は**`null`へ寄せる**。Pythonの`_record(**kwargs)`は渡された
+        // キーをNoneのまま載せるのに、JSは`undefined`のまま積むとJSONで**キーごと
+        // 消える**ので、詳細モードだけが「Python: null / Worker: undefined」で
+        // 割れ続けていた(2026-08-21、剣獣ヘルメスの検証デッキで露見)。
+        details: structuredClone(Object.fromEntries(
+          Object.entries(details).map(([key, value]) =>
+            [key, value === undefined ? null : value]))),
+      });
+      TRACE_RECORD_OBSERVERS.get(state)?.(state.events.at(-1));
+    }
     if (type === "effect_complete" && !HAND_EFFECT_SCOPES.get(state)?.length) {
       const pending = PENDING_HAND_NOTIFICATIONS.get(state) || [];
       PENDING_HAND_NOTIFICATIONS.delete(state);
@@ -5708,6 +5833,11 @@
 
   function resolveEffectBody(state, cards, targets, effect, sourceUid) {
     if (!effectActive(effect, state, cards, sourceUid)) return false;
+    if (effect.kind === "timed_attack_life_cap") {
+      protectLife(state, cards, {protection: "attack_total", amount: effect.amount,
+        scope: "turn", source_kind: "any", attacker_cost_min: null});
+      return true;
+    }
     // 印字の対価は、可否を見たあと**解決に入る直前**に1回だけ払う
     // （判定側で払うと、投機的な見積もりが資源を溶かす）。Python同一。
     if (!payClausePayment(state, cards, targets, effect, sourceUid)) return false;
@@ -6233,6 +6363,10 @@
       state.effectTextGrants.push([...effect.target_lineages]);
       return true;
     }
+    if (effect.kind === "register_effect_grant") {
+      state.effectGrants.push(...effect.granted_effects.map(entry => [sourceUid, entry]));
+      return true;
+    }
     if (effect.kind === "attack_step_lock") {
       state.attackStepLocks.push([...effect.target_lineages]);
       record(state, cards, "attack_step_locked", {card_no:effect.source_card_no,
@@ -6330,6 +6464,8 @@
           reuseRisk: typeof board.bounce_reuse_risk === "function"
             ? (row) => board.bounce_reuse_risk(row) : null,
         }) : rows.slice(0, amount);
+      if (effect.kind === "unit_bounce" && effect.target_all && effect.optional
+          && !picked.some(row => !row.waiting)) return false;
       const affected = unguardedTargets(board, picked, effect);
       let applied;
       if (effect.kind === "unit_destroy") {
@@ -6469,14 +6605,13 @@
       return amount > 0;
     }
     if (effect.kind === "life_core_move") {
-      if (amount <= 0 || state.life - amount < 1
+      if (amount <= 0 || !canPayLife(state, cards, amount)
           || !["reserve", "trash"].includes(effect.destination)) return false;
       const ordinary = state.life - Number(state.lifeHasSoul);
       const sealedActive = state.field.some((unit) => !unit.waiting
         && unitInfo(state, cards, unit)?.has_sealed_effect);
       const takesSoul = state.lifeHasSoul && (!sealedActive || amount > ordinary);
-      state.life -= amount;
-      if (amount > 0) state.lifeReducedThisTurn = true;
+      subtractLife(state, amount);
       if (takesSoul) {
         state.lifeHasSoul = false;
         if (effect.destination === "reserve") state.reserveHasSoul = true;
@@ -6822,7 +6957,7 @@
     return effect.kind === "oracle_watch";
   }
 
-  function fundPayment(state, cards, targets, needed, allowSacrifice, combineFloors = null) {
+  function fundPayment(state, cards, targets, needed, allowSacrifice, combineFloors = null, preserveSoul = false) {
     let remaining = needed;
     // **リザーブへの反映はこの関数を出るとき**。Pythonは`_fund_deficit`が捻出量を
     // 返すだけで、加算するのは呼び出し元(`reserve += _fund_deficit(...)`)なので、
@@ -6839,7 +6974,7 @@
     for (const unit of state.field) {
       if (unit.creator_core || unit.waiting) continue;
       const floor = Math.max(unitFloor(state, cards, unit), combineFloors?.[unit.uid] || 0);
-      const free = Math.max(0, unit.cores - floor);
+      const free = Math.max(0, unit.cores - floor - Number(preserveSoul && Boolean(unit.soul_core)));
       const take = Math.min(free, remaining);
       const ordinaryFree = Math.max(
         0, unit.cores - Number(Boolean(unit.soul_core)) - floor);
@@ -6868,7 +7003,8 @@
           > paymentForState(state, cards, cards[cardNo]).pay);
     };
     const ordered = [...state.field].filter((unit) => unit.cores > 0 && !unit.creator_core
-        && !unit.waiting && !sacrificeProtected(unit, cards) && !combineFloors?.[unit.uid])
+        && !unit.waiting && !sacrificeProtected(unit, cards) && !combineFloors?.[unit.uid]
+        && !(preserveSoul && unit.soul_core))
       .sort((left, right) =>
         Number(unitPreservesHandReduction(left)) - Number(unitPreservesHandReduction(right))
         || accessTier(right.card_no, cards, targets) - accessTier(left.card_no, cards, targets)
@@ -6955,8 +7091,8 @@
     });
   }
 
-  // 試しに解いて戻すとき、写せない(関数・盤面の口を持つ)ので外して持ち越す鍵(2026-10-13)。
-  const TRIAL_HELD_KEYS = ["combatOpponent", "deferredFieldLeaves",
+  // 関数や盤面の口と、試行前の棋譜の行は参照を保つ。試行中の追記だけを戻す。
+  const TRIAL_HELD_KEYS = ["events", "combatOpponent", "deferredFieldLeaves",
     "deferredPlayCompletions", "deferredDerivedPlays"];
   // バーストの節のうち`resolveEffect`を通らない種類。択一の試行に載せない(Python同一)。
   const BURST_SPECIAL_KINDS = new Set([
@@ -7073,13 +7209,15 @@
   function resolveBurstEffectsImpl(state, cards, targets, cardNo) {
     const card = cards[cardNo];
     if (!card) return false;
+    const locked = state.combatOpponent?.burst_effect_locked?.();
+    const effects = locked ? [] : card.burst_effects || [];
     let selfPlayed = false;
     const derivedMark = state.derivedSeq;
-    const printedBoundary = (card.burst_effects || []).some(effect =>
+    const printedBoundary = effects.some(effect =>
       effect.connector_before === "この効果発揮後");
     let returnedToHand = false;
     const resolvedChoiceGroups = new Set();
-    for (const effect of card.burst_effects || []) {
+    for (const effect of effects) {
       if (effect.effect_id) {
         state.completedEffects.delete(effect.effect_id);
         if (state.completedEffectCards) delete state.completedEffectCards[effect.effect_id];
@@ -7088,11 +7226,11 @@
     // 択一は解いてみて良い方(2026-10-13、Python同一)。自分を出す枝などを含む組は従来どおり。
     const decidedAlternatives = new Map();
     const burstBranches = (group) => {
-      const members = (card.burst_effects || []).filter((row) => row.exclusive_group === group);
+      const members = effects.filter((row) => row.exclusive_group === group);
       if (members.some((row) => BURST_SPECIAL_KINDS.has(row.kind))) return [];
       return members.filter((row) => effectActive(row, state, cards, null));
     };
-    for (const effect of card.burst_effects || []) {
+    for (const effect of effects) {
       const choiceGroup = effect.exclusive_group;
       if (choiceGroup !== null && choiceGroup !== undefined
           && resolvedChoiceGroups.has(choiceGroup)) continue;
@@ -7164,7 +7302,7 @@
       state.burstOpen = null;
       state.trashCards.push(cardNo);
       record(state, cards, "card_moved",
-        { card_no: cardNo, destination: "trash", reason: "burst_resolved" });
+        { card_no: cardNo, destination: "trash", reason: locked ? "burst_effect_locked" : "burst_resolved" });
     }
     for (const source of [...state.field].sort((a, b) => a.uid - b.uid)) {
       const effect = unitInfo(state, cards, source)?.after_burst_open;
@@ -7357,8 +7495,7 @@
       state.reserve -= 1;
       state.reserveHasSoul = false;
     } else if (source === "life") {
-      state.life -= 1;
-      state.lifeReducedThisTurn = true;
+      subtractLife(state, 1);
       state.lifeHasSoul = false;
     } else if (source === "field") {
       const holder = soulFieldHolder(state, cards, host);
@@ -7375,9 +7512,17 @@
     return true;
   }
 
-  function payManifestation(state, cards, creatorUid) {
-    const source = manifestationSoulSource(state, cards);
+  function payManifestation(state, cards, creatorUid, waiverKey = null) {
     const creator = state.field.find((unit) => unit.uid === creatorUid);
+    if (waiverKey !== null) {
+      creator.cores -= 1;
+      state.spent += 1;
+      state.blockTurnUsed.add(waiverKey);
+      recordCoreMove(state,cards,{amount:1,source:"field",destination:"trash",
+        reason:"manifestation_creator",source_uid:creatorUid});
+      return true;
+    }
+    const source = manifestationSoulSource(state, cards);
     if (!source || (source.zone === "life" && state.life<=1) || !creator || creator.waiting
         || creator.cores - Number(source.unit?.uid === creatorUid) < 1) return false;
     const permissionKey = source.unit && isCreatorNexus(cards,source.unit)
@@ -7386,8 +7531,7 @@
       state.reserve -= 1;
       state.reserveHasSoul = false;
     } else if (source.zone === "life") {
-      state.life -= 1;
-      state.lifeReducedThisTurn = true;
+      subtractLife(state, 1);
       state.lifeHasSoul = false;
     } else {
       source.unit.cores -= 1;
@@ -8822,7 +8966,19 @@
     const watcherUnits = [...state.field];
     const summonGroup = state.summonGroup || null;
     const mode = candidate.mode || "normal";
-    const traceDetails = { mode, pay: candidate.pay, total: candidate.total };
+    let waiverKey = null;
+    let manifestationPayment = null;
+    if (candidate.manifestation_creator_uid != null && card.manifestation_soul_waiver) {
+      const creator = manifestationCreators(card, state, cards)
+        .find(unit => unit.uid === candidate.manifestation_creator_uid);
+      manifestationPayment = manifestationPaymentOptions(state, cards, candidate.card_no,
+        creator, candidate.total, candidate.allow_sacrifice).find(payment =>
+        (candidate.soul_payment == null || candidate.soul_payment === payment.soul_payment)
+        && (candidate.source_zone == null || candidate.source_zone === payment.source_zone));
+      if (!manifestationPayment) return false;
+      if (manifestationPayment.soul_payment === "waived") waiverKey = manifestationWaiverKey(card);
+    }
+    const traceDetails = { mode, pay: candidate.pay, total: candidate.total, ...manifestationPayment };
     // トラッシュからの召喚も通常の召喚と同じ支払いなので、同じ鍵を持つ(2026-10-11、
     // Python `play_card`の`trace_mode`と同一。それまで`brave_mode`を書いていなかった)。
     if (["normal", "manifestation", "trash_main_summon", "trigger_counter", "deck_discard_protection", "shadow"].includes(mode)) {
@@ -8850,11 +9006,14 @@
     }
     if (candidate.manifestation_creator_uid !== null
         && candidate.manifestation_creator_uid !== undefined
-        && !payManifestation(state, cards, candidate.manifestation_creator_uid)) return false;
+        && !payManifestation(state, cards, candidate.manifestation_creator_uid, waiverKey)) return false;
     if (!costAffordable(state, cards, candidate.pay, candidate.total, candidate.allow_sacrifice)) return false;
-    const funding = candidate.total > state.reserve || (candidate.pay && reserveCostBanned(state));
+    const preserveSoul = waiverKey !== null;
+    const funding = candidate.total > state.reserve - Number(preserveSoul && state.reserveHasSoul)
+      || (candidate.pay && reserveCostBanned(state));
     if (funding) beginEffectFrame(state);
-    if (!fundCost(state, cards, targets, candidate.pay, candidate.total, candidate.allow_sacrifice, combinePlan?.floors)) {
+    if (!fundCost(state, cards, targets, candidate.pay, candidate.total, candidate.allow_sacrifice,
+        combinePlan?.floors, preserveSoul)) {
       if (funding) endEffectFrame(state);
       return false;
     }
@@ -8862,7 +9021,12 @@
     // 自己召喚)は手札を触らない。経由させると、同名カードが手札にもあるとき
     // **別の1枚が消えて並びがずれる**(Python側はどちらもゾーンから直接出す)。
     let takenFrom = null;
-    if (candidate.source_zone_name) {
+    if (manifestationPayment) {
+      takenFrom = manifestationPayment.source_zone;
+      const zone = takenFrom === "side" ? state.sideCards : state.hand;
+      zone.splice(zone.indexOf(candidate.card_no), 1);
+      pruneSidePlayable(state);
+    } else if (candidate.source_zone_name) {
       // 効果が名指ししたゾーンから出す(v66、`zone_summon`。Python `play_card`の
       // `source_zone`)。手元の許可層は通さない。
       const zone = { hand: state.hand, side: state.sideCards, deck: state.deck,
@@ -8896,6 +9060,7 @@
     if (funding) endEffectFrame(state);
     record(state, cards, "cost_paid", { card_no: candidate.card_no,
       payment: mode === "free_deploy" ? "none"
+        : preserveSoul ? "manifestation_soul_waived"
         : candidate.mode === "manifestation" ? "soul_core_and_cores" : "cores",
       ...traceDetails });
     // ドライビングフォースの配置元は、提示・コスト確定・支払いの間は元zoneに
@@ -10159,10 +10324,10 @@
   // 別経路で組み直すと、同じユニットが窓ごとに違う値を報告することになる。
   function combatFieldRows(state, cards, includeWaiting = false) {
     // BPは`combatUnitRow`と同じ出どころ(`stateView`)から取る。
-    // `includeWaiting`は待機中の発揮元の常時効果を読む口だけが使う(T91、Python同一)。
+    // `includeWaiting`は待機中の常時効果と破壊時の対象選択に使う(T91、D41)。
     const view = stateView(state, cards).field;
     return [...state.field]
-      .filter((unit) => includeWaiting || !unit.waiting)
+      .filter(unit => includeWaiting || !(unit.waiting || unit.battle_destroy_pending))
       .sort((left, right) => left.uid - right.uid)
       .map((unit) => {
         const card = unitInfo(state, cards, unit) || {};
@@ -10171,7 +10336,8 @@
           uid: unit.uid,
           card_no: unit.card_no,
           card_type: card.card_type || "",
-        ...(effectsSuppressed(state, unit) ? {effects_suppressed:true} : {}),
+          ...(unit.waiting || unit.battle_destroy_pending || (includeWaiting && unit.destroying) ? {waiting: true} : {}),
+          ...(effectsSuppressed(state, unit) ? {effects_suppressed:true} : {}),
           ...(card.is_brave && unit.brave_mode !== "combine" ? {spirit_state: true} : {}),
           bp: row ? row.bp : printedBp(unit, cards, state),
           ...combatCostRow(state, cards, unit, card),
@@ -10380,9 +10546,9 @@
   }
 
   /** 場の体ごとに、今受けている名前つきの引用効果の付与(T17-KW)。Map(uid→[[付与, 付与元uid]])。
-   *  Python `_keyword_grants_by_unit`と同一(付与元のLv・「〜がいる間」、受け手の照合、
+   *  Python `_quoted_grants_by_unit`と同一(付与元のLv・「〜がいる間」、受け手の照合、
    *  付与で得た【X】を数える不動点)。 */
-  function keywordGrantsByUnit(state, cards) {
+  function quotedGrantsByUnit(state, cards) {
     const field = [...state.field].sort((left, right) => left.uid - right.uid);
     const active = [];
     for (const granter of field) {
@@ -10395,6 +10561,7 @@
         }
       }
     }
+    active.push(...state.effectGrants);
     let grantedKeywords = new Map();
     while (active.length) {
       const result = new Map();
@@ -10405,7 +10572,11 @@
           result.get(unit.uid).push([entry, granterUid]);
         }
       }
-      const keywords = new Map([...result].map(([uid, rows]) => [uid, new Set(rows.map(([entry]) => entry.keyword))]));
+      const keywords = new Map();
+      for (const [uid, rows] of result) {
+        const names = new Set(rows.map(([entry]) => entry.keyword).filter(Boolean));
+        if (names.size) keywords.set(uid, names);
+      }
       const same = keywords.size === grantedKeywords.size && [...keywords].every(([uid, set]) =>
         grantedKeywords.get(uid)?.size === set.size && [...set].every((word) => grantedKeywords.get(uid).has(word)));
       if (same) return result;
@@ -10417,7 +10588,7 @@
   function grantKeysActive(state, cards, instance, uid) {
     const keys = instance.clauses.map((effect) => effect.grant_key).filter(Boolean);
     if (!keys.length) return true;
-    const live = new Set((keywordGrantsByUnit(state, cards).get(uid) || [])
+    const live = new Set((quotedGrantsByUnit(state, cards).get(uid) || [])
       .map(([entry, granterUid]) => `${entry.grant_id}@${granterUid}`));
     return keys.every((key) => live.has(key));
   }
@@ -10510,7 +10681,9 @@
     if (Number.isNaN(bpMax) || Number.isNaN(costMax) || Number.isNaN(symbolsMax)) {
       return [];
     }
-    const rows = board.field().filter((row) => {
+    const field = effect.mode === "on_destroy" && board.field_including_waiting
+      ? board.field_including_waiting() : board.field();
+    const rows = field.filter((row) => {
       if (state.uTargetContext?.target_uid != null && state.uTargetContext.target_uid !== row.uid) return false;
       if (resisted(state, cards, row, effect, sourceUid)) return false;
       if (types.length && !types.some((word) => (row.card_type || "").endsWith(word)
@@ -11229,7 +11402,7 @@
     const target = targets[0].uid;
     if (state.reserveHasSoul) return {source:"reserve",holder:null,target};
     if (state.trashHasSoul) return {source:"trash",holder:null,target};
-    if (state.lifeHasSoul) return state.life>1 ? {source:"life",holder:null,target} : null;
+    if (state.lifeHasSoul) return canPayLife(state, cards, 1) ? {source:"life",holder:null,target} : null;
     const unit = [...state.field].sort((a,b)=>a.uid-b.uid).find(row=>row.soul_core);
     if (!unit || unit.waiting || isCreatorNexus(cards,unit)
         || (unit.uid===sourceUid && unit.cores-1<unitFloor(state, cards, unit))) return null;
@@ -11240,7 +11413,7 @@
     const {source,holder,target}=plan;
     if (source==="reserve") {state.reserve--;state.reserveHasSoul=false;}
     else if (source==="trash") {state.spent--;state.trashHasSoul=false;}
-    else if (source==="life") {state.life--;state.lifeHasSoul=false;state.lifeReducedThisTurn=true;}
+    else if (source==="life") {subtractLife(state, 1);state.lifeHasSoul=false;}
     else {const unit=state.field.find(row=>row.uid===holder);unit.cores--;unit.soul_core=false;}
     const recipient=state.field.find(row=>row.uid===target);recipient.cores++;recipient.soul_core=true;
     recordCoreMove(state,cards,{amount:1,source,destination:"field",reason:"deck_discard_protection",source_card_no:sourceNo,source_uid:holder,target_uid:target});
@@ -11522,6 +11695,7 @@
       // アタック/ブロックの候補なのでスピリット系しか並べないが、破壊の対象には
       // ネクサスも入る。Python `_combat_field_rows` と同一。
       field: () => combatFieldRows(state, cards),
+      field_including_waiting: () => combatFieldRows(state, cards, true),
       exhaust: (uid, skipNextRefresh = false) => {
         const unit = state.field.find((row) => row.uid === uid);
         if (!unit || unit.waiting || (unit.exhausted && !skipNextRefresh)) return false;
@@ -11588,7 +11762,7 @@
         state.battleReplacements = {};
         state.spiritLifeTakenAttack = {};
         state.lifeSourceCapStarts = Object.fromEntries(Object.entries(state.lifeSourceCapStarts)
-          .filter(([, row]) => row.protection !== "per_source_attack"));
+          .filter(([, row]) => !["per_source_attack", "attack_total"].includes(row.protection)));
         state.attackingUid = null;
         state.battlingUid = null;
         state.battleActive = false;
@@ -11625,6 +11799,7 @@
         state.timedAttackBans = [];
         state.attackStepLocks = [];
         state.effectTextGrants = [];
+        state.effectGrants = [];
         state.handCostBonus = 0;
         state.deckDiscardedTurn = 0;
         state.deckDiscardProtection = null;
@@ -11653,6 +11828,14 @@
       // Python `_combat_protect_life` と同一。
       protect_life: (protection) => protectLife(state, cards, protection),
       add_attack_ban: (ban) => state.timedAttackBans.push(clone(ban)),
+      burst_effect_locked: () => {
+        if (!state.effectGrants.length) return false;
+        const uid = state.attackingUid;
+        const unit = state.field.find(row => row.uid === uid);
+        return Boolean(state.battleActive && unit && !unit.waiting && !effectsSuppressed(state, unit)
+          && (quotedGrantsByUnit(state, cards).get(uid) || []).some(([entry]) =>
+            entry.window === "while_attacking" && entry.clauses.some(clause => clause.kind === "burst_effect_lock")));
+      },
       attack_step_end_blocked: (uid) => {
         const unit = state.field.find(row => row.uid === uid && !row.waiting);
         return Boolean(unit && state.attackStepLocks.length
@@ -11980,9 +12163,16 @@
       // 破棄して守るか。Python `_combat_board` の`target_guard`と同一。
       target_guard: (uid, effectKind, amount = null) =>
         combatTargetGuard(state, cards, uid, effectKind, amount),
-      destroy: (uid, cause, opponent = null) => {
+      mark_battle_destruction: uid => {
+        const unit = state.field.find(row => row.uid === uid);
+        if (unit) unit.battle_destroy_pending = true;
+      },
+      destroy: (uid, cause, opponent = null, deferLeave = false) => {
         const unit = state.field.find((row) => row.uid === uid);
-        if (!unit || unit.waiting || unit.destroying) return null;
+        if (!unit || unit.waiting || unit.destroying
+            || (cause === "effect" && unit.battle_destroy_pending)) return null;
+        if (unitInfo(state, cards, unit).field_life_protections?.some(rule =>
+          rule.own_nexuses_only_name && nexusDomainActive(state, cards, rule, unit))) return null;
         if (cause === 'effect') notifyOwnRemovedByOpponentEffect(state,cards,targets,unit,opponent);
         if (cause === "effect") opponent?.effect_destroyed?.({uid,card_no:unit.card_no,
           target_type:unit.brave_mode === "spirit" ? "スピリット" : unitInfo(state,cards,unit).card_type});
@@ -11990,7 +12180,10 @@
         const outerEvents = state.uTriggerEvents.splice(0);
         try {
           combatBoard(state, cards, targets).resolve_trigger(uid, "destroy", opponent);
-          if (!state.field.includes(unit) || !unit.destroying) return "other";
+          if (!state.field.includes(unit) || !unit.destroying) {
+            delete unit.battle_destroy_pending;
+            return "other";
+          }
         } finally {
           delete unit.destroying;
           state.uTriggerEvents.unshift(...outerEvents);
@@ -11999,9 +12192,15 @@
         // **契約煌臨元の置き換えを通らない**ぶんPython(`_finalize_field_leave`へ
         // 委譲)と食い違っていた。破壊が効果から撃てるようになって初めて届く
         // 経路なので、ここで揃えておく(2026-08-17)。
-        const destination = finalizeFieldLeave(state, cards, unit, cause);
-        // 下の札/煌臨元の破棄では、本体の「破壊後」を成立させない。
-        return destination === "trash" ? "trash" : "other";
+        const finish = () => {
+          const unit = state.field.find(row => row.uid === uid);
+          if (!unit || (deferLeave && !unit.battle_destroy_pending)) return "other";
+          delete unit.battle_destroy_pending;
+          const destination = finalizeFieldLeave(state, cards, unit, cause);
+          // 下の札/煌臨元の破棄では、本体の「破壊後」を成立させない。
+          return destination === "trash" ? "trash" : "other";
+        };
+        return deferLeave ? finish : finish();
       },
       // ライフのコアがライフエリアを離れる。アタックが通ったときと効果の両方。
       // `destination`は**アタックによる減少では常にリザーブ**(公式ルール)で、
@@ -12012,7 +12211,7 @@
       // 効果の発生源は保護判定前に分離し、アタック限定の保護を効果へ広げない。
       // 発生源を持たない効果はnull。渡し分けないと
       // 「コスト4以上のアタックでは減らない」型が効果まで止めてしまう。
-      // **ここが保護の唯一の参照点**。Python `_combat_damage_life` と同一。
+      // 自分の効果の対価などの支払いは、別途 attackLifeRoom を読む。
       damage_life: (amount, destination = "reserve", attacker = null, ownEffect = false) => {
         const source = attacker;
         if (source?.damage_kind === "effect") attacker = null;
@@ -12021,9 +12220,8 @@
           state, Math.max(amount, 0), attacker, ownEffect, source);
         const key = lifeSourceKey(source, ownEffect);
         syncLifeCapObservers(state, cards);
-        const inBattle = state.battleActive || [source?.board, MAIN_STEP_OPPONENTS.get(state),
-          state.combatOpponent].some(board => board?.in_battle?.());
-        let cappedAmount = protectedAmount;
+        const inBattle = lifeInBattle(state, source);
+        let cappedAmount = attackLifeRoom(state, cards, protectedAmount, inBattle);
         if (key !== null) {
           const other = source.opponent_board || (!ownEffect ? source.board : null);
           const caps = [...lifeSourceCaps(state, cards).map(rule => ["self", rule]),
@@ -12031,6 +12229,7 @@
           const liveSource = caps.some(([, rule]) => rule.attacker_symbol_min)
             ? source.board?.field?.().find(u => u.uid === source.uid) || source : source;
           for (const [side, rule] of caps) {
+            if (rule.protection === "attack_total") continue;
             if (!(rule.attacker_types || ["スピリット"]).includes(lifeSourceType(source))) continue;
             if (rule.protection === "per_source_attack" && !inBattle) continue;
             if (rule.scope === "self" && ownEffect) continue;
@@ -12058,8 +12257,7 @@
           if (destination === "reserve") state.reserveHasSoul = true;
           else if (destination === "trash") state.trashHasSoul = true;
         }
-        state.life -= taken;
-        if (taken > 0) state.lifeReducedThisTurn = true;
+        subtractLife(state, taken, inBattle);
         if (destination === "reserve") state.reserve += taken;
         if (key !== null) state.spiritLifeTaken[key] = (state.spiritLifeTaken[key] || 0) + taken;
         if (key !== null && inBattle) state.spiritLifeTakenAttack[key] = (state.spiritLifeTakenAttack[key] || 0) + taken;
@@ -12279,9 +12477,11 @@
       // 手順4のフラッシュタイミングで手札から煌臨する口(2026-10-01、Python同一)。
       flash_kourin_options: (side) => flashKourinOptions(state, cards, side),
       flash_manifestation_options: side => flashManifestationOptions(state,cards,side),
-      play_flash_manifestation: (cardNo,creatorUid,side,opponent=null) => {
+      play_flash_manifestation: (cardNo,creatorUid,side,opponent=null,soulPayment=null,sourceZone=null) => {
         const option=flashManifestationOptions(state,cards,side).find(row =>
-          row.card_no===cardNo && row.creators.includes(creatorUid));
+          row.card_no===cardNo && row.creators.includes(creatorUid)
+          && (soulPayment === null || row.soul_payment === soulPayment)
+          && (sourceZone === null || row.source_zone === sourceZone));
         if(!option)return null;
         const previous=[state.combatOpponent||null,MAIN_STEP_OPPONENTS.get(state)];
         state.combatOpponent=opponent;
@@ -12291,14 +12491,17 @@
           const before=state.uid;
           play(state,cards,targets,{card_no:cardNo,pay:0,total:entryMaintenance(state, cards, cards[cardNo]),
             maintenance:entryMaintenance(state, cards, cards[cardNo]),
-            mode:"manifestation",manifestation_creator_uid:creatorUid,allow_sacrifice:false,brave_mode:null});
+            mode:"manifestation",manifestation_creator_uid:creatorUid,allow_sacrifice:false,brave_mode:null,
+            ...(option.soul_payment ? {soul_payment:option.soul_payment, source_zone:option.source_zone} : {})});
           uid=state.field.find(unit => unit.uid>before && unit.card_no===cardNo)?.uid ?? null;
         } finally {
           state.combatOpponent=previous[0];
           if(previous[1])MAIN_STEP_OPPONENTS.set(state,previous[1]);else MAIN_STEP_OPPONENTS.delete(state);
         }
-        return {card_no:cardNo,creator_uid:creatorUid,uid,payment:"soul_core_and_cores",
-          ...(option.source_zone === "side" ? {source_zone:"side"} : {})};
+        return {card_no:cardNo,creator_uid:creatorUid,uid,
+          payment:option.soul_payment === "waived" ? "manifestation_soul_waived" : "soul_core_and_cores",
+          ...(option.soul_payment ? {soul_payment:option.soul_payment} : {}),
+          ...(option.source_zone ? {source_zone:option.source_zone} : {})};
       },
       play_flash_kourin: (cardNo, hostUid, side, opponent = null) => {
         const option = flashKourinOptions(state, cards, side).find(
@@ -12445,10 +12648,11 @@
         for (const brave of combinedBraves(state, uid)) {
           rows.push(...windowRows(brave.card_no, brave));
         }
-        // 付与された名前つきの効果(T17-KW)。受け手が発揮し、付与元の体ごとに別の効果(C1・C11)。
+        // 付与された引用効果。受け手が発揮し、付与元の体ごとに別の効果(C1・C11)。
         // Python `_combat_resolve_window`と同一。
         if (window === "attack") {
-          for (const [entry, granterUid] of keywordGrantsByUnit(state, cards).get(uid) || []) {
+          for (const [entry, granterUid] of quotedGrantsByUnit(state, cards).get(uid) || []) {
+            if (entry.window !== window) continue;
             const granter = state.field.find((row) => row.uid === granterUid);
             for (const clause of entry.clauses) {
               rows.push([{ ...clause, effect_block_id: `${clause.effect_block_id}@${granterUid}`,
@@ -12718,6 +12922,7 @@
       },
       // 決着で試行を打ち切ると戻り値が無いので、記録済みイベントはここから読む。
       events: () => state.events,
+      set_trace_record_observer: (observer) => TRACE_RECORD_OBSERVERS.set(state, observer),
     };
     return board;
   }
@@ -12742,6 +12947,8 @@
       seed: trialSeed, contract_card_no: packet.deck.contract_card_no,
       consider_mulligan: options.consider_mulligan, initial_hand: options.initial_hand,
     });
+    const hasTimedAttackCap = Object.values(cards).some(card =>
+      card.enablers?.some(effect => effect.kind === "timed_attack_life_cap"));
     const state = {
       // `deck_order`は共有契約なので**トップ（次に引く札）から順**。だが山札そのものは
       // Pythonと同じ**下→上**（index 0が一番下、末尾がトップ）で持つ。ここで一度だけ
@@ -12776,11 +12983,14 @@
       spiritLifeTaken: {},
       spiritLifeTakenAttack: {},
       lifeSourceCapStarts: {},
-      hasLifeSourceCaps: Object.values(cards).some(card => card.field_life_protections?.length),
+      hasLifeSourceCaps: hasTimedAttackCap || Object.values(cards).some(card => card.field_life_protections?.length),
+      hasAttackTotal: hasTimedAttackCap || Object.values(cards).some(card =>
+        card.field_life_protections?.some(rule => rule.protection === "attack_total")),
       timedAttackBans: [],
       attackStepLocks: [],
       // 「このターンの間、…効果の記述を持たないスピリットとしても扱う」の系統(BS04-109)。
       effectTextGrants: [],
+      effectGrants: [],
       pendingRefreshSteps: [],
       life: 5, sealed: false,
       reserveHasSoul: true, countHasSoul: false, trashHasSoul: false, lifeHasSoul: false,
@@ -12901,6 +13111,7 @@
     for (let turn = 1; turn <= options.turns; turn += 1) {
       state.turn = turn;
       if (turn > 1 && !state.combat) {
+        state.effectGrants = [];
         // 相手のターンのステップ(2026-10-10、Python同一)。相手の口は無い。
         // 記録はすべて直前の自分のターン(turn-1)の番号で付け、相手のターンの
         // 終わりの見出しはステップの効果の後に置く。
@@ -13407,7 +13618,7 @@
   const TRACE_MODE = "stage6a1-alternating-main-v1";
   const RUNTIME_VERSION = "stage6a1-portable-v9";
   const COMBAT_MODE = "stage6b1-combat-v1";
-  const COMBAT_RUNTIME_VERSION = "stage6b1-portable-v10";
+  const COMBAT_RUNTIME_VERSION = "stage6b1-portable-v11";
   // 方針を変えたらここを上げる(棋譜の`policy`がこの版を持つ)。ルールの版
   // `COMBAT_MODE`とは別物。v2(2026-08-22): 削り切りの判定を1体ずつから
   // **アタックステップ合計**へ(`lethalStepPlan`)。Python同一。
@@ -15007,8 +15218,18 @@
       const destroyed = outcome === "attacker_destroyed" ? [[actor, freshAttacker]]
         : outcome === "blocker_destroyed" ? [[defenderId, freshBlocker]]
           : [[actor, freshAttacker], [defenderId, freshBlocker]];
-      for (const [owner, row] of destroyed) {
-        const landed = boards[owner].destroy(row.uid, "battle", otherBoard(boards, owner));
+      const simultaneous = destroyed.length > 1
+        && destroyed.every(([owner]) => boards[owner].mark_battle_destruction);
+      let finishes;
+      if (simultaneous) {
+        for (const [owner, row] of destroyed) boards[owner].mark_battle_destruction(row.uid);
+        finishes = destroyed.map(([owner, row]) =>
+          boards[owner].destroy(row.uid, "battle", otherBoard(boards, owner), true));
+      }
+      for (const [index, [owner, row]] of destroyed.entries()) {
+        const finish = finishes?.[index];
+        const landed = simultaneous ? (typeof finish === "function" ? finish() : finish)
+          : boards[owner].destroy(row.uid, "battle", otherBoard(boards, owner));
         emit("destroyed_by_battle", owner, { unit: row, outcome });
         // 破壊は相手のアタック/ブロックによるものなので「相手による」に当たる。
         burstAfterFieldLeave(emit, owner, boards[owner], landed,
@@ -15068,9 +15289,17 @@
     }
     const secondPlayer = PLAYER_IDS.find((playerId) => playerId !== contract.first_player);
     const combatEvents = [];
+    const streamEvents = new Map();
     let currentRound = 0;
     let currentActor = null;
+    let advancing = false;
+    const currentStreamEvents = () => {
+      const key = `${currentRound}:${currentActor}`;
+      if (!streamEvents.has(key)) streamEvents.set(key, []);
+      return streamEvents.get(key);
+    };
     const flushExternalMainEvents = (owner, phase) => {
+      if (advancing) return;
       // board APIが記録した詳細行を、持ち主の自ターンではなく実際に起きた
       // 相手ターン位置へ移す。魂状態の遷移もこの経路で表示する(Python同一)。
       const ownerRunner = runners[owner];
@@ -15093,7 +15322,7 @@
     const emit = (type, owner, details, phaseOverride = null) => {
       const phase = phaseOverride || "attack";
       flushExternalMainEvents(owner, phase);
-      combatEvents.push({
+      const event = {
         round: currentRound,
         actor: owner,
         phase,
@@ -15102,7 +15331,13 @@
         turn_of: currentActor,
         state: Object.fromEntries(PLAYER_IDS.map((playerId) =>
           [playerId, canonicalState(runners[playerId].board.snapshot())])),
-      });
+      };
+      if (advancing) {
+        event.after_source = runners[currentActor].board.events().length;
+        currentStreamEvents().push(event);
+      } else {
+        combatEvents.push(event);
+      }
     };
     if (combat) {
       for (const playerId of PLAYER_IDS) advanceTurn(runners[playerId]);
@@ -15111,6 +15346,13 @@
       for (const playerId of PLAYER_IDS) {
         const board = runners[playerId].board;
         if (!board || typeof board.set_choice_ranker !== "function") continue;
+        board.set_trace_record_observer((source) => {
+          if (!advancing || playerId === currentActor) return;
+          currentStreamEvents().push({
+            actor: playerId, after_source: runners[currentActor].board.events().length,
+            raw_source: source,
+          });
+        });
         board.set_choice_ranker(() => burstRankKey(burstBoardRank(
           runners[playerId].board, runners[otherPlayer(playerId)].board, null,
           currentActor === playerId)));
@@ -15168,7 +15410,19 @@
           }
         };
         for (;;) {
-          const step = advanceTurn(runners[actor]);
+          const foreignMark = defenderBoard?.events().length;
+          advancing = combat;
+          let step;
+          try {
+            step = advanceTurn(runners[actor]);
+          } finally {
+            advancing = false;
+          }
+          if (defenderBoard) {
+            for (const source of defenderBoard.events().slice(foreignMark)) {
+              runners[defender].stage6_external_seqs.add(source.seq);
+            }
+          }
           if (!step || step.step === "turn_end") break;
           if (step.step === "main_start") {
             defenderStep("main_start", "main");
@@ -15224,6 +15478,12 @@
     // 差し込み済みの戦闘イベント。守り手の『相手のメインステップ開始時』(段`main`)
     // だけはメインステップの記録の直後へ先に置く(Python `_splice_combat`同一)。
     const splicedCombat = new Set();
+    const appendCombat = (round, actor, owner, phase, type, details) => {
+      events.push({
+        seq: events.length + 1, round, actor: owner, phase, source_seq: null,
+        type, details, state: jointState(actor, latest),
+      });
+    };
     const spliceCombat = (round, actor, phases = null) => {
       for (const [index, combatEvent] of combatEvents.entries()) {
         if (combatEvent.round !== round || combatEvent.turn_of !== actor) continue;
@@ -15231,16 +15491,8 @@
         if (splicedCombat.has(index)) continue;
         splicedCombat.add(index);
         for (const playerId of PLAYER_IDS) latest[playerId] = combatEvent.state[playerId];
-        events.push({
-          seq: events.length + 1,
-          round,
-          actor: combatEvent.actor,
-          phase: combatEvent.phase,
-          source_seq: null,
-          type: combatEvent.type,
-          details: combatEvent.details,
-          state: jointState(actor, latest),
-        });
+        appendCombat(round, actor, combatEvent.actor, combatEvent.phase,
+          combatEvent.type, combatEvent.details);
       }
     };
     for (const turn of turnOrder) {
@@ -15253,7 +15505,29 @@
       let spliced = false;
       // 詳細イベントのphaseは**そのとき踏んでいるステップ**(Python同一)。
       let currentPhase = "main";
+      const foreignEvents = players[otherPlayer(actor)]._events;
+      // A rewound trial can reuse a sequence number, but never its row object.
+      const queue = (streamEvents.get(`${round}:${actor}`) || []).filter(({ raw_source: raw }) =>
+        !raw || foreignEvents[raw.seq - 1] === raw);
+      let streamIndex = 0;
+      const spliceStream = (beforeSource) => {
+        while (streamIndex < queue.length && queue[streamIndex].after_source < beforeSource) {
+          const event = queue[streamIndex++];
+          const raw = event.raw_source;
+          if (raw) {
+            latest[event.actor] = canonicalState(raw.state);
+            if (detail && MAIN_EVENT_TYPES.has(raw.type)) {
+              appendCombat(round, actor, event.actor, currentPhase, raw.type,
+                { ...publicMainEventDetails(raw.type, raw.details), turn_player: actor });
+            }
+          } else {
+            Object.assign(latest, event.state);
+            appendCombat(round, actor, event.actor, event.phase, event.type, event.details);
+          }
+        }
+      };
       for (const source of sourceEvents) {
+        spliceStream(source.seq);
         // アタックステップの終わりの記録があればその前、無ければエンドの前(Python同一)。
         if (!spliced && (source.type === "step_attack_end" || source.type === "step_end")) {
           spliceCombat(round, actor);
@@ -15282,6 +15556,7 @@
         });
         if (source.type === "step_main") spliceCombat(round, actor, ["main"]);
       }
+      spliceStream(Infinity);
       // 決着したターンはエンドステップまで進まないので、最後に置く。
       if (!spliced) spliceCombat(round, actor);
     }
