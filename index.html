@@ -243,6 +243,34 @@ body[data-workspace="builder"] #deck-panel .pseudo-card{min-height:5.2rem}
 .playmat .pm-field-zone .pm-unit{display:inline-block;vertical-align:top;margin:0 5.6cqw 1.3cqw 0}
 /* 合体はブレイヴが上へ0.3枚ぶん出るので、その分と倒したときの下端を先に取る。 */
 .playmat .pm-field-zone .pm-unit.pm-combined{margin-top:8.05cqw;margin-right:8.05cqw;margin-bottom:2.9cqw}
+/* 異魔神を少し上に置き、左右の合体先の内側に重ねる（公式エターナル p09）。 */
+.imagin-group {
+  display: inline-flex; align-items: flex-start; vertical-align: top; isolation: isolate;
+  width: min(calc(100% - 1cqw), calc(var(--imagin-span) * 11.5cqw)); margin: 0 1cqw 1.3cqw 0;
+}
+.imagin-slot {
+  flex: 0 0 calc(100% * var(--imagin-weight) / var(--imagin-span)); min-width: 0;
+  position: relative; z-index: 0; margin-top: var(--imagin-drop);
+}
+.imagin-slot + .imagin-slot { margin-inline-start: calc(-1 * var(--imagin-overlap)); }
+.imagin-slot.imagin-brave { z-index: 1; margin-top: 0; }
+.playmat .pm-field-zone .imagin-slot .pm-unit {
+  display: block; width: calc(100% / var(--imagin-weight)); margin: 0 auto; padding: 0;
+}
+.playmat .pm-field-zone .imagin-slot .pm-card { width: 100%; }
+.imagin-slot .pm-unit.pm-exhausted,
+.imagin-slot .pm-unit.pm-heavy-exhausted { transform-origin: center; }
+/* 回転後もコスト/Lv/BPを異魔神の下に隠さない。 */
+.imagin-brave + .imagin-slot { --imagin-inset-left: 10%; }
+.imagin-slot:has(+ .imagin-brave) { --imagin-inset-right: 10%; }
+.imagin-slot .pm-unit .pm-top {
+  left: var(--imagin-inset-left, 0%); right: var(--imagin-inset-right, 0%);
+}
+.imagin-slot .pm-unit.pm-heavy-exhausted .pm-top {
+  left: var(--imagin-inset-right, 0%); right: var(--imagin-inset-left, 0%);
+}
+.imagin-slot .pm-unit.pm-exhausted .pm-top { left: 0; right: 0; }
+.imagin-slot:has(+ .imagin-brave) .pm-unit.pm-exhausted .pm-top { top: 22%; }
 /* 札の中段は最大12個まで実物を1列に縮め、超過だけ右端の「…」で示す。 */
 .playmat .pm-unit .cores{gap:.1cqw;flex-wrap:nowrap;overflow:visible}
 .playmat .pm-unit .cores .unit-orb-line{display:flex;align-items:center;justify-content:center;gap:.1cqw;width:100%;white-space:nowrap}
@@ -635,6 +663,72 @@ body[data-workspace="builder"] #deck-panel .pseudo-card{min-height:5.2rem}
   }
   globalThis.BSDBTraceReport = Object.freeze({ text });
 })();
+
+// Shared by the PWA and the generated portable board.
+function renderBattleField(field, renderUnit, renderBrave) {
+  const byUid = new Map(field.map(unit => [unit.uid, unit]));
+  const attached = new Map();
+  const next = new Map();
+  const hasPrevious = new Set();
+  let ordered = true;
+
+  for (const brave of field) {
+    if (brave.brave_mode !== "combine") continue;
+    const links = brave.combined_sides ? Object.entries(brave.combined_sides)
+      : brave.combined_host_uid == null ? [] : [[null, brave.combined_host_uid]];
+    for (const [side, hostUid] of links) {
+      const rows = attached.get(hostUid) || [];
+      rows.push({ ...brave, linkSide: side });
+      attached.set(hostUid, rows);
+      const host = byUid.get(hostUid);
+      if (!side || !host || host.brave_mode === "combine") continue;
+      const [from, to] = side === "left" ? [hostUid, brave.uid] : [brave.uid, hostUid];
+      if (next.has(from) || hasPrevious.has(to)) ordered = false;
+      next.set(from, to);
+      hasPrevious.add(to);
+    }
+  }
+
+  // An Imagin is between its hosts. A Spirit that takes two Imagins can
+  // connect two such groups into a longer row. Closed loops have no start
+  // and keep the per-host attachments with explicit side labels.
+  const groupByUid = new Map();
+  if (ordered) {
+    for (const unit of field) {
+      if (!next.has(unit.uid) || hasPrevious.has(unit.uid)) continue;
+      const group = [unit];
+      for (let uid = next.get(unit.uid); uid != null; uid = next.get(uid)) {
+        group.push(byUid.get(uid));
+      }
+      for (const member of group) groupByUid.set(member.uid, group);
+    }
+  }
+
+  const rendered = new Set();
+  const attachmentsFor = unit => (attached.get(unit.uid) || [])
+    .filter(brave => !groupByUid.has(brave.uid));
+  // Eternal rule manual p09: the upright hosts tuck about 9% under the Brave
+  // and sit about 20% of a card width lower. Reserve the long edge of each
+  // host so that fatigue keeps the same center and still fits on its own side.
+  const longEdge = 1.4;
+  const overlap = 0.09 + (longEdge - 1) / 2;
+  const drop = 0.2;
+  return field.map(unit => {
+    const group = groupByUid.get(unit.uid);
+    if (!group) return unit.brave_mode === "combine" ? "" : renderUnit(unit, attachmentsFor(unit));
+    if (rendered.has(group)) return "";
+    rendered.add(group);
+    let span = -overlap * (group.length - 1);
+    const slots = group.map(member => {
+      const isBrave = member.brave_mode === "combine";
+      const weight = isBrave ? 1 : longEdge;
+      span += weight;
+      return `<div class="imagin-slot${isBrave ? " imagin-brave" : ""}" style="--imagin-weight:${weight}">${isBrave
+        ? renderBrave(member) : renderUnit(member, attachmentsFor(member))}</div>`;
+    }).join("");
+    return `<div class="imagin-group" style="--imagin-span:${span};--imagin-overlap:${overlap / span * 100}%;--imagin-drop:${drop / span * 100}%">${slots}</div>`;
+  }).join("");
+}
 </script>
 <script src="portable_images.js"></script>
 <script>
@@ -759,7 +853,32 @@ function orbs(n,soul=false,limit=5){n=Math.max(0,Number(n)||0);if(!n)return'<spa
 function unitOrbs(n,soul=false){n=Math.max(0,Number(n)||0);if(!n)return'<span class="core-zero">0</span>';const normal=Math.max(0,n-(soul?1:0)),shown=Math.min(normal,12-(soul?1:0)),slots=shown+(soul?1:0)+(n>12?1:0),size=Math.min(1.8,Math.max(.55,(10.9-Math.max(0,slots-1)*.1)/Math.max(1,slots)));return`<span class="unit-orb-line" style="--unit-orb-size:${size.toFixed(3)}cqw">${soul?'<span class="orb soul"></span>':""}${Array.from({length:shown},()=>'<span class="orb"></span>').join("")}${n>12?`<span class="orb-more orb-many" data-core-count="${normal}" role="button" tabindex="0" title="タップでコアを全部表示" aria-label="コア${normal}個。タップで全部表示">…</span>`:""}</span>`}
 function zone(label,body,count="",extra=""){return`<div class="pm-zone ${extra}"><span class="pm-label"><span>${label}</span><span>${count}</span></span>${body}</div>`}
 function fieldBodies(field){return(field||[]).filter(u=>u.brave_mode!=="combine")}
-function renderField(field){const all=field||[],braves=new Map;all.filter(u=>u.brave_mode==="combine").forEach(u=>{const links=u.combined_sides?Object.entries(u.combined_sides):u.combined_host_uid==null?[]:[[null,u.combined_host_uid]];for(const[side,hostUid]of links){const rows=braves.get(hostUid)||[];rows.push({...u,linkSide:side});braves.set(hostUid,rows)}});const bodies=fieldBodies(all);return bodies.length?'<span class="pm-field-notch" aria-hidden="true"></span>'+bodies.map(u=>{const attached=braves.get(u.uid)||[],under=[...(u.kourin_stack||[])].reverse(),base=`${cardFace(u,u.waiting?"waiting":"",under)}${under.length?`<span class="pm-stack" title="煌臨元${under.length}枚（上から）: ${esc(under.map(cardName).join("、"))}">${under.length}</span>`:""}<span class="cores${u.soul_core?" has-soul":""}" title="維持コア${u.cores??0}個${u.soul_core?"（うちソウルコア1個）":""}">${unitOrbs(u.cores,!!u.soul_core)}</span><span class="pm-top">${byNo.get(u.card_no)?.cost!=null?`<span class="pm-cost">${byNo.get(u.card_no).cost}</span>`:""}${u.level?`<span class="lv">Lv${u.level}</span>`:""}${u.bp?`<span class="bp">BP ${Number(u.bp).toLocaleString()}</span>`:""}</span>`;const tired=u.heavy_exhausted?" pm-heavy-exhausted":u.exhausted?" pm-exhausted":"";if(!attached.length)return`<div class="pm-unit${tired}">${base}</div>`;return`<div class="pm-unit pm-combined${attached.some(b=>b.linkSide)?" pm-imagin-combined":""}${tired}" title="${esc(cardName(u))}と${esc(attached.map(cardName).join("、"))}が合体中"><div class="pm-combined-host">${base}</div>${attached.map((b,i)=>`<div class="pm-brave-attachment"${attached.length===2&&attached.every(b=>b.linkSide)?` style="left:${i*5.75}cqw;top:${-10.35-i*2.3}cqw;z-index:${3-i}"`:""} title="${b.linkSide?(b.linkSide==="left"?"左合体中":"右合体中"):"合体中"}">${cardFace(b)}${b.linkSide?`<span class="brave-side-badge">${b.linkSide==="left"?"左":"右"}</span>`:""}</div>`).join("")}</div>`}).join(""):'<span class="pm-empty">なし</span>'}
+function renderField(field){
+  const units = renderBattleField(field || [], renderFieldUnit, brave => cardFace(brave));
+  return units ? '<span class="pm-field-notch" aria-hidden="true"></span>' + units
+    : '<span class="pm-empty">なし</span>';
+}
+
+function renderFieldUnit(u, attached) {
+  const under = [...(u.kourin_stack || [])].reverse();
+  const base = `${cardFace(u, u.waiting ? "waiting" : "", under)}
+    ${under.length ? `<span class="pm-stack" title="煌臨元${under.length}枚（上から）: ${esc(under.map(cardName).join("、"))}">${under.length}</span>` : ""}
+    <span class="cores${u.soul_core ? " has-soul" : ""}" title="維持コア${u.cores ?? 0}個${u.soul_core ? "（うちソウルコア1個）" : ""}">${unitOrbs(u.cores, !!u.soul_core)}</span>
+    <span class="pm-top">${byNo.get(u.card_no)?.cost != null ? `<span class="pm-cost">${byNo.get(u.card_no).cost}</span>` : ""}${u.level ? `<span class="lv">Lv${u.level}</span>` : ""}${u.bp ? `<span class="bp">BP ${Number(u.bp).toLocaleString()}</span>` : ""}</span>`;
+  const tired = u.heavy_exhausted ? " pm-heavy-exhausted" : u.exhausted ? " pm-exhausted" : "";
+  if (!attached.length) return `<div class="pm-unit${tired}">${base}</div>`;
+  const imagin = attached.some(brave => brave.linkSide);
+  const spread = attached.length === 2 && attached.every(brave => brave.linkSide);
+  const attachments = attached.map((brave, index) =>
+    `<div class="pm-brave-attachment"${spread ? ` style="left:${index * 5.75}cqw;top:${-10.35 - index * 2.3}cqw;z-index:${3 - index}"` : ""}
+      title="${brave.linkSide ? (brave.linkSide === "left" ? "左合体中" : "右合体中") : "合体中"}">
+      ${cardFace(brave)}${brave.linkSide ? `<span class="brave-side-badge">${brave.linkSide === "left" ? "左" : "右"}</span>` : ""}
+    </div>`
+  ).join("");
+  return `<div class="pm-unit pm-combined${imagin ? " pm-imagin-combined" : ""}${tired}" title="${esc(cardName(u))}と${esc(attached.map(cardName).join("、"))}が合体中">
+    <div class="pm-combined-host">${base}</div>${attachments}
+  </div>`;
+}
 function stage6TurnOwner(ev){return ev.details?.turn_player||ev.state?.active_player||ev.actor}
 function stage6OwnerClass(ev){return ev.actor?`event-owner-${ev.actor}`:""}
 function stage6Context(ev){if(ev.type==="match_opening")return"対戦開始";const turn=stage6TurnOwner(ev),turnLabel=turn==="self"?"自分":"相手",actorLabel=ev.actor==="self"?"自分":ev.actor==="opponent"?"相手":"両者";return ev.actor&&turn&&ev.actor!==turn?`${turnLabel}ターン中・${actorLabel}の処理`:`${turnLabel}ターン・${actorLabel}の処理`}
