@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v258-v1";
-  const STAGE_VERSION = "v258";
+  const ENGINE_SLICE = "stage4-v259-v1";
+  const STAGE_VERSION = "v259";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v258-portable-v204";
+  const RUNTIME_VERSION = "stage4-v259-portable-v205";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1884,6 +1884,7 @@
         recordCoreMove(state, cards, { amount: source.cost, source: "field",
           destination: "void", reason: "contract_technique",
           source_card_no: unit.card_no, source_uid: unit.uid });
+        notifyCreatorCoreDecreased(state, cards, targets, unit, source.cost);
       }
       const chosen = new Set();
       for (const effect of source.effects) {
@@ -6887,6 +6888,7 @@
       for (const {donor, amount:take} of plan) {
         const takesSoul = donor.soul_core && take > donor.cores - 1;
         donor.cores -= take;
+        notifyCreatorCoreDecreased(state, cards, targets, donor, take);
         if (takesSoul) {
           movedSoul = true;
           donor.soul_core = false;
@@ -8002,7 +8004,7 @@
   }
 
   // 発揮元が自分自身の出来事でも撃つ誘発。Python `SELF_INCLUSIVE_EVENTS`と同一。
-  const SELF_INCLUSIVE_EVENTS = new Set(["ally_attacked", "u_trigger_hit", "u_trigger_guard", "u_trigger_after", "opponent_destroyed_by_effect", "own_removed_by_opponent_effect", "soul_core_placed"]);
+  const SELF_INCLUSIVE_EVENTS = new Set(["ally_attacked", "u_trigger_hit", "u_trigger_guard", "u_trigger_after", "opponent_destroyed_by_effect", "own_removed_by_opponent_effect", "soul_core_placed", "creator_core_decreased"]);
 
   function notifyOwnRemovedByOpponentEffect(state,cards,targets,unit,opponent=null) {
     if (!state.field.some(u=>(cards[u.card_no]?.triggered_effects || []).some(e=>
@@ -8015,6 +8017,19 @@
         target_type:unit.brave_mode==='spirit'?'スピリット':cards[unit.card_no].card_type,
         attack_step:!state.ownTurnActive && !state.ownAttackActive && Boolean(other?.in_attack_step?.())},other);
     } finally {endEffectFrame(state);if (!state.effectFrameDepth) flushCountReactions(state,cards,targets);}
+  }
+
+  /** 自分の創界神ネクサスのコアが効果で減った(T119、Q29435)。
+   *  Python `_notify_creator_core_decreased`と同一。 */
+  function notifyCreatorCoreDecreased(state, cards, targets, unit, amount) {
+    if (amount <= 0 || !unit || !(cards[unit.card_no]?.lineages || []).includes("創界神")) return;
+    if (!state.field.some(u => (cards[u.card_no]?.triggered_effects || []).some(e =>
+        e.trigger?.event === "creator_core_decreased"))) return;
+    beginEffectFrame(state);
+    try {
+      resolveEventTriggers(state, cards, targets, "creator_core_decreased",
+        { uid: unit.uid, card_no: unit.card_no, amount });
+    } finally { endEffectFrame(state); if (!state.effectFrameDepth) flushCountReactions(state, cards, targets); }
   }
 
   function notifySoulCorePlaced(state, cards, targets, uid) {
@@ -8113,6 +8128,9 @@
           if (!SUMMONABLE_CARD_TYPES.has(played.card_type)) continue;
           if (KOURIN_PLAY_SOURCES.has(payload.source) && !trigger.includes_kourin) continue;
         }
+        // 「自分の「◯◯」のコアが減ったとき」(T119、Python同一)。
+        if (trigger.creator_name != null
+            && !(cards[payload.card_no]?.name || "").includes(trigger.creator_name)) continue;
         if (trigger.slot && !cardMatchesSlot(unitInfo(state, cards, payload), trigger.slot)) continue;
         if (trigger.combined_brave_slot) {
           if (!(payload.combined_braves || []).some((cardNo) => cards[cardNo]
@@ -8156,7 +8174,7 @@
         const reaction = {event,payload,branches,sourceUid,sourceCardNo};
         if (reactionOwner?.defer_opponent_effect_reaction?.({event,payload,branches,
             source_uid:sourceUid,source_card_no:sourceCardNo})) continue;
-        if (["opponent_destroyed_by_effect", "soul_core_placed", "own_removed_by_opponent_effect"].includes(event)) {
+        if (["opponent_destroyed_by_effect", "soul_core_placed", "own_removed_by_opponent_effect", "creator_core_decreased"].includes(event)) {
           state.pendingEffectReactions.push({...reaction,seq:state.derivedSeq++});
         } else resolveEventTriggerChoice(state, cards, targets, reaction);
       }
@@ -8992,7 +9010,7 @@
     const traceDetails = { mode, pay: candidate.pay, total: candidate.total, ...manifestationPayment };
     // トラッシュからの召喚も通常の召喚と同じ支払いなので、同じ鍵を持つ(2026-10-11、
     // Python `play_card`の`trace_mode`と同一。それまで`brave_mode`を書いていなかった)。
-    if (["normal", "manifestation", "trash_main_summon", "trigger_counter", "deck_discard_protection", "shadow"].includes(mode)) {
+    if (["normal", "manifestation", "trash_main_summon", "creator_core_summon", "trigger_counter", "deck_discard_protection", "shadow"].includes(mode)) {
       traceDetails.creator_uid = candidate.manifestation_creator_uid ?? null;
       traceDetails.brave_mode = candidate.brave_mode;
     }
@@ -9797,6 +9815,50 @@
     return paid ? trial.dig + trial.handGain - before : 0;
   }
 
+  /** 創界神ネクサスのコアをボイドに置いて自分を召喚する経路を使う(T119)。
+   *  Python `_resolve_creator_core_summons`と同一。先読みの写し(`speculative`)では使わない。 */
+  function resolveCreatorCoreSummons(state, cards, targets) {
+    if (state.speculative) return false;
+    for (const [zone, pile] of [["hand", state.hand], ["trash", state.trashCards]]) {
+      for (const cardNo of [...new Set(pile)]) {
+        const card = cards[cardNo];
+        const route = card?.creator_core_summon;
+        if (!route || route.source_zone !== zone) continue;
+        const limitKey = `creator_core_summon\u0000${card.name}`;
+        if (state.blockTurnUsed.has(limitKey)) continue;
+        if (card.is_brave || (card.summon_conditions || []).length) continue;
+        const need = route.creator_cores;
+        const donor = state.field.filter((unit) => !unit.waiting
+          && (cards[unit.card_no]?.lineages || []).includes("創界神")
+          && (unitInfo(state, cards, unit)?.name || "").includes(route.creator_name)
+          // ソウルコアはボイドに置けない。
+          && unit.cores - Number(Boolean(unit.soul_core)) >= need)
+          .sort((left, right) => right.cores - left.cores || left.uid - right.uid)[0];
+        if (!donor) continue;
+        const pay = route.pay;
+        const maintenance = entryMaintenance(state, cards, card);
+        const total = pay + maintenance;
+        if (!costAffordable(state, cards, pay, total, true)) continue;
+        state.blockTurnUsed.add(limitKey);
+        donor.cores -= need;
+        recordCoreMove(state, cards, { amount: need, source: "field",
+          destination: "void", reason: "creator_core_summon_cost",
+          source_card_no: cardNo, source_uid: donor.uid });
+        // 【契約域】と召喚時効果は同時に誘発し、順はターンプレイヤーが決める(Q29274)。
+        // ここではコアが減った誘発を先に解いてから召喚する。
+        notifyCreatorCoreDecreased(state, cards, targets, donor, need);
+        if (zone === "trash") {
+          state.trashCards.splice(state.trashCards.indexOf(cardNo), 1);
+          state.hand.push(cardNo);
+        }
+        play(state, cards, targets, { card_no: cardNo, pay, total, maintenance,
+          brave_mode: null, allow_sacrifice: true, mode: "creator_core_summon" });
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** メインステップのプレイを最後まで進める。`floor`は6C-3の残す額。
    *  Python `_play_out_main_step` と同一。 */
   function playOutMainStep(state, cards, targets, floor, held = []) {
@@ -9808,6 +9870,7 @@
         if (!candidate || !play(state, cards, targets, candidate)) break;
         resolveMainActivatedEffects(state, cards, targets);
         resolveTrashMainSummon(state, cards, targets);
+        while (resolveCreatorCoreSummons(state, cards, targets)) { /* 使える経路を使い切る */ }
         noteLegalCandidates(state, cards, targets);
       }
     } finally {
@@ -13252,6 +13315,7 @@
       }
       resolveMainActivatedEffects(state, cards, targets);
       resolveTrashMainSummon(state, cards, targets);
+      while (resolveCreatorCoreSummons(state, cards, targets)) { /* 使える経路を使い切る */ }
       // 6C-3 「バーストのフラッシュ効果のためにコアを残すか」。**両方を最後まで
       // 試して、目的関数(dig + handGain)が大きいほうを採る**。残す側の見返りは
       // 本体効果を実測した増分、出し切る側の見返りはプレイの増分。**残す損失は
@@ -13271,11 +13335,13 @@
         if (removalPlan.reason === "hold") {
           const spendTrial = clone(state);
           spendTrial.trace = false;
+          spendTrial.speculative = true;
           spendTrial.events = [];
           playOutMainStep(spendTrial, cards, targets, 0);
           spendScore = spendTrial.dig + spendTrial.handGain;
           const holdTrial = clone(state);
           holdTrial.trace = false;
+          holdTrial.speculative = true;
           holdTrial.events = [];
           playOutMainStep(holdTrial, cards, targets, removalPlan.cost, removalPlan.cards);
           holdScore = holdTrial.dig + holdTrial.handGain;
@@ -13297,12 +13363,14 @@
       } else {
         const spendTrial = clone(state);
         spendTrial.trace = false;
+        spendTrial.speculative = true;
         spendTrial.events = [];
         playOutMainStep(spendTrial, cards, targets, removalFloor, heldCards);
         const spendScore = spendTrial.dig + spendTrial.handGain
           + burstFollowupGain(spendTrial, cards, targets, holdPlan);
         const holdTrial = clone(state);
         holdTrial.trace = false;
+        holdTrial.speculative = true;
         holdTrial.events = [];
         playOutMainStep(holdTrial, cards, targets, holdPlan.cost + removalFloor, heldCards);
         const holdScore = holdTrial.dig + holdTrial.handGain
