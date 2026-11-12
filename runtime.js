@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v257-v1";
-  const STAGE_VERSION = "v257";
+  const ENGINE_SLICE = "stage4-v258-v1";
+  const STAGE_VERSION = "v258";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v257-portable-v203";
+  const RUNTIME_VERSION = "stage4-v258-portable-v204";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -2519,7 +2519,7 @@
   }
 
   /** 対価の供給元になる自分のユニットか。Python `_payment_unit_matches` と同一。 */
-  function paymentUnitMatches(unit, cards, payment) {
+  function paymentUnitMatches(state, unit, cards, payment) {
     if (unit.waiting) return false;
     // 場の体は今の色(自身の枠色書換、T87の3)。
     // 書換を持たない札は印字のまま(読みを引かない)。
@@ -2562,7 +2562,7 @@
   /** コアを払える自分のユニットを、**多く持っている順**に返す。 */
   function paymentCoreDonors(state, cards, payment, amount) {
     return state.field
-      .filter((unit) => paymentUnitMatches(unit, cards, payment)
+      .filter((unit) => paymentUnitMatches(state, unit, cards, payment)
         && unit.cores - Number(Boolean(unit.soul_core)) >= amount
         && unit.cores - amount >= unitFloor(state, cards, unit))
       .sort((left, right) => right.cores - left.cores || left.uid - right.uid);
@@ -2651,14 +2651,14 @@
       const donors = creatorCorePlan(state, cards, paymentCoreDonors(state, cards, payment, 1), amount, true);
       return donors ? {donors} : null;
     }
-    if (kind === "reserve_core_to_flag") {
+    if (kind === "void_core_to_flag") {
       const amount = Number(payment.amount || 1);
       const targetUnits = state.field
-        .filter((unit) => paymentUnitMatches(unit, cards, payment))
+        .filter((unit) => isCreatorNexus(cards, unit)
+          && paymentUnitMatches(state, unit, cards, payment)
+          && creatorCoreRoom(state, cards, unit) >= amount)
         .sort((left, right) => left.uid - right.uid);
-      if (!targetUnits.length
-        || state.reserve - Number(state.reserveHasSoul) < amount) return null;
-      return { target: targetUnits[0], amount };
+      return targetUnits.length ? { target: targetUnits[0], amount } : null;
     }
     if (kind === "own_core_trash") {
       const amount = Number(payment.amount || 1);
@@ -2682,7 +2682,7 @@
       if (holder && isCreatorNexus(cards, holder)) return null;
       if (holder && holder.uid===sourceUid && holder.cores-1<unitFloor(state, cards, holder)) return null;
       const targetUnits = state.field
-        .filter((unit) => paymentUnitMatches(unit, cards, payment) && creatorCoreRoom(state,cards,unit)>0)
+        .filter((unit) => paymentUnitMatches(state, unit, cards, payment) && creatorCoreRoom(state,cards,unit)>0)
         .sort((left, right) => left.uid - right.uid);
       const origin = holder ? "field" : state.reserveHasSoul ? "reserve"
         : state.trashHasSoul ? "trash" : state.lifeHasSoul && canPayLife(state, cards, 1) ? "life" : null;
@@ -2800,9 +2800,8 @@
         destination: "trash", reason, source_uid: sourceUid ?? null });
     }
     if (plan.target) {
-      state.reserve -= plan.amount;
       plan.target.cores += plan.amount;
-      recordCoreMove(state, cards, { amount: plan.amount, source: "reserve",
+      recordCoreMove(state, cards, { amount: plan.amount, source: "void",
         destination: "field", reason, source_uid: sourceUid ?? null,
         target_uid: plan.target.uid });
     }
@@ -7213,6 +7212,8 @@
     const effects = locked ? [] : card.burst_effects || [];
     let selfPlayed = false;
     const derivedMark = state.derivedSeq;
+    const playMark = state.deferredDerivedPlays.length;
+    const completionMark = state.deferredPlayCompletions.length;
     const printedBoundary = effects.some(effect =>
       effect.connector_before === "この効果発揮後");
     let returnedToHand = false;
@@ -7250,8 +7251,18 @@
             state[key].push(...rows.filter(row=>row.seq>=derivedMark));
             return [key,peers];
           });
-          try { flushCountReactions(state,cards,targets); }
-          finally { for(const [key,peers] of waiting) state[key].unshift(...peers); }
+          waiting.push(["deferredDerivedPlays", state.deferredDerivedPlays.splice(0, playMark)]);
+          waiting.push(["deferredPlayCompletions", state.deferredPlayCompletions.splice(0, completionMark)]);
+          try {
+            flushCountReactions(state, cards, targets);
+            while (state.deferredDerivedPlays.length) {
+              const play = state.deferredDerivedPlays.shift();
+              if (play.run) play.run(); else play();
+            }
+            flushDerivedPlayReactions(state, cards, targets);
+          } finally {
+            for (const [key, peers] of waiting) state[key].unshift(...peers);
+          }
         }
         // 直接合体は維持コアが要らない（裁定3616、Python同一）。以前は合体させても
         // 維持コアぶんをリザーブから払い、どこにも置かずに消していた。
@@ -9057,7 +9068,8 @@
     if (card.soul_paid_on_play) traceDetails.soul_core_used_for_summon_cost = soulCoreUsedForSummonCost;
     state.reserve -= candidate.total;
     state.spent += candidate.pay;
-    if (funding) endEffectFrame(state);
+    const keepFundingFrame = funding && watchEvent(card, mode) === "summon";
+    if (funding && !keepFundingFrame) endEffectFrame(state);
     record(state, cards, "cost_paid", { card_no: candidate.card_no,
       payment: mode === "free_deploy" ? "none"
         : preserveSoul ? "manifestation_soul_waived"
@@ -9157,18 +9169,20 @@
       beginEffectFrame(state);
       try { body(); } finally { endEffectFrame(state); }
     };
-    const finishPlay = inFrame(() => {
+    const resolvePlay = () => {
       preBody();
       resolvePlayedEffects(...playedArgs());
       postBody();
-    });
+    };
+    const finishPlay = inFrame(resolvePlay);
+    const parentDepth = state.effectFrameDepth - Number(keepFundingFrame);
     const waitsBehindExistingDerivedPlay = mode === "hand_reaction"
-      && state.effectFrameDepth > 0 && state.deferredPlayCompletions.length > 0;
+      && parentDepth > 0 && state.deferredPlayCompletions.length > 0;
     // 効果の途中で出した召喚(`zone_summon`、v66)は、召喚時効果と完了を親の
     // 効果の窓が閉じた直後に解く(Pythonは`runtime.reserve`で同じ順になる)。
     // 専用の待ち行列にして、窓の直後に同期的に空にする——先読みの複製に
     // 関数を残さないため。
-    if (candidate.derived_play && state.effectFrameDepth > 0) {
+    if (candidate.derived_play && parentDepth > 0) {
       // 親の窓が`mergeDerived`なら召喚時効果を派生の候補として取り込み、完了は
       // 窓の後(`post`)。取り込まれなければ`run`で従来どおりまとめて解く。
       state.deferredDerivedPlays.push({
@@ -9178,14 +9192,18 @@
         post: inFrame(postBody),
       });
     } else if (["burst_free_play", "burst_paid_followup"].includes(mode)
-        || (mode === "face_up_draw_replacement" && state.effectFrameDepth > 0)
+        || (mode === "face_up_draw_replacement" && parentDepth > 0)
         || waitsBehindExistingDerivedPlay) {
       state.deferredPlayCompletions.push(finishPlay);
     } else if (Array.isArray(candidate.completion_sink)) {
       // 呼び出し元が残りの処理の後で解く(`reveal_play_remainder`。Pythonの
       // `deferred_batch`と同じ位置)。
       candidate.completion_sink.push(finishPlay);
+    } else if (keepFundingFrame) {
+      try { resolvePlay(); } finally { endEffectFrame(state); }
+      return true;
     } else finishPlay();
+    if (keepFundingFrame) endEffectFrame(state);
     return true;
   }
 
