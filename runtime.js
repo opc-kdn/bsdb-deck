@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v261-v1";
-  const STAGE_VERSION = "v261";
+  const ENGINE_SLICE = "stage4-v262-v1";
+  const STAGE_VERSION = "v262";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v261-portable-v207";
+  const RUNTIME_VERSION = "stage4-v262-portable-v208";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3536,7 +3536,7 @@
       const effects = [...(card.enablers || []).filter((effect) => effect.mode === "on_play"),
         ...(card.on_play_opponent_effects || [])];
       if (!effects.length || !effects.every((effect) => effect.flash_timing)) return;
-      const grants = effects.filter(effect => effect.recipient === "battling")
+      const grants = effects.filter(effect => effect.recipient === "chosen_ally")
         .flatMap(effect => effect.granted_effects)
         .filter(entry => grantUnitMatches(state, cards, entry.protect, false, unit, new Map()))
         .map(entry => ({ window: entry.window, battle_end_from: [...(entry.battle_end_from || [])],
@@ -6418,14 +6418,19 @@
       return true;
     }
     if (effect.kind === "register_effect_grant") {
-      if (effect.recipient === "battling") {
-        // このバトルの間、1体に(T17-TRIG)。バトル中の自分の体に固定する。Python同一。
-        const chosenUid = state.battleActive ? state.battlingUid : null;
-        const chosen = state.field.find(row => row.uid === chosenUid);
-        if (!chosen || chosen.waiting) return false;
-        const entries = effect.granted_effects
-          .filter(entry => grantUnitMatches(state, cards, entry.protect, false, chosen, new Map()))
-          .map(entry => ({ ...entry, fixed_uid: chosenUid, period: "battle" }));
+      if (effect.recipient === "chosen_ally") {
+        // このバトルの間、1体に(T17-TRIG)。条件に合う自分のスピリットから選んで固定する。
+        // バトル中でなければ空振り(Q17541)。バトル中の体を優先。Python同一。
+        if (!state.battleActive) return false;
+        const field = [...state.field].sort((left, right) => left.uid - right.uid);
+        const entries = [];
+        for (const entry of effect.granted_effects) {
+          const matching = field.filter(unit =>
+            grantUnitMatches(state, cards, entry.protect, false, unit, new Map())).map(unit => unit.uid);
+          if (!matching.length) continue;
+          const chosenUid = matching.includes(state.battlingUid) ? state.battlingUid : matching[0];
+          entries.push({ ...entry, fixed_uid: chosenUid, period: "battle" });
+        }
         if (!entries.length) return false;
         state.effectGrants.push(...entries.map(entry => [sourceUid, entry]));
         return true;
@@ -9300,7 +9305,7 @@
     // 効果の記述の扱いの付与(T89-GRANT)だけでは出す理由にしない。Python `collect_playable`同一。
     if ((card.enablers || []).some((effect) =>
       ["on_play", "recurring"].includes(effect.mode) && effect.kind !== "effect_text_grant"
-        && !effect.requires_battle
+        && !effect.battle_scoped
         && !(candidate.brave_mode === "spirit" && effect.combine_only))) return true;
     if (MAIN_STEP_OPPONENTS.has(state)
         && (card.on_play_opponent_effects || []).some((effect) =>
