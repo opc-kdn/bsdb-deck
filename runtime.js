@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v268-v1";
-  const STAGE_VERSION = "v268";
+  const ENGINE_SLICE = "stage4-v269-v1";
+  const STAGE_VERSION = "v269";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v268-portable-v213";
+  const RUNTIME_VERSION = "stage4-v269-portable-v214";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -910,6 +910,7 @@
   }
   const BASIC_COLORS = ["赤", "紫", "緑", "白", "黄", "青"];
   const SUPPORTED_EFFECTS = new Set([
+    "brave_attack_borrow",
     "self_remain",
     "attack_step_end", "timed_attack_life_cap",
     "effect_text_grant", "register_effect_grant",
@@ -12955,6 +12956,17 @@
               gate_source: group.source,
               imagin_limit_host: combinedSide(group.source,uid) ? uid : null,
             }));
+          const borrowedAttackDraw = (sourceUid) => {
+            if (!state.deck.length || !cards[unit.card_no].card_type.includes("スピリット")) return null;
+            let best = null;
+            for (const donor of [...state.field].sort((left, right) => left.uid - right.uid)) {
+              if (donor.uid === sourceUid || donor.waiting) continue;
+              for (const row of cards[donor.card_no].attack_effects || []) {
+                if (row.brave_borrowable && (!best || row.amount > best.amount)) best = row;
+              }
+            }
+            return best;
+          };
           const resolveCombatInstance = (instance) => {
             state.derivedEffectBuffer = [];
             // 「Aするか、Bする」(2026-10-13): 解いてみて良い方の枝だけ(Python同一)。
@@ -12962,8 +12974,17 @@
             const decidedAlternatives = new Map();
             const usable = (row) => !(instance.gate_source.brave_mode === "spirit"
               && row.combine_only);
-            for (const [clauseIndex, effect] of instance.clauses.entries()) {
-              if (!usable(effect)) continue;
+            for (const [clauseIndex, clause] of instance.clauses.entries()) {
+              if (!usable(clause)) continue;
+              let effect = clause;
+              let sourceNo = instance.source_card_no;
+              if (clause.kind === "brave_attack_borrow") {
+                const donor = borrowedAttackDraw(instance.source_uid);
+                if (!donor) continue;
+                sourceNo = unit.card_no;
+                effect = {kind: "draw", amount: donor.amount, mode: "on_attack",
+                  source_card_no: sourceNo, effect_id: donor.effect_id};
+              }
               if (effect.kind === "attack_step_end" && !effectActive(effect, state, cards, uid)) continue;
               const group = effect.exclusive_group ?? null;
               if (group !== null && chosen.has(group)) continue;
@@ -12972,10 +12993,10 @@
                   && usable(row)),
                 (row) => resolveEffect(state, cards, targets, row, uid),
                 state.combatOpponent || null)) continue;
-              record(state, cards, "effect_start", { card_no: instance.source_card_no, uid,
+              record(state, cards, "effect_start", { card_no: sourceNo, uid,
                 effect_kind: effect.kind, fired_timing: instance.fired_timing, effect_tag: effect.effect_tag || null, window });
               const ok = resolveEffect(state, cards, targets, effect, uid);
-              record(state, cards, "effect_complete", { card_no: instance.source_card_no, uid,
+              record(state, cards, "effect_complete", { card_no: sourceNo, uid,
                 effect_kind: effect.kind, fired_timing: instance.fired_timing, effect_tag: effect.effect_tag || null,
                 window, resolved: ok });
               resolved.push({ kind: effect.kind, effect_id: effect.effect_id ?? null,
@@ -12997,6 +13018,7 @@
             && grantKeysActive(state, cards, instance, uid)
             && instance.clauses.some((effect) =>
               !(instance.gate_source.brave_mode === "spirit" && effect.combine_only)
+              && (effect.kind !== "brave_attack_borrow" || borrowedAttackDraw(instance.source_uid))
               && effectActive(effect, state, cards, uid)
               // 任意の自己回復は回復状態なら対価/同名回数を温存(Python同一)。
               && (effect.kind !== "self_refresh"
