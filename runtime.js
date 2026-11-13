@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v259-v1";
-  const STAGE_VERSION = "v259";
+  const ENGINE_SLICE = "stage4-v261-v1";
+  const STAGE_VERSION = "v261";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v259-portable-v205";
+  const RUNTIME_VERSION = "stage4-v261-portable-v207";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3493,6 +3493,60 @@
       } finally { endEffectFrame(state);flushCountReactions(state,cards,targets); }
       return {card_no:effect.source_card_no,uid,cost:0,source_zone:"field",payment_index:paymentIndex};
     } finally { [state.combatOpponent,state.preferredTargets]=previous; }
+  }
+
+  /** 手札のフラッシュのマジックを1枚撃つ(除去・付与の共通)。Python
+   *  `_combat_play_flash_removal_unchecked`と同一。 */
+  function playFlashMagic(state, cards, targets, cardNo, opponent, prefer) {
+    if (!opponent) return null;
+    const card = cards[cardNo];
+    const cost = paymentForState(state, cards, card);
+    const previous = [state.combatOpponent || null, MAIN_STEP_OPPONENTS.get(state),
+      state.preferredTargets];
+    state.combatOpponent = opponent;
+    MAIN_STEP_OPPONENTS.set(state, opponent);
+    state.preferredTargets = [...prefer];
+    try {
+      // メインステップの候補(`legalCandidates`)と同じ形。Python `play_card`と同一。
+      play(state, cards, targets, { hand_index: state.hand.indexOf(cardNo),
+        card_no: cardNo, brave_mode: null, allow_sacrifice: false, mode: "normal",
+        manifestation_creator_uid: null, ...cost });
+    } finally {
+      state.combatOpponent = previous[0];
+      if (previous[1]) MAIN_STEP_OPPONENTS.set(state, previous[1]);
+      else MAIN_STEP_OPPONENTS.delete(state);
+      state.preferredTargets = previous[2];
+    }
+    return { card_no: cardNo, cost: cost.total };
+  }
+
+  /** 手順4で撃てる「このバトルの間、1体に」の付与のマジック(T17-TRIG)。
+   *  Python `_combat_flash_battle_grant_options`と同一。 */
+  function flashBattleGrantOptions(state, cards) {
+    const uid = state.battleActive ? state.battlingUid : null;
+    const unit = state.field.find(row => row.uid === uid);
+    if (!unit || unit.waiting) return [];
+    const options = [];
+    const seen = new Set();
+    state.hand.forEach((cardNo, handIndex) => {
+      if (seen.has(cardNo)) return;
+      seen.add(cardNo);
+      const card = cards[cardNo];
+      if (!card || card.card_type !== "マジック") return;
+      const effects = [...(card.enablers || []).filter((effect) => effect.mode === "on_play"),
+        ...(card.on_play_opponent_effects || [])];
+      if (!effects.length || !effects.every((effect) => effect.flash_timing)) return;
+      const grants = effects.filter(effect => effect.recipient === "battling")
+        .flatMap(effect => effect.granted_effects)
+        .filter(entry => grantUnitMatches(state, cards, entry.protect, false, unit, new Map()))
+        .map(entry => ({ window: entry.window, battle_end_from: [...(entry.battle_end_from || [])],
+          destroyed_roles: [...(entry.destroyed_roles || ["spirit"])] }));
+      if (!grants.length) return;
+      const cost = paymentForState(state, cards, card);
+      if (!costAffordable(state, cards, cost.pay, cost.total, false)) return;
+      options.push({ card_no: cardNo, hand_index: handIndex, cost: cost.total, uid, grants });
+    });
+    return options;
   }
 
   function flashRemovalOptions(state, cards) {
@@ -6364,6 +6418,18 @@
       return true;
     }
     if (effect.kind === "register_effect_grant") {
+      if (effect.recipient === "battling") {
+        // このバトルの間、1体に(T17-TRIG)。バトル中の自分の体に固定する。Python同一。
+        const chosenUid = state.battleActive ? state.battlingUid : null;
+        const chosen = state.field.find(row => row.uid === chosenUid);
+        if (!chosen || chosen.waiting) return false;
+        const entries = effect.granted_effects
+          .filter(entry => grantUnitMatches(state, cards, entry.protect, false, chosen, new Map()))
+          .map(entry => ({ ...entry, fixed_uid: chosenUid, period: "battle" }));
+        if (!entries.length) return false;
+        state.effectGrants.push(...entries.map(entry => [sourceUid, entry]));
+        return true;
+      }
       state.effectGrants.push(...effect.granted_effects.map(entry => [sourceUid, entry]));
       return true;
     }
@@ -9234,6 +9300,7 @@
     // 効果の記述の扱いの付与(T89-GRANT)だけでは出す理由にしない。Python `collect_playable`同一。
     if ((card.enablers || []).some((effect) =>
       ["on_play", "recurring"].includes(effect.mode) && effect.kind !== "effect_text_grant"
+        && !effect.requires_battle
         && !(candidate.brave_mode === "spirit" && effect.combine_only))) return true;
     if (MAIN_STEP_OPPONENTS.has(state)
         && (card.on_play_opponent_effects || []).some((effect) =>
@@ -10648,7 +10715,9 @@
       const result = new Map();
       for (const unit of field) {
         for (const [granterUid, entry] of active) {
-          if (!grantUnitMatches(state, cards, entry.protect, granterUid === unit.uid, unit, grantedKeywords)) continue;
+          // 「1体に」は解決時に選んだ体に固定(3章)。Python同一。
+          if ("fixed_uid" in entry ? entry.fixed_uid !== unit.uid
+            : !grantUnitMatches(state, cards, entry.protect, granterUid === unit.uid, unit, grantedKeywords)) continue;
           if (!result.has(unit.uid)) result.set(unit.uid, []);
           result.get(unit.uid).push([entry, granterUid]);
         }
@@ -10664,6 +10733,16 @@
       grantedKeywords = keywords;
     }
     return new Map();
+  }
+
+  /** アタックしている受け手が、ターンの間の付与で`kind`の「できない」を持つか(T17-TRIG、Q28965)。
+   *  Python `_attacking_grant_lock`と同一。 */
+  function attackingGrantLock(state, cards, uid, kind) {
+    if (!state.effectGrants.length) return false;
+    const unit = state.field.find(row => row.uid === uid);
+    return Boolean(unit && !unit.waiting && !effectsSuppressed(state, unit)
+      && (quotedGrantsByUnit(state, cards).get(uid) || []).some(([entry]) =>
+        entry.window === "while_attacking" && entry.clauses.some(clause => clause.kind === kind)));
   }
 
   function grantKeysActive(state, cards, instance, uid) {
@@ -11847,6 +11926,8 @@
         state.attackingUid = null;
         state.battlingUid = null;
         state.battleActive = false;
+        state.effectGrants = state.effectGrants.filter(([, entry]) => entry.period !== "battle");
+        state.battleDestroyers = [];
         for (const unit of state.field) {
           delete unit.u_reflected_battle;
           delete unit.forced_block_effect;
@@ -11881,6 +11962,7 @@
         state.attackStepLocks = [];
         state.effectTextGrants = [];
         state.effectGrants = [];
+        state.battleDestroyers = [];
         state.handCostBonus = 0;
         state.deckDiscardedTurn = 0;
         state.deckDiscardProtection = null;
@@ -11909,20 +11991,16 @@
       // Python `_combat_protect_life` と同一。
       protect_life: (protection) => protectLife(state, cards, protection),
       add_attack_ban: (ban) => state.timedAttackBans.push(clone(ban)),
-      burst_effect_locked: () => {
-        if (!state.effectGrants.length) return false;
-        const uid = state.attackingUid;
-        const unit = state.field.find(row => row.uid === uid);
-        return Boolean(state.battleActive && unit && !unit.waiting && !effectsSuppressed(state, unit)
-          && (quotedGrantsByUnit(state, cards).get(uid) || []).some(([entry]) =>
-            entry.window === "while_attacking" && entry.clauses.some(clause => clause.kind === "burst_effect_lock")));
-      },
+      burst_effect_locked: () => Boolean(state.battleActive)
+        && attackingGrantLock(state, cards, state.attackingUid, "burst_effect_lock"),
+      // Stage6はアタックする体のuidで聞く(宣言の時点、以後そのバトルの間は固定)。
       attack_step_end_blocked: (uid) => {
         const unit = state.field.find(row => row.uid === uid && !row.waiting);
         return Boolean(unit && state.attackStepLocks.length
           && cards[unit.card_no].card_type.includes("アルティメット")
           && state.attackStepLocks.some(wanted => wanted.some(value =>
-            (cards[unit.card_no].lineages || []).includes(value))));
+            (cards[unit.card_no].lineages || []).includes(value))))
+          || attackingGrantLock(state, cards, uid, "attack_step_end_lock");
       },
       // 待機中の発揮元も外さない(Q31511、T91)。
       opponent_step_end_blocked: step => state.field.some(unit =>
@@ -12615,31 +12693,14 @@
         playFieldRemovalFlash(state,cards,targets,uid,effectId,paymentIndex,opponent,prefer),
       play_mirage_flash: (effectId,opponent,prefer = []) =>
         playMirageFlash(state,cards,targets,effectId,opponent,prefer),
-      play_flash_removal: (cardNo, opponent, prefer = []) => {
-        if (!opponent) return null;
-        if (!flashRemovalOptions(state, cards).some((row) => row.card_no === cardNo)) {
-          return null;
-        }
-        const card = cards[cardNo];
-        const cost = paymentForState(state, cards, card);
-        const previous = [state.combatOpponent || null, MAIN_STEP_OPPONENTS.get(state),
-          state.preferredTargets];
-        state.combatOpponent = opponent;
-        MAIN_STEP_OPPONENTS.set(state, opponent);
-        state.preferredTargets = [...prefer];
-        try {
-          // メインステップの候補(`legalCandidates`)と同じ形。Python `play_card`と同一。
-          play(state, cards, targets, { hand_index: state.hand.indexOf(cardNo),
-            card_no: cardNo, brave_mode: null, allow_sacrifice: false, mode: "normal",
-            manifestation_creator_uid: null, ...cost });
-        } finally {
-          state.combatOpponent = previous[0];
-          if (previous[1]) MAIN_STEP_OPPONENTS.set(state, previous[1]);
-          else MAIN_STEP_OPPONENTS.delete(state);
-          state.preferredTargets = previous[2];
-        }
-        return { card_no: cardNo, cost: cost.total };
-      },
+      // 「このバトルの間、1体に」の付与のマジック(T17-TRIG、Python同一)。撃ち方は除去と同じ。
+      flash_battle_grant_options: () => flashBattleGrantOptions(state, cards),
+      play_flash_battle_grant: (cardNo, opponent, prefer = []) =>
+        flashBattleGrantOptions(state, cards).some((row) => row.card_no === cardNo)
+          ? playFlashMagic(state, cards, targets, cardNo, opponent, prefer) : null,
+      play_flash_removal: (cardNo, opponent, prefer = []) =>
+        flashRemovalOptions(state, cards).some((row) => row.card_no === cardNo)
+          ? playFlashMagic(state, cards, targets, cardNo, opponent, prefer) : null,
       // 魂状態の契約カード。**公開情報**なので相手も読める(Python同一)。
       soul_cards: () => [...state.soulCards],
       // 盤面のフラッシュ効果。同じくアタック方針の入力になる公開情報。
@@ -12708,13 +12769,15 @@
           state.battlingUid = uid;
         }
         if (effectsSuppressed(state, unit)) return [];
+        // `bp_destroyed`は付与の受け手の窓だけ(T17-TRIG、Python同一)。
         const key = window === "destroy" ? "triggered_effects" : COMBAT_WINDOW_KEYS[window];
+        if (window === "bp_destroyed" && !state.battleDestroyers.includes(uid)) state.battleDestroyers.push(uid);
         // 『バトル終了時』は**どちらの宣言から遅らせた節か**で選ぶ(6C)。
         // ブロック時由来の節は、その札がブロックしたバトルでしか発揮しない。
         const inWindow = (effect) => window !== "battle_end"
           || (effect.battle_end_from || []).includes(battleRole);
         const windowRows = (cardNo, source, contractBaseOnly = false) =>
-          (effectsSuppressed(state,source) ? [] : (combinedCardInfo(cards[cardNo] || {},source,uid)[key] || []))
+          (!key || effectsSuppressed(state,source) ? [] : (combinedCardInfo(cards[cardNo] || {},source,uid)[key] || []))
             .filter((effect) => (window !== "destroy" || effect.mode === "on_destroy") && inWindow(effect)
               && (!contractBaseOnly || effect.works_as_contract_base))
             .map((effect) => [contractBaseOnly ? inheritedContractEffect(effect) : effect, source, cardNo]);
@@ -12731,14 +12794,20 @@
         }
         // 付与された引用効果。受け手が発揮し、付与元の体ごとに別の効果(C1・C11)。
         // Python `_combat_resolve_window`と同一。
-        if (window === "attack") {
-          for (const [entry, granterUid] of quotedGrantsByUnit(state, cards).get(uid) || []) {
-            if (entry.window !== window) continue;
-            const granter = state.field.find((row) => row.uid === granterUid);
-            for (const clause of entry.clauses) {
-              rows.push([{ ...clause, effect_block_id: `${clause.effect_block_id}@${granterUid}`,
-                grant_key: `${entry.grant_id}@${granterUid}` }, unit, granter.card_no]);
-            }
+        // バトル終了時は宣言の役、BP比べの破壊は破壊した相手の種別で絞る。
+        const grantedRows = window === "attack" || (state.effectGrants.length
+          && ["battle_end", "bp_destroyed"].includes(window))
+          ? quotedGrantsByUnit(state, cards).get(uid) || [] : [];
+        for (const [entry, granterUid] of grantedRows) {
+          if (entry.window !== window
+            || (window === "battle_end" && !(entry.battle_end_from || []).includes(battleRole))
+            || (window === "bp_destroyed" && !(entry.destroyed_roles || ["spirit"]).includes(battleRole))) continue;
+          const granter = state.field.find((row) => row.uid === granterUid);
+          for (const clause of entry.clauses) {
+            if (clause.requires_battle_destroyed && !state.battleDestroyers.includes(uid)) continue;
+            rows.push([{ ...clause, effect_block_id: `${clause.effect_block_id}@${granterUid}`,
+              grant_key: `${entry.grant_id}@${granterUid}` }, unit,
+              granter ? granter.card_no : clause.source_card_no]);
           }
         }
         // トラッシュの実カードの「自分の合体スピリットがアタックしたとき」(T19、Python同一)。
@@ -13072,6 +13141,8 @@
       // 「このターンの間、…効果の記述を持たないスピリットとしても扱う」の系統(BS04-109)。
       effectTextGrants: [],
       effectGrants: [],
+      // このバトルでBP比べにより相手を破壊した自分の体(T17-TRIG)。Python `battle_destroyers`。
+      battleDestroyers: [],
       pendingRefreshSteps: [],
       life: 5, sealed: false,
       reserveHasSoul: true, countHasSoul: false, trashHasSoul: false, lifeHasSoul: false,
@@ -13769,6 +13840,7 @@
     "flash_defense_played", "flash_kourin_played", "flash_manifestation_played",
     "flash_removal_played", "trash_flash_played",
     "field_flash_resolved",
+    "flash_battle_grant_played", "bp_destroyed_effects_resolved",
     "attack_effects_resolved", "block_effects_resolved",
     "blocked_effects_resolved", "battle_end_effects_resolved",
     "life_reduced_effects_resolved",
@@ -13801,6 +13873,9 @@
     "flash_manifestation_played",
     // 公式手順2・4のフラッシュタイミングで手札の除去を撃った記録(2026-10-01)。
     "flash_removal_played",
+    // 手順4の「このバトルの間、1体に」の付与と、BP比べで相手だけを破壊したときの窓
+    // (T17-TRIG、Python同一)。
+    "flash_battle_grant_played", "bp_destroyed_effects_resolved",
     // 6C-2B続き: 守り手が相手のターンのフラッシュタイミングで場の効果を撃った記録。
     "field_flash_resolved",
   ]);
@@ -14993,6 +15068,57 @@
 
   /** 手順4の煌臨時効果でアタッカー/ブロッカーが場を離れていたらバトルを閉じる。
    *  Python `_battle_left` と同一。 */
+  /** 手順4で「このバトルの間、1体に」の付与のマジックを撃つ(T17-TRIG)。
+   *  Python `_flash_battle_grant`と同一。 */
+  function flashBattleGrant(emit, actor, defenderId, boards, attacker, blocker) {
+    const played = [];
+    for (const [owner, side, own, other] of [[actor, "own", attacker, blocker],
+      [defenderId, "opponent", blocker, attacker]]) {
+      const board = boards[owner];
+      const otherBoard = boards[owner === actor ? defenderId : actor];
+      if (!board.flash_battle_grant_options) continue;
+      const ownNow = board.units().find((row) => row.uid === own.uid);
+      const otherNow = otherBoard.units().find((row) => row.uid === other.uid);
+      if (!ownNow || !otherNow) continue;
+      const outcome = owner === actor ? battleOutcome(ownNow.bp, otherNow.bp)
+        : battleOutcome(otherNow.bp, ownNow.bp);
+      if (outcome !== (owner === actor ? "blocker_destroyed" : "attacker_destroyed")) continue;
+      const role = (otherNow.card_type || "").includes("アルティメット") ? "ultimate" : "spirit";
+      const options = board.flash_battle_grant_options().filter((row) => row.grants.some((grant) =>
+        (grant.window === "bp_destroyed" && grant.destroyed_roles.includes(role))
+        || (grant.window === "battle_end" && owner === actor
+          && grant.battle_end_from.includes("attack"))));
+      if (!options.length) continue;
+      const option = [...options].sort((left, right) => left.cost - right.cost
+        || (left.card_no < right.card_no ? -1 : left.card_no > right.card_no ? 1 : 0)
+        || left.hand_index - right.hand_index)[0];
+      const result = board.play_flash_battle_grant(option.card_no, otherBoard, []);
+      if (!result) continue;
+      emit("flash_battle_grant_played", owner, { ...result, side, step: 4 });
+      played.push(result);
+    }
+    return played;
+  }
+
+  /** BP比べで相手の体だけを破壊しトラッシュへ置けたとき、勝った体の窓(T17-TRIG、Q30986)。
+   *  Python `_bp_destroyed_window`と同一。決着したらtrue。 */
+  function bpDestroyedWindow(emit, actor, defenderId, boards, attacker, blocker, destroyed, landed) {
+    if (destroyed.length !== 1 || landed !== "trash") return false;
+    const [loserOwner, loser] = destroyed[0];
+    const winnerOwner = loserOwner === actor ? defenderId : actor;
+    const winner = loserOwner === actor ? blocker : attacker;
+    const board = boards[winnerOwner];
+    const row = board.units().find((unit) => unit.uid === winner.uid);
+    if (!row) return false;
+    const role = (loser.card_type || "").includes("アルティメット") ? "ultimate" : "spirit";
+    emitTrigger(emit, board, winnerOwner, winner.uid, row, "bp_destroyed", boards[loserOwner], role);
+    if (boards[loserOwner].life() <= 0) {
+      emit("match_won", winnerOwner, { loser: loserOwner, reason: "life_reached_zero" });
+      return true;
+    }
+    return false;
+  }
+
   function battleLeft(emit, actor, defenderId, boards, attacker, blocker) {
     adoptBattleSuccessor(attacker,boards[actor]);adoptBattleSuccessor(blocker,boards[defenderId]);
     const attackerHere = attacker.battle_absent || boards[actor].units().some((row) => row.uid === attacker.uid);
@@ -15271,6 +15397,10 @@
         uid = freshAttacker.uid;
         freshBlocker = overlayRow(freshBlocker, defenderBoard);
       }
+      if (flashBattleGrant(emit, actor, defenderId, boards, freshAttacker, freshBlocker).length) {
+        freshAttacker = overlayRow(freshAttacker, attackerBoard);
+        freshBlocker = overlayRow(freshBlocker, defenderBoard);
+      }
       // 公式手順4のフラッシュタイミング(6C-2B)。ブロック時効果のあと、BP比較の
       // 前。ブロックしたバトルは**ライフを1つも減らさない**ので、脅威はブロッカーが
       // 破壊されることだけ(`life`は0)——『ライフ保護』はここでは選ばれない。
@@ -15312,15 +15442,18 @@
         finishes = destroyed.map(([owner, row]) =>
           boards[owner].destroy(row.uid, "battle", otherBoard(boards, owner), true));
       }
+      let landed;
       for (const [index, [owner, row]] of destroyed.entries()) {
         const finish = finishes?.[index];
-        const landed = simultaneous ? (typeof finish === "function" ? finish() : finish)
+        landed = simultaneous ? (typeof finish === "function" ? finish() : finish)
           : boards[owner].destroy(row.uid, "battle", otherBoard(boards, owner));
         emit("destroyed_by_battle", owner, { unit: row, outcome });
         // 破壊は相手のアタック/ブロックによるものなので「相手による」に当たる。
         burstAfterFieldLeave(emit, owner, boards[owner], landed,
           otherBoard(boards, owner), owner === actor);
       }
+      if (bpDestroyedWindow(emit, actor, defenderId, boards, freshAttacker, freshBlocker,
+        destroyed, landed)) return true;
       emit("battle_resolved", actor,
         { attacker: freshAttacker, blocker: freshBlocker, outcome });
       endBattle(emit, actor, defenderId, boards, uid, freshBlocker.uid);
