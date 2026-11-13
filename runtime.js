@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v262-v1";
-  const STAGE_VERSION = "v262";
+  const ENGINE_SLICE = "stage4-v263-v1";
+  const STAGE_VERSION = "v263";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v262-portable-v208";
+  const RUNTIME_VERSION = "stage4-v263-portable-v209";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -5737,7 +5737,7 @@
             unit_colors: () => readOwn(own.unit_colors),
             damage_life: (amount, destination = "reserve", attacker = null) => own.damage_life(
               amount,destination,attacker ? {...attacker,opponent_board:previousOpponent} : null,true),
-            destroy: (uid, cause) => own.destroy(uid, cause, previousOpponent),
+            destroy: (uid, cause) => own.destroy(uid, cause, previousOpponent, false, false),
             discard_blind_hand: (amount, no) => own.discard_blind_hand(amount, no, previousOpponent, true),
             discard_revealed_hand: (amount, no) => own.discard_revealed_hand(amount, no, previousOpponent, true),
             discard_deck: (amount, _opponent, no, sourceType = null) => {
@@ -12331,7 +12331,8 @@
         const unit = state.field.find(row => row.uid === uid);
         if (unit) unit.battle_destroy_pending = true;
       },
-      destroy: (uid, cause, opponent = null, deferLeave = false) => {
+      // `byOpponent`は「相手による」破壊か(Python `_combat_destroy`と同一)。偽は反射したUの自分の効果だけ。
+      destroy: (uid, cause, opponent = null, deferLeave = false, byOpponent = true) => {
         const unit = state.field.find((row) => row.uid === uid);
         if (!unit || unit.waiting || unit.destroying
             || (cause === "effect" && unit.battle_destroy_pending)) return null;
@@ -12343,7 +12344,7 @@
         unit.destroying = true;
         const outerEvents = state.uTriggerEvents.splice(0);
         try {
-          combatBoard(state, cards, targets).resolve_trigger(uid, "destroy", opponent);
+          combatBoard(state, cards, targets).resolve_trigger(uid, "destroy", opponent, byOpponent ? "opponent" : null);
           if (!state.field.includes(unit) || !unit.destroying) {
             delete unit.battle_destroy_pending;
             return "other";
@@ -12800,11 +12801,13 @@
         // 付与された引用効果。受け手が発揮し、付与元の体ごとに別の効果(C1・C11)。
         // Python `_combat_resolve_window`と同一。
         // バトル終了時は宣言の役、BP比べの破壊は破壊した相手の種別で絞る。
-        const grantedRows = window === "attack" || (state.effectGrants.length
-          && ["battle_end", "bp_destroyed"].includes(window))
+        // 破壊時は「相手による」破壊(`battleRole === "opponent"`)だけ。
+        const grantedRows = window === "attack" || (window === "destroy" && battleRole === "opponent")
+          || (state.effectGrants.length && ["battle_end", "bp_destroyed"].includes(window))
           ? quotedGrantsByUnit(state, cards).get(uid) || [] : [];
         for (const [entry, granterUid] of grantedRows) {
           if (entry.window !== window
+            || (window === "destroy" && !(entry.destroyed_by || []).includes(battleRole))
             || (window === "battle_end" && !(entry.battle_end_from || []).includes(battleRole))
             || (window === "bp_destroyed" && !(entry.destroyed_roles || ["spirit"]).includes(battleRole))) continue;
           const granter = state.field.find((row) => row.uid === granterUid);
