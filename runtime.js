@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v279-v1";
-  const STAGE_VERSION = "v279";
+  const ENGINE_SLICE = "stage4-v280-v1";
+  const STAGE_VERSION = "v280";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v279-portable-v224";
+  const RUNTIME_VERSION = "stage4-v280-portable-v225";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -10484,9 +10484,15 @@
     const symbolBonus = flagSymbolBonus(state, cards, unit, "attack");
     const restriction = unit.battle_blocker_types ? {blocker_types:unit.battle_blocker_types} : (card.attack_effects || []).find(effect=>effect.kind==="block_restriction"
       && effect.effect_id===unit.block_restriction_effect && effectActive(effect,state,cards,unit.uid));
-    const force = (card.attack_effects || []).find((effect) => effect.kind === "force_block"
+    let force = (card.attack_effects || []).find((effect) => effect.kind === "force_block"
       && effect.effect_id === unit.forced_block_effect
       && (!effect.levels || effect.levels.includes(levelFor(unit, cards, state))));
+    // 付与で撃った強制(BS50-010【激突X】)は、受け手がその付与を持つ間だけ続く(C3、Python同一)。
+    if (!force && unit.forced_block_effect && unit.forced_block_effect.includes(":grant:")
+        && state.battleActive && state.attackingUid === unit.uid) {
+      force = (quotedGrantsByUnit(state, cards).get(unit.uid) || []).flatMap(([entry]) => entry.clauses)
+        .find((clause) => clause.kind === "force_block" && clause.effect_id === unit.forced_block_effect);
+    }
     return {
       uid: unit.uid,
       card_no: unit.card_no,
@@ -10812,6 +10818,38 @@
     if (extra?.size) card = { ...card, keywords: [...new Set([...(card.keywords || []), ...extra])] };
     return grantRecipientMatches(protect, isHolder, card, unit.brave_mode === "spirit",
       combinedBraves(state, unit.uid).length > 0);
+  }
+
+  /** 「ブロックした体が消滅/破壊されたとき」の遅らせた付与の節(BS50-010【激突X】、T17-TRIG)。
+   *  受け手のアタック時に積んだ節だけ。発揮済みなので、付与元が離れていても、受け手が同じBPで
+   *  一緒に破壊されていても解く(Q7903)。場に居て効果を発揮できない受け手は撃たない(C2)。
+   *  Python `_combat_resolve_blocker_destroyed`と同一。 */
+  function combatResolveBlockerDestroyed(state, cards, targets, uid, opponent, battleRole) {
+    const unit = state.field.find((row) => row.uid === uid);
+    if (unit && effectsSuppressed(state, unit)) return [];
+    const rows = state.battleDelayedGrants.filter(([delayedUid, clause]) => delayedUid === uid
+      && clause.delayed_window === "blocker_destroyed"
+      && (clause.destroyed_roles || []).includes(battleRole));
+    const resolved = [];
+    if (!rows.length) return resolved;
+    const previousOpponent = state.combatOpponent;
+    state.combatOpponent = opponent || null;
+    beginEffectFrame(state);
+    try {
+      for (const [, effect, cardNo] of rows) {
+        record(state, cards, "effect_start", { card_no: cardNo, uid, effect_kind: effect.kind,
+          fired_timing: "blocker_destroyed", effect_tag: null, window: "blocker_destroyed" });
+        const ok = resolveEffect(state, cards, targets, effect, uid);
+        record(state, cards, "effect_complete", { card_no: cardNo, uid, effect_kind: effect.kind,
+          fired_timing: "blocker_destroyed", effect_tag: null, window: "blocker_destroyed", resolved: ok });
+        resolved.push({ kind: effect.kind, effect_id: effect.effect_id ?? null, resolved: Boolean(ok) });
+      }
+      flushCountReactions(state, cards, targets);
+    } finally {
+      endEffectFrame(state);
+      state.combatOpponent = previousOpponent;
+    }
+    return resolved;
   }
 
   /** 場の体ごとに、今受けている名前つきの引用効果の付与(T17-KW)。Map(uid→[[付与, 付与元uid]])。
@@ -12924,6 +12962,9 @@
       resolve_opponent_step: (step, opponent) =>
         resolveOpponentStep(state, cards, targets, step, opponent || null),
       resolve_trigger: (uid, window, opponent, battleRole) => {
+        if (window === "blocker_destroyed") {
+          return combatResolveBlockerDestroyed(state, cards, targets, uid, opponent, battleRole);
+        }
         const unit = state.field.find((row) => row.uid === uid);
         if (window === "attack") state.attackingUid = unit && !unit.waiting ? uid : null;
         if (window === "attack" && unit) { delete unit.forced_block_effect; delete unit.block_restriction_effect; delete unit.battle_blocker_types; }
@@ -12967,7 +13008,8 @@
         // アタック時に発揮して遅らせた付与の節(SD69-RV002)。付与元が離れていても解く。Python同一。
         if (window === "battle_end" && battleRole === "attack") {
           for (const [delayedUid, clause, cardNo] of state.battleDelayedGrants) {
-            if (delayedUid !== uid || (clause.requires_blocked && !state.battleBlocked.includes(uid))
+            if (delayedUid !== uid || clause.delayed_window !== "battle_end"
+              || (clause.requires_blocked && !state.battleBlocked.includes(uid))
               || (clause.count_min != null && state.count < clause.count_min)) continue;
             rows.push([{ ...clause }, unit, cardNo]);
           }
@@ -12984,11 +13026,15 @@
               grant_key: `${entry.grant_id}@${granterUid}` }, unit,
               granter ? granter.card_no : clause.source_card_no]);
           }
-          for (const clause of entry.battle_end_clauses || []) {
-            // 発揮済みなので`grant_key`(窓の途中で付与を失えば外す鍵、C3)は付けない。Python同一。
-            state.battleDelayedGrants.push([uid, { ...clause,
-              effect_block_id: `${clause.effect_block_id}@${granterUid}` },
-              granter ? granter.card_no : clause.source_card_no]);
+          // 遅らせる節。発揮済みなので`grant_key`(窓の途中で付与を失えば外す鍵、C3)は付けない。
+          // バトル終了時(SD69-RV002)と、ブロックした体の消滅/破壊時(BS50-010)。Python同一。
+          for (const [delayedWindow, delayedKey] of [["battle_end", "battle_end_clauses"],
+            ["blocker_destroyed", "blocker_destroyed_clauses"]]) {
+            for (const clause of entry[delayedKey] || []) {
+              state.battleDelayedGrants.push([uid, { ...clause, delayed_window: delayedWindow,
+                effect_block_id: `${clause.effect_block_id}@${granterUid}` },
+                granter ? granter.card_no : clause.source_card_no]);
+            }
           }
         }
         // トラッシュの実カードの「自分の合体スピリットがアタックしたとき」(T19、Python同一)。
@@ -14055,7 +14101,7 @@
     "flash_defense_played", "flash_kourin_played", "flash_manifestation_played",
     "flash_removal_played", "trash_flash_played",
     "field_flash_resolved",
-    "flash_battle_grant_played", "bp_destroyed_effects_resolved",
+    "flash_battle_grant_played", "bp_destroyed_effects_resolved", "blocker_destroyed_effects_resolved",
     "attack_effects_resolved", "block_effects_resolved",
     "blocked_effects_resolved", "battle_end_effects_resolved",
     "life_reduced_effects_resolved",
@@ -14093,7 +14139,7 @@
     "flash_removal_played",
     // 手順4の「このバトルの間、1体に」の付与と、BP比べで相手だけを破壊したときの窓
     // (T17-TRIG、Python同一)。
-    "flash_battle_grant_played", "bp_destroyed_effects_resolved",
+    "flash_battle_grant_played", "bp_destroyed_effects_resolved", "blocker_destroyed_effects_resolved",
     // 6C-2B続き: 守り手が相手のターンのフラッシュタイミングで場の効果を撃った記録。
     "field_flash_resolved",
   ]);
@@ -15336,6 +15382,19 @@
     return played;
   }
 
+  /** BP比べでブロックした体が破壊されトラッシュへ置けたとき、アタッカーの窓(BS50-010【激突X】)。
+   *  アタッカーも破壊されていても開く(Q7903)。Python `_blocker_destroyed_window`と同一。決着したらtrue。 */
+  function blockerDestroyedWindow(emit, actor, defenderId, boards, attacker, blocker, destroyed, landed) {
+    if (landed !== "trash" || !destroyed.some(([owner]) => owner === defenderId)) return false;
+    const role = (blocker.card_type || "").includes("アルティメット") ? "ultimate" : "spirit";
+    emitTrigger(emit, boards[actor], actor, attacker.uid, attacker, "blocker_destroyed", boards[defenderId], role);
+    if (boards[defenderId].life() <= 0) {
+      emit("match_won", actor, { loser: defenderId, reason: "life_reached_zero" });
+      return true;
+    }
+    return false;
+  }
+
   /** BP比べで相手の体だけを破壊しトラッシュへ置けたとき、勝った体の窓(T17-TRIG、Q30986)。
    *  Python `_bp_destroyed_window`と同一。決着したらtrue。 */
   function bpDestroyedWindow(emit, actor, defenderId, boards, attacker, blocker, destroyed, landed) {
@@ -15695,6 +15754,8 @@
           otherBoard(boards, owner), owner === actor);
       }
       if (bpDestroyedWindow(emit, actor, defenderId, boards, freshAttacker, freshBlocker,
+        destroyed, landed)) return true;
+      if (blockerDestroyedWindow(emit, actor, defenderId, boards, freshAttacker, freshBlocker,
         destroyed, landed)) return true;
       emit("battle_resolved", actor,
         { attacker: freshAttacker, blocker: freshBlocker, outcome });
