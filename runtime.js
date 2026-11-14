@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v274-v1";
-  const STAGE_VERSION = "v274";
+  const ENGINE_SLICE = "stage4-v275-v1";
+  const STAGE_VERSION = "v275";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v274-portable-v219";
+  const RUNTIME_VERSION = "stage4-v275-portable-v220";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -6102,10 +6102,18 @@
     }
     if (effect.kind === "coreboost") {
       if(!voidCoreGainAllowed(state,cards))return false;
-      state.reserve += amount;
-      recordCoreMove(state, cards, { amount, source: "void", destination: "reserve",
+      let gained = amount;
+      // 「このスピリットのシンボルと同じ数のコア」(T17-TRIG、BS05-026)。Python同一。
+      if (effect.amount_per_source_symbol) {
+        const unit = state.field.find((row) => row.uid === sourceUid);
+        if (!unit) return false;
+        gained = amount * combatUnitRow(state, cards, unit, sourceUid).symbol_count;
+        if (gained <= 0) return false;
+      }
+      state.reserve += gained;
+      recordCoreMove(state, cards, { amount: gained, source: "void", destination: "reserve",
         reason: "coreboost", source_card_no: effect.source_card_no, source_uid: sourceUid });
-      return amount > 0;
+      return gained > 0;
     }
     if (effect.kind === "field_coreboost" && effect.target_event_subject) {
       // 「そのスピリットに置く」＝引き金の主語(アタックした体、Python同一)。
@@ -10951,6 +10959,8 @@
       if (effect.target_levels?.length && !effect.target_levels.includes(row.level)) return false;
       if (bpMax !== null && bpMax !== undefined && row.bp > bpMax) return false;
       if (costMax !== null && costMax !== undefined && targetCost(effect, row) > costMax) return false;
+      // 「合体していない相手のスピリット」(T17-TRIG、BS10-X06)。Python同一。
+      if (effect.target_uncombined && row.brave_cost) return false;
       // 下限と列挙(「BP10000以上」「コスト6/7/8」、2026-10-11、Python同一)。
       if (!targetLowerBoundsAdmit(effect, row)) return false;
       // 「回復状態の」は疲労も重疲労もしていないもの。「疲労状態の」は重疲労を
