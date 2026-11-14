@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v276-v1";
-  const STAGE_VERSION = "v276";
+  const ENGINE_SLICE = "stage4-v277-v1";
+  const STAGE_VERSION = "v277";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v276-portable-v221";
+  const RUNTIME_VERSION = "stage4-v277-portable-v222";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -2689,6 +2689,17 @@
       const amount = Number(payment.amount || 1);
       return canPayLife(state, cards, amount) ? { life: amount } : null;
     }
+    if (kind === "life_core_to_self") {
+      // ライフのコアをこの体へ(BS21-082の付与、T17-TRIG)。通常コアから置く。方針: ブロック
+      // されないための対価は、相手に回復状態の体がいるときだけ払う。Python同一。
+      const amount = Number(payment.amount || 1);
+      const board = state.combatOpponent;
+      if (!paymentSourceUnit(state, sourceUid) || !canPayLife(state, cards, amount)
+          || state.life - Number(state.lifeHasSoul) < amount) return null;
+      if (payment.requires_ready_blocker
+          && !(board?.units && board.units().some((row) => !row.exhausted))) return null;
+      return { lifeToSelf: amount };
+    }
     if (kind === "soul_core_trash") {
       const unit = paymentSourceUnit(state, sourceUid);
       if (!unit || !unit.soul_core) return null;
@@ -2836,6 +2847,12 @@
         state.trashHasSoul = true;
       }
       state.spent += plan.life;
+    }
+    if (plan.lifeToSelf) {
+      subtractLife(state, plan.lifeToSelf);
+      paymentSourceUnit(state, sourceUid).cores += plan.lifeToSelf;
+      recordCoreMove(state, cards, { amount: plan.lifeToSelf, source: "life",
+        destination: "field", reason, target_uid: sourceUid });
     }
     if ("soulFrom" in plan) {
       const holder = plan.soulFrom;
