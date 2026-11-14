@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v280-v1";
-  const STAGE_VERSION = "v280";
+  const ENGINE_SLICE = "stage4-v282-v1";
+  const STAGE_VERSION = "v282";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v280-portable-v225";
+  const RUNTIME_VERSION = "stage4-v282-portable-v227";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3937,12 +3937,27 @@
         cores_returned: coresReturned });
       return destination;
     }
+    recordBattleLoss(state, cards, unit);
     const trashed = stack.filter((cardNo) => !cards[cardNo]?.is_token);
     state.trashCards.push(...trashed);
     record(state, cards, "field_left", { card_no: unit.card_no, uid: unit.uid, cause,
       destination: isToken ? "vanish" : "trash",
       moved_card_nos: trashed, cores_returned: coresReturned });
     return isToken ? "vanish" : "trash";
+  }
+
+  /** 消滅/破壊された体の種別(T17-WIN)。スピリット状態のブレイヴはスピリット。Python `_battle_loss_role`。 */
+  function battleLossRole(state, cards, unit) {
+    if (unit.brave_mode === "spirit") return "spirit";
+    return (unitInfo(state, cards, unit)?.card_type || "").includes("アルティメット") ? "ultimate" : "spirit";
+  }
+
+  /** バトル中の自分の体がトラッシュへ置かれた(消滅/破壊、T17-WIN)。Stage6が手順ごとに引き取る。
+   *  相打ちで待機中に窓を開いた体は二重に記録しない。Python `_record_battle_loss`と同一。 */
+  function recordBattleLoss(state, cards, unit) {
+    if (!state.battleActive || ![state.attackingUid, state.battlingUid].includes(unit.uid)
+        || state.battleLossesAnnounced.includes(unit.uid)) return;
+    state.battleLosses.push({ uid: unit.uid, role: battleLossRole(state, cards, unit) });
   }
 
   /** ソウルコアは維持の判定より先に払うので、宿主自身・リザーブから払う1個は
@@ -5471,6 +5486,50 @@
       || (card?.burst_effects || []).some((row) => burstEffectIsUseful(card, row));
   }
 
+  function fieldOpenPickupCandidates(state, cards, effect, sourceUid) {
+    const source = state.field.find(unit => unit.uid === sourceUid);
+    const sourceCardNo = effect.source_card_no || source?.card_no;
+    const sourceLineages = cards[sourceCardNo]?.lineages || [];
+    const candidates = [];
+    for (const unit of state.field) {
+      if (unit.waiting) continue;
+      const card = cards[unit.card_no];
+      for (const pickup of card.field_open_pickups || []) {
+        if (!effectActive(pickup, state, cards, unit.uid)) continue;
+        if (pickup.source_lineage
+          ? !sourceLineages.includes(pickup.source_lineage)
+          : unit.uid !== sourceUid || unit.card_no !== sourceCardNo) continue;
+        candidates.push([unit.uid, unit.card_no, pickup]);
+      }
+    }
+    return candidates;
+  }
+
+  function resolveFieldOpenPickups(state, cards, targets, remaining, candidates) {
+    for (const [uid, cardNo, pickup] of candidates) {
+      if (!remaining.length) break;
+      const unit = state.field.find(row => row.uid === uid);
+      const key = `field_open_pickup:${cards[cardNo].name}`;
+      if (state.blockTurnUsed.has(key) || !unit || unit.waiting || unit.card_no !== cardNo
+          || !effectActive(pickup, state, cards, uid)) continue;
+      const { picked } = chooseFromPool(remaining, [pickup.condition_slot], cards, targets);
+      if (!picked.length) continue;
+      remaining.splice(remaining.indexOf(picked[0]), 1);
+      if (pickup.destination === "side") {
+        state.sideCards.push(...picked);
+        state.sideGain += 1;
+      } else {
+        state.hand.push(...picked);
+        state.handGain += 1;
+      }
+      state.seen.add(picked[0]);
+      state.blockTurnUsed.add(key);
+      recordCardSelection(state, cards, { cards: picked, source: "open",
+        destination: pickup.destination, reason: "field_open_pickup",
+        source_card_no: cardNo });
+    }
+  }
+
   function applyOpenReactions(state, cards, targets, pool, sourceCardNo) {
     const matched = (cardNo) => (cards[cardNo]?.open_reactions || []).find((row) =>
       openReactionMatches(row, sourceCardNo, cards)
@@ -6240,6 +6299,7 @@
         source_card_no: effect.source_card_no, source_uid: sourceUid });
     }
     if (effect.kind === "search") {
+      const pickups = fieldOpenPickupCandidates(state, cards, effect, sourceUid);
       const pool = takeTopSlice(state, effect.reveal || 0);
       state.dig += pool.length;
       state.openPoolStack.push(pool);
@@ -6304,6 +6364,7 @@
       recordCardSelection(state, cards, { cards: result.picked, source: "open",
         destination: "hand", reason: "search",
         source_card_no: effect.source_card_no });
+      resolveFieldOpenPickups(state, cards, targets, result.remaining, pickups);
       let leftover = effect.leftover || "bottom";
       if (leftover === "top_or_bottom") {
         leftover = chooseTopOrBottom(result.remaining, state.hand, cards);
@@ -6797,6 +6858,7 @@
       return true;
     }
     if (effect.kind === "exchange") {
+      const pickups = fieldOpenPickupCandidates(state, cards, effect, sourceUid);
       const pool = takeTopSlice(state, effect.reveal || 0);
       if (!pool.length) return false;
       state.dig += pool.length;
@@ -6852,6 +6914,7 @@
         destination: "open", reason: "exchange_return", source_card_no: effect.source_card_no });
       // 交換しなかった公開札(selection.remainingへ戻したものを含む)。
       const unpicked = [...selection.remaining];
+      resolveFieldOpenPickups(state, cards, targets, unpicked, pickups);
       let revealedDestination = effect.revealed_destination || effect.leftover || "bottom";
       let returnedDestination = effect.returned_destination || effect.leftover || "bottom";
       // Pythonは交換側でも `_resolve_top_or_bottom` を呼ぶ。ここを一律bottomに
@@ -6914,6 +6977,7 @@
       if (effect.requires_predecessor_id
           && !state.completedEffects.has(effect.requires_predecessor_id)) return false;
       if (effect.requires_predecessor_id) state.completedEffects.delete(effect.requires_predecessor_id);
+      const pickups = fieldOpenPickupCandidates(state, cards, effect, sourceUid);
       const pool = takeTopSlice(state, effect.reveal || 0);
       if (!pool.length) return false;
       state.dig += pool.length;
@@ -6950,6 +7014,7 @@
             allow_sacrifice: true, mode: "normal", completion_sink: completions });
         }
         const resolveRemainder = () => {
+          resolveFieldOpenPickups(state, cards, targets, remaining, pickups);
           let remainderDestination = effect.remainder_destination;
           if (remainderDestination === "top_or_bottom") {
             remainderDestination = chooseTopOrBottom(remaining, state.hand, cards);
@@ -7078,6 +7143,7 @@
     }
     // rz7_kourin_searchは2026-08-16に削除(汎用searchが印字どおりに解く)。
     if (effect.kind === "driving_force") {
+      const pickups = fieldOpenPickupCandidates(state, cards, effect, sourceUid);
       const pool = takeTopSlice(state, amount);
       state.dig += pool.length;
       state.openPoolStack.push(pool);
@@ -7103,6 +7169,7 @@
       state.handGain += selected.length;
       recordCardSelection(state, cards, { cards: selected, source: "open",
         destination: "hand", reason: effect.kind, source_card_no: effect.source_card_no });
+      resolveFieldOpenPickups(state, cards, targets, pool, pickups);
       state.trashCards.push(...pool);
       recordCardSelection(state, cards, { cards: pool, source: "open",
         destination: "trash", reason: `${effect.kind}_open`, source_card_no: effect.source_card_no });
@@ -10572,6 +10639,8 @@
     // ライフが実際に減ったかが条件。battle_end はブロックの有無と関係なく
     // 発揮するので代用できない(Python同一)。
     life_reduced: "life_reduced_effects",
+    // バトルしている相手の体の消滅/破壊(T17-WIN、Python同一)。
+    opponent_destroyed: "opponent_destroyed_effects",
   };
   const LINKED_KEYS = ["requires_predecessor_changed", "requires_predecessor_id",
     "gates_next_effect", "b3_followup_id", "requires_successful_followup"];
@@ -10818,38 +10887,6 @@
     if (extra?.size) card = { ...card, keywords: [...new Set([...(card.keywords || []), ...extra])] };
     return grantRecipientMatches(protect, isHolder, card, unit.brave_mode === "spirit",
       combinedBraves(state, unit.uid).length > 0);
-  }
-
-  /** 「ブロックした体が消滅/破壊されたとき」の遅らせた付与の節(BS50-010【激突X】、T17-TRIG)。
-   *  受け手のアタック時に積んだ節だけ。発揮済みなので、付与元が離れていても、受け手が同じBPで
-   *  一緒に破壊されていても解く(Q7903)。場に居て効果を発揮できない受け手は撃たない(C2)。
-   *  Python `_combat_resolve_blocker_destroyed`と同一。 */
-  function combatResolveBlockerDestroyed(state, cards, targets, uid, opponent, battleRole) {
-    const unit = state.field.find((row) => row.uid === uid);
-    if (unit && effectsSuppressed(state, unit)) return [];
-    const rows = state.battleDelayedGrants.filter(([delayedUid, clause]) => delayedUid === uid
-      && clause.delayed_window === "blocker_destroyed"
-      && (clause.destroyed_roles || []).includes(battleRole));
-    const resolved = [];
-    if (!rows.length) return resolved;
-    const previousOpponent = state.combatOpponent;
-    state.combatOpponent = opponent || null;
-    beginEffectFrame(state);
-    try {
-      for (const [, effect, cardNo] of rows) {
-        record(state, cards, "effect_start", { card_no: cardNo, uid, effect_kind: effect.kind,
-          fired_timing: "blocker_destroyed", effect_tag: null, window: "blocker_destroyed" });
-        const ok = resolveEffect(state, cards, targets, effect, uid);
-        record(state, cards, "effect_complete", { card_no: cardNo, uid, effect_kind: effect.kind,
-          fired_timing: "blocker_destroyed", effect_tag: null, window: "blocker_destroyed", resolved: ok });
-        resolved.push({ kind: effect.kind, effect_id: effect.effect_id ?? null, resolved: Boolean(ok) });
-      }
-      flushCountReactions(state, cards, targets);
-    } finally {
-      endEffectFrame(state);
-      state.combatOpponent = previousOpponent;
-    }
-    return resolved;
   }
 
   /** 場の体ごとに、今受けている名前つきの引用効果の付与(T17-KW)。Map(uid→[[付与, 付与元uid]])。
@@ -12116,6 +12153,9 @@
         state.battleDestroyers = [];
         state.battleBlocked = [];
         state.battleDelayedGrants = [];
+        state.battleLosses = [];
+        state.battleLossesAnnounced = [];
+        state.battleDeclaredLevels = {};
         for (const unit of state.field) {
           delete unit.u_reflected_battle;
           delete unit.forced_block_effect;
@@ -12153,6 +12193,9 @@
         state.battleDestroyers = [];
         state.battleBlocked = [];
         state.battleDelayedGrants = [];
+        state.battleLosses = [];
+        state.battleLossesAnnounced = [];
+        state.battleDeclaredLevels = {};
         state.handCostBonus = 0;
         state.deckDiscardedTurn = 0;
         state.deckDiscardProtection = null;
@@ -12517,6 +12560,19 @@
       mark_battle_destruction: uid => {
         const unit = state.field.find(row => row.uid === uid);
         if (unit) unit.battle_destroy_pending = true;
+      },
+      // バトル中の体の消滅/破壊の記録を引き取る(T17-WIN、Python `_combat_drain_battle_losses`)。
+      drain_battle_losses: () => {
+        const rows = state.battleLosses || [];
+        state.battleLosses = [];
+        return rows;
+      },
+      // 相打ちの破壊待機中に窓を開いた体。置かれる見込みの体だけ種別を返す(Python同一)。
+      announce_battle_loss: uid => {
+        const unit = state.field.find(row => row.uid === uid);
+        if (!unit || !unit.battle_destroy_pending) return null;
+        state.battleLossesAnnounced.push(uid);
+        return battleLossRole(state, cards, unit);
       },
       // `byOpponent`は「相手による」破壊か(Python `_combat_destroy`と同一)。偽は反射したUの自分の効果だけ。
       destroy: (uid, cause, opponent = null, deferLeave = false, byOpponent = true) => {
@@ -12962,9 +13018,6 @@
       resolve_opponent_step: (step, opponent) =>
         resolveOpponentStep(state, cards, targets, step, opponent || null),
       resolve_trigger: (uid, window, opponent, battleRole) => {
-        if (window === "blocker_destroyed") {
-          return combatResolveBlockerDestroyed(state, cards, targets, uid, opponent, battleRole);
-        }
         const unit = state.field.find((row) => row.uid === uid);
         if (window === "attack") state.attackingUid = unit && !unit.waiting ? uid : null;
         if (window === "attack" && unit) { delete unit.forced_block_effect; delete unit.block_restriction_effect; delete unit.battle_blocker_types; }
@@ -12972,6 +13025,8 @@
         if (window === "attack" || window === "block") {
           state.battleActive = true;
           state.battlingUid = uid;
+          // 宣言の時点のLv(T17-WIN、Python `battle_declared_levels`)。
+          state.battleDeclaredLevels = { ...(state.battleDeclaredLevels || {}), [uid]: levelFor(unit, cards, state) };
         }
         if (effectsSuppressed(state, unit)) return [];
         // `bp_destroyed`は付与の受け手の窓だけ(T17-TRIG、Python同一)。
@@ -12980,11 +13035,21 @@
         if (window === "blocked" && !state.battleBlocked.includes(uid)) state.battleBlocked.push(uid);
         // 『バトル終了時』は**どちらの宣言から遅らせた節か**で選ぶ(6C)。
         // ブロック時由来の節は、その札がブロックしたバトルでしか発揮しない。
-        const inWindow = (effect) => window !== "battle_end"
-          || (effect.battle_end_from || []).includes(battleRole);
+        // 「バトルしている相手の体が消滅/破壊されたとき」(T17-WIN)。`battleRole`は消えた相手の種別。
+        // アタック時由来の節はアタッカー、ブロック時由来の節はブロッカーのとき(Python同一)。
+        const side = window === "opponent_destroyed" ? (uid === state.attackingUid ? "attack" : "block") : null;
+        const inWindow = (effect) => (window !== "battle_end"
+          || (effect.battle_end_from || []).includes(battleRole))
+          && (window !== "opponent_destroyed" || ((effect.opponent_destroyed_from || []).includes(side)
+            && (effect.destroyed_roles || []).includes(battleRole)));
+        // 『アタック時』に発揮して遅らせた印字の節は、宣言の時点のLvも合うときだけ(D54、Python同一)。
+        const declaredLevelOk = (effect, source) => window !== "opponent_destroyed" || source !== unit
+          || !(effect.levels || []).length
+          || (effect.levels || []).includes((state.battleDeclaredLevels || {})[uid]);
         const windowRows = (cardNo, source, contractBaseOnly = false) =>
           (!key || effectsSuppressed(state,source) ? [] : (combinedCardInfo(cards[cardNo] || {},source,uid)[key] || []))
             .filter((effect) => (window !== "destroy" || effect.mode === "on_destroy") && inWindow(effect)
+              && declaredLevelOk(effect, source)
               && (!contractBaseOnly || effect.works_as_contract_base))
             .map((effect) => [contractBaseOnly ? inheritedContractEffect(effect) : effect, source, cardNo]);
         // [節, 合体限定判定に使う発揮元]の組。解決は**常にホスト**で行う
@@ -13014,6 +13079,14 @@
             rows.push([{ ...clause }, unit, cardNo]);
           }
         }
+        // 「バトルしている相手の体が消滅/破壊されたとき」まで遅らせた付与の節(BS50-010、T17-WIN)。
+        // 印字の節と同じ窓・同じ入口。付与元が離れていても解く。Python同一。
+        if (window === "opponent_destroyed" && side === "attack") {
+          for (const [delayedUid, clause, cardNo] of state.battleDelayedGrants) {
+            if (delayedUid === uid && clause.delayed_window === "opponent_destroyed"
+              && (clause.destroyed_roles || []).includes(battleRole)) rows.push([{ ...clause }, unit, cardNo]);
+          }
+        }
         for (const [entry, granterUid] of grantedRows) {
           if (entry.window !== window
             || (window === "destroy" && !(entry.destroyed_by || []).includes(battleRole))
@@ -13027,9 +13100,9 @@
               granter ? granter.card_no : clause.source_card_no]);
           }
           // 遅らせる節。発揮済みなので`grant_key`(窓の途中で付与を失えば外す鍵、C3)は付けない。
-          // バトル終了時(SD69-RV002)と、ブロックした体の消滅/破壊時(BS50-010)。Python同一。
+          // バトル終了時(SD69-RV002)と、バトルしている相手の体の消滅/破壊時(BS50-010、T17-WIN)。Python同一。
           for (const [delayedWindow, delayedKey] of [["battle_end", "battle_end_clauses"],
-            ["blocker_destroyed", "blocker_destroyed_clauses"]]) {
+            ["opponent_destroyed", "opponent_destroyed_clauses"]]) {
             for (const clause of entry[delayedKey] || []) {
               state.battleDelayedGrants.push([uid, { ...clause, delayed_window: delayedWindow,
                 effect_block_id: `${clause.effect_block_id}@${granterUid}` },
@@ -13404,6 +13477,11 @@
       // [uid, 節, 出どころの札番号](T17-TRIG、SD69-RV002)。Python `battle_blocked`・`battle_delayed_grants`。
       battleBlocked: [],
       battleDelayedGrants: [],
+      // このバトルの自分の体が消滅/破壊されてトラッシュへ置かれた記録と、相打ちで待機中に
+      // 窓を開いた体(T17-WIN)。Python `battle_losses`・`battle_losses_announced`。
+      battleLosses: [],
+      battleLossesAnnounced: [],
+      battleDeclaredLevels: {},
       pendingRefreshSteps: [],
       life: 5, sealed: false,
       reserveHasSoul: true, countHasSoul: false, trashHasSoul: false, lifeHasSoul: false,
@@ -14101,7 +14179,7 @@
     "flash_defense_played", "flash_kourin_played", "flash_manifestation_played",
     "flash_removal_played", "trash_flash_played",
     "field_flash_resolved",
-    "flash_battle_grant_played", "bp_destroyed_effects_resolved", "blocker_destroyed_effects_resolved",
+    "flash_battle_grant_played", "bp_destroyed_effects_resolved", "opponent_destroyed_effects_resolved",
     "attack_effects_resolved", "block_effects_resolved",
     "blocked_effects_resolved", "battle_end_effects_resolved",
     "life_reduced_effects_resolved",
@@ -14139,7 +14217,7 @@
     "flash_removal_played",
     // 手順4の「このバトルの間、1体に」の付与と、BP比べで相手だけを破壊したときの窓
     // (T17-TRIG、Python同一)。
-    "flash_battle_grant_played", "bp_destroyed_effects_resolved", "blocker_destroyed_effects_resolved",
+    "flash_battle_grant_played", "bp_destroyed_effects_resolved", "opponent_destroyed_effects_resolved",
     // 6C-2B続き: 守り手が相手のターンのフラッシュタイミングで場の効果を撃った記録。
     "field_flash_resolved",
   ]);
@@ -15112,8 +15190,11 @@
           "battle_end", attackerBoard, "block");
       }
     }
+    // 「バトル終了時」はまだバトル中。そこでの消滅/破壊も窓を開いてからバトルが終わる(W2、Python同一)。
+    const won = battleLossWindows(emit, actor, defenderId, boards, attackerUid, blockerUid);
     attackerBoard.end_battle();
     defenderBoard.end_battle();
+    return won;
   }
 
   // 6C-2B: このステップで**まだアタックできる**、現在のアタッカー以外のユニット。
@@ -15382,15 +15463,36 @@
     return played;
   }
 
-  /** BP比べでブロックした体が破壊されトラッシュへ置けたとき、アタッカーの窓(BS50-010【激突X】)。
-   *  アタッカーも破壊されていても開く(Q7903)。Python `_blocker_destroyed_window`と同一。決着したらtrue。 */
-  function blockerDestroyedWindow(emit, actor, defenderId, boards, attacker, blocker, destroyed, landed) {
-    if (landed !== "trash" || !destroyed.some(([owner]) => owner === defenderId)) return false;
-    const role = (blocker.card_type || "").includes("アルティメット") ? "ultimate" : "spirit";
-    emitTrigger(emit, boards[actor], actor, attacker.uid, attacker, "blocker_destroyed", boards[defenderId], role);
-    if (boards[defenderId].life() <= 0) {
-      emit("match_won", actor, { loser: defenderId, reason: "life_reached_zero" });
-      return true;
+  /** 消滅/破壊された体の相手側(バトルしている体)の`opponent_destroyed`を開く(T17-WIN)。
+   *  受け手が場に居なければ開かない。決着したらtrue。Python `_open_opponent_destroyed`と同一。 */
+  function openOpponentDestroyed(emit, actor, defenderId, boards, lossOwner, receiverUid, role) {
+    const receiverOwner = lossOwner === actor ? defenderId : actor;
+    const board = boards[receiverOwner];
+    receiverUid = board.battle_uid ? board.battle_uid(receiverUid) : receiverUid;
+    const row = board.units().find((unit) => unit.uid === receiverUid);
+    if (!row) return false;
+    emitTrigger(emit, board, receiverOwner, receiverUid, row, "opponent_destroyed", boards[lossOwner], role);
+    for (const owner of [actor, defenderId]) {
+      if (boards[owner].life() <= 0) {
+        emit("match_won", owner === actor ? defenderId : actor, { loser: owner, reason: "life_reached_zero" });
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** バトル中の体の消滅/破壊を両盤面から引き取り、相手の体の窓を開く(T17-WIN)。守り手の体が
+   *  消えた分(アタッカーの窓=手番側)が先。決着したらtrue。Python `_battle_loss_windows`と同一。 */
+  function battleLossWindows(emit, actor, defenderId, boards, attackerUid, blockerUid) {
+    const losses = {};
+    for (const owner of [actor, defenderId]) {
+      losses[owner] = boards[owner].drain_battle_losses ? boards[owner].drain_battle_losses() : [];
+    }
+    if (blockerUid === null || blockerUid === undefined) return false;
+    for (const [lossOwner, receiverUid] of [[defenderId, attackerUid], [actor, blockerUid]]) {
+      for (const loss of losses[lossOwner]) {
+        if (openOpponentDestroyed(emit, actor, defenderId, boards, lossOwner, receiverUid, loss.role)) return true;
+      }
     }
     return false;
   }
@@ -15414,7 +15516,10 @@
     return false;
   }
 
+  /** 閉じたらtrue、その中で決着したら"won"。閉じる前に、その手順で消滅/破壊されたバトル中の
+   *  体の窓を開く(T17-WIN、Python `_battle_left`と同一)。 */
   function battleLeft(emit, actor, defenderId, boards, attacker, blocker) {
+    if (blocker && battleLossWindows(emit, actor, defenderId, boards, attacker.uid, blocker.uid)) return "won";
     adoptBattleSuccessor(attacker,boards[actor]);adoptBattleSuccessor(blocker,boards[defenderId]);
     const attackerHere = attacker.battle_absent || boards[actor].units().some((row) => row.uid === attacker.uid);
     const blockerHere = !blocker || blocker.battle_absent
@@ -15422,7 +15527,7 @@
     if (attackerHere && blockerHere) return false;
     emit("battle_resolved", actor, { attacker, blocker,
       outcome: !attackerHere ? "attacker_left_field" : "blocker_left_field" });
-    endBattle(emit, actor, defenderId, boards, attacker.uid, blocker ? blocker.uid : null);
+    if (endBattle(emit, actor, defenderId, boards, attacker.uid, blocker ? blocker.uid : null)) return "won";
     return true;
   }
 
@@ -15434,9 +15539,9 @@
       // バトル終了時の節は撃たない(Q29816)。バトル限定のBP修正だけ捨てる。
       boards[actor].end_battle();
       boards[defenderId].end_battle();
-    } else {
-      endBattle(emit, actor, defenderId, boards, attacker.uid,
-        blocker ? blocker.uid : null);
+    } else if (endBattle(emit, actor, defenderId, boards, attacker.uid,
+      blocker ? blocker.uid : null)) {
+      return "won";
     }
     return endsStep;
   }
@@ -15653,6 +15758,8 @@
       }
       const blockEffects = emitTrigger(emit, defenderBoard, defenderId, blocker.uid, blocker, "block",
         {...attackerBoard, can_end_attack_step: () => !stepLocked()}) || [];
+      // ブロックされたとき/ブロック時の効果で消えたバトル中の体の窓(T17-WIN、Python同一)。
+      if (battleLossWindows(emit, actor, defenderId, boards, uid, blocker.uid)) return true;
       if (blockEffects.some(row => row.kind === "attack_step_end" && row.resolved)) {
         emit("battle_resolved", actor, {attacker, blocker, outcome: "effect_ended_step"});
         for (const board of [attackerBoard, defenderBoard]) board.end_battle();
@@ -15674,7 +15781,9 @@
       };
       if (flashKourin(emit, actor, defenderId, boards, uid, freshBlocker.uid,
         blockerThreatened,order).length) {
-        if (battleLeft(emit, actor, defenderId, boards, freshAttacker, freshBlocker)) continue;
+        const closed = battleLeft(emit, actor, defenderId, boards, freshAttacker, freshBlocker);
+        if (closed === "won") return true;
+        if (closed) continue;
         freshAttacker = overlayRow(freshAttacker, attackerBoard);
         uid = freshAttacker.uid;
         freshBlocker = overlayRow(freshBlocker, defenderBoard);
@@ -15690,7 +15799,9 @@
       if (flashRemoval(emit, actor, defenderId, boards, 4,
         { own: attackerThreatened, opponent: blockerThreatened },
         { own: [freshBlocker.uid], opponent: [uid] }, order,index).length) {
-        if (battleLeft(emit, actor, defenderId, boards, freshAttacker, freshBlocker)) continue;
+        const closed = battleLeft(emit, actor, defenderId, boards, freshAttacker, freshBlocker);
+        if (closed === "won") return true;
+        if (closed) continue;
         freshAttacker = overlayRow(freshAttacker, attackerBoard);
         uid = freshAttacker.uid;
         freshBlocker = overlayRow(freshBlocker, defenderBoard);
@@ -15708,8 +15819,10 @@
             battleOutcome(freshAttacker.bp, freshBlocker.bp)) },
         remainingAttackers(order, index, attackerBoard).length > 0);
       if (flashStopsTheBattle(blockedFlash, stepLocked())) {
-        if (flashStopBattle(emit, actor, defenderId, boards, freshAttacker,
-          freshBlocker, blockedFlash)) return false;
+        const stopped = flashStopBattle(emit, actor, defenderId, boards, freshAttacker,
+          freshBlocker, blockedFlash);
+        if (stopped === "won") return true;
+        if (stopped) return false;
         continue;
       }
       if (attackFlashGrant(emit, actor, attackerBoard, freshAttacker.uid, defenderBoard)) {
@@ -15722,14 +15835,17 @@
               {loser:owner,reason:'life_reached_zero'}); return true;
           }
         }
-        if (battleLeft(emit, actor, defenderId, boards, freshAttacker, freshBlocker)) continue;
+        const closed = battleLeft(emit, actor, defenderId, boards, freshAttacker, freshBlocker);
+        if (closed === "won") return true;
+        if (closed) continue;
         freshAttacker = overlayRow(freshAttacker, attackerBoard);
         freshBlocker = overlayRow(freshBlocker, defenderBoard);
       }
       if(freshAttacker.battle_absent || freshBlocker.battle_absent){
         emit('battle_resolved',actor,{attacker:freshAttacker,blocker:freshBlocker,
           outcome:freshAttacker.battle_absent?'attacker_left_field':'blocker_left_field'});
-        endBattle(emit,actor,defenderId,boards,freshAttacker.uid,freshBlocker.uid);continue;
+        if (endBattle(emit,actor,defenderId,boards,freshAttacker.uid,freshBlocker.uid)) return true;
+        continue;
       }
       const outcome = battleOutcome(freshAttacker.bp, freshBlocker.bp);
       const destroyed = outcome === "attacker_destroyed" ? [[actor, freshAttacker]]
@@ -15743,23 +15859,40 @@
         finishes = destroyed.map(([owner, row]) =>
           boards[owner].destroy(row.uid, "battle", otherBoard(boards, owner), true));
       }
-      let landed;
+      if (simultaneous) {
+        // 相打ち: 両方が破壊待機の間に、トラッシュへ置かれる体ごとに相手の窓を開く
+        // (Q7903・Q14122)。守り手の分(手番側の窓)が先。Python同一。
+        const indexes = [...destroyed.keys()].sort((a, b) =>
+          Number(destroyed[a][0] === actor) - Number(destroyed[b][0] === actor));
+        for (const index of indexes) {
+          const [owner, row] = destroyed[index];
+          const role = typeof finishes[index] === "function" && boards[owner].announce_battle_loss
+            ? boards[owner].announce_battle_loss(row.uid) : null;
+          const other = destroyed[1 - index][1];
+          if (role !== null && role !== undefined
+            && openOpponentDestroyed(emit, actor, defenderId, boards, owner, other.uid, role)) return true;
+        }
+      }
+      const landings = [];
       for (const [index, [owner, row]] of destroyed.entries()) {
         const finish = finishes?.[index];
-        landed = simultaneous ? (typeof finish === "function" ? finish() : finish)
+        const landed = simultaneous ? (typeof finish === "function" ? finish() : finish)
           : boards[owner].destroy(row.uid, "battle", otherBoard(boards, owner));
         emit("destroyed_by_battle", owner, { unit: row, outcome });
+        landings.push(landed);
+      }
+      // 破壊されたときの効果をすべて解いてから、破壊後のバースト(Q31711、Python同一)。
+      if (bpDestroyedWindow(emit, actor, defenderId, boards, freshAttacker, freshBlocker,
+        destroyed, landings[landings.length - 1])) return true;
+      if (battleLossWindows(emit, actor, defenderId, boards, uid, freshBlocker.uid)) return true;
+      for (const [index, [owner]] of destroyed.entries()) {
         // 破壊は相手のアタック/ブロックによるものなので「相手による」に当たる。
-        burstAfterFieldLeave(emit, owner, boards[owner], landed,
+        burstAfterFieldLeave(emit, owner, boards[owner], landings[index],
           otherBoard(boards, owner), owner === actor);
       }
-      if (bpDestroyedWindow(emit, actor, defenderId, boards, freshAttacker, freshBlocker,
-        destroyed, landed)) return true;
-      if (blockerDestroyedWindow(emit, actor, defenderId, boards, freshAttacker, freshBlocker,
-        destroyed, landed)) return true;
       emit("battle_resolved", actor,
         { attacker: freshAttacker, blocker: freshBlocker, outcome });
-      endBattle(emit, actor, defenderId, boards, uid, freshBlocker.uid);
+      if (endBattle(emit, actor, defenderId, boards, uid, freshBlocker.uid)) return true;
       // 『このバトルが終了したとき、アタックステップを終了する』(Q17596)。
       if (flashEndsTheStepAfter(blockedFlash, stepLocked())) return false;
     }
