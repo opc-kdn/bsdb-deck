@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v269-v1";
-  const STAGE_VERSION = "v269";
+  const ENGINE_SLICE = "stage4-v270-v1";
+  const STAGE_VERSION = "v270";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v269-portable-v214";
+  const RUNTIME_VERSION = "stage4-v270-portable-v215";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -4967,12 +4967,16 @@
   }
 
   // 山札から1枚出るたびに呼ぶ（**取り除く前**に、そのときの山札枚数で）。
-  function observeDeckExit(state, cardNo, deckSizeBefore) {
+  function observeDeckExit(state, cardNo, deckSizeBefore, fromBottom = false) {
+    if (fromBottom && deckSizeBefore > 1) {
+      if (state.knownBottomCards.length) { state.knownBottomCards.shift(); return; }
+      if (deckSizeBefore === state.knownTopCards.length) { state.knownTopCards.pop(); return; }
+    }
     const priorTop = state.knownTopCards.length;
     const priorBottom = state.knownBottomCards.length;
     const priorTopCards = [...state.knownTopCards];
     const priorBottomCards = [...state.knownBottomCards];
-    if (consumeKnownTop(state, cardNo, deckSizeBefore)) return;
+    if ((!fromBottom || deckSizeBefore === 1) && consumeKnownTop(state, cardNo, deckSizeBefore)) return;
     if (priorTop !== state.knownTopCards.length
         || priorBottom !== state.knownBottomCards.length) {
       // 既知端の順序が保てない操作。正体は分かったままなので、順不同の袋へ戻す。
@@ -5018,11 +5022,17 @@
     return state.deck.pop();
   }
 
-  function draw(state, cards, amount, reason = "draw") {
+  function draw(state, cards, amount, reason = "draw", fromBottom = false) {
     let count = 0;
     const drawn = [];
     while (state.deck.length && count < amount) {
-      const cardNo = takeTopCard(state);
+      let cardNo;
+      if (fromBottom && state.deck.length > 1) {
+        observeDeckExit(state, state.deck[0], state.deck.length, true);
+        cardNo = state.deck.shift();
+      } else {
+        cardNo = takeTopCard(state);
+      }
       state.hand.push(cardNo);
       state.seen.add(cardNo);
       state.handGain += 1;
@@ -5964,7 +5974,7 @@
       // `draw()`を呼んで常に`success`を返し、実際に増えたかは`changed`側で見る。
       // ここで0枚を「不発」にすると、Pythonが解決済みと書く節をWorkerだけ
       // 不発と書く(seed 20260817の戦闘モードで発覚)。
-      draw(state, cards, amount, "effect");
+      draw(state, cards, amount, "effect", effect.draw_from_bottom);
       if(effect.count_soul_followup)placeCountSoul(state,cards,
         {...effect.count_soul_followup,source_card_no:effect.source_card_no},sourceUid);
       return true;
@@ -12983,6 +12993,7 @@
                 if (!donor) continue;
                 sourceNo = unit.card_no;
                 effect = {kind: "draw", amount: donor.amount, mode: "on_attack",
+                  draw_from_bottom: donor.draw_from_bottom,
                   source_card_no: sourceNo, effect_id: donor.effect_id};
               }
               if (effect.kind === "attack_step_end" && !effectActive(effect, state, cards, uid)) continue;
