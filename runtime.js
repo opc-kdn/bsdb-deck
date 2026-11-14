@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v275-v1";
-  const STAGE_VERSION = "v275";
+  const ENGINE_SLICE = "stage4-v276-v1";
+  const STAGE_VERSION = "v276";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v275-portable-v220";
+  const RUNTIME_VERSION = "stage4-v276-portable-v221";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1753,11 +1753,18 @@
         const gate = group[0];
         if (gate.flash_level_min !== null && gate.flash_level_min !== undefined
             && !(gate.flash_level_min <= level && level <= gate.flash_level_max)) continue;
+        // フラッシュ『このスピリットのアタック時』はこの体がアタックしているバトルの
+        // フラッシュタイミングだけ(T17-TRIG、CB05-052。Python同一)。
+        if (gate.requires_attacking_self && !(window === "flash" && state.ownAttackActive
+            && state.battleActive && state.attackingUid === unit.uid)) continue;
         const cost = gate.flash_cost_cores || 0;
         const ordinary = unit.cores - Number(Boolean(unit.soul_core));
         if (cost && (ordinary < cost || unit.cores - cost < unitFloor(state, cards, unit))) continue;
+        // 「Nコスト支払うことで」は盤面を壊さずに払える分だけ(Python同一)。
+        const pay = gate.flash_pay_cost || 0;
+        if (pay && !costAffordable(state, cards, pay, pay, false)) continue;
         sources.push({ card_no: cardNo, cost, effects: group, key,
-          technique: techniqueId !== null });
+          technique: techniqueId !== null, ...(pay ? { pay } : {}) });
       }
     }
     return sources;
@@ -1879,6 +1886,16 @@
     let resolvedAny = false;
     beginEffectFrame(state);
     try {
+      const pay = source.pay || 0;
+      if (pay) {
+        // コストの支払い(リザーブ優先、足りなければ場のコア)でトラッシュへ(CB05-052、Python同一)。
+        fundCost(state, cards, targets, pay, pay, false);
+        payFromReserve(state, pay, 0);
+        state.reserve -= pay;
+        state.spent += pay;
+        recordCoreMove(state, cards, { amount: pay, source: "reserve", destination: "trash",
+          reason: "field_flash_cost", source_card_no: source.card_no, source_uid: unit.uid });
+      }
       if (source.cost) {
         unit.cores -= source.cost;
         // ボイドへ置いたコアはどのゾーンにも入らない(トラッシュではない)。
@@ -10826,8 +10843,11 @@
    *  アタックしている受け手、『バトル時』の封じはバトルしている受け手(アタック・ブロック)が持つ間だけ
    *  (Q1297・Q19373)。待機中・効果を発揮できない受け手は持たない。Python `_burst_activation_locked`と同一。 */
   function burstActivationLocked(state, cards) {
-    if (!state.battleActive || !state.field.some((unit) =>
+    // 場のフラッシュで登録したターンの付与(CB05-052)も数える(Python同一)。
+    if (!state.battleActive || !(state.field.some((unit) =>
       (cards[unit.card_no]?.granted_effects || []).some((entry) =>
+        entry.clauses.some((clause) => clause.kind === "burst_activation_lock")))
+      || (state.effectGrants || []).some(([, entry]) =>
         entry.clauses.some((clause) => clause.kind === "burst_activation_lock")))) return false;
     let grants = null;
     for (const [uid, windows] of [[state.attackingUid, ["while_attacking", "while_battling"]],
@@ -12852,6 +12872,15 @@
         const unit=state.field.find(u=>u.uid===uid);
         return unit?fieldFlashSources(state,cards,unit).filter(s=>s.brave_uid!==undefined)
           .flatMap(s=>fieldEntryChoices(state,cards,unit,s)):[];
+      },
+      // アタック中の自身だけが使える場のフラッシュ(T17-TRIG、CB05-052)の発揮元。Python同名。
+      attack_flash_options: (uid) => {
+        const unit = state.field.find((row) => row.uid === uid);
+        return unit ? fieldFlashSources(state, cards, unit)
+          .filter((source) => source.brave_uid === undefined
+            && source.effects[0].requires_attacking_self)
+          .map((source) => ({ card_no: source.card_no, pay: source.pay || 0,
+            kinds: source.effects.map((effect) => effect.kind) })) : [];
       },
       resolve_field_flash: (uid, choice = null, opponent = null) => {
         // `uid`がnullなら魂状態のカードの分(Python同一。Stage6は行のuidを
@@ -15065,6 +15094,18 @@
     return true;
   }
 
+  /** 手順4でアタック中の自身のフラッシュ『このスピリットのアタック時』を撃つ(T17-TRIG、CB05-052)。
+   *  読める中身はバーストの発動封じだけなので、相手のバーストがセットされていて、まだ封じて
+   *  いないときだけ(方針)。Python `_attack_flash_grant`と同一。 */
+  function attackFlashGrant(emit, actor, board, uid, opponent) {
+    if (!board.attack_flash_options || !board.attack_flash_options(uid).length
+        || !(opponent.burst_set && opponent.burst_set())
+        || (board.burst_activation_locked && board.burst_activation_locked())) return false;
+    if (!board.resolve_field_flash(uid, null, opponent)) return false;
+    emit('field_flash_resolved', actor, {uid});
+    return true;
+  }
+
   function flashDefense(emit, defenderId, defenderBoard, threat, moreAttackers) {
     // **盤面のフラッシュ効果は相手のターンでも撃つ**(6C-2B続き、Python同一)。
     // 印字が『Lv1・Lv2：フラッシュ』でステップを指定していなければ、相手の
@@ -15448,6 +15489,9 @@
           }
           continue;
         }
+        if (attackFlashGrant(emit, actor, attackerBoard, attacker.uid, defenderBoard)) {
+          attacker = overlayRow(attacker, attackerBoard);
+        }
         if (flashAttackEntry(emit, actor, attackerBoard, attacker.uid, defenderBoard)) {
           for (const owner of [actor, defenderId]) {
             if (boards[owner].life() <= 0) {
@@ -15566,6 +15610,9 @@
         if (flashStopBattle(emit, actor, defenderId, boards, freshAttacker,
           freshBlocker, blockedFlash)) return false;
         continue;
+      }
+      if (attackFlashGrant(emit, actor, attackerBoard, freshAttacker.uid, defenderBoard)) {
+        freshAttacker = overlayRow(freshAttacker, attackerBoard);
       }
       if (flashAttackEntry(emit, actor, attackerBoard, freshAttacker.uid, defenderBoard)) {
         for (const owner of [actor, defenderId]) {
