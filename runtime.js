@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v271-v1";
-  const STAGE_VERSION = "v271";
+  const ENGINE_SLICE = "stage4-v273-v1";
+  const STAGE_VERSION = "v273";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v271-portable-v216";
+  const RUNTIME_VERSION = "stage4-v273-portable-v218";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -10814,6 +10814,25 @@
     return new Map();
   }
 
+  /** 相手は今バーストを発動できないか(T17-TRIG、BS24-026・BS16-065)。付与の『アタック時』の封じは
+   *  アタックしている受け手、『バトル時』の封じはバトルしている受け手(アタック・ブロック)が持つ間だけ
+   *  (Q1297・Q19373)。待機中・効果を発揮できない受け手は持たない。Python `_burst_activation_locked`と同一。 */
+  function burstActivationLocked(state, cards) {
+    if (!state.battleActive || !state.field.some((unit) =>
+      (cards[unit.card_no]?.granted_effects || []).some((entry) =>
+        entry.clauses.some((clause) => clause.kind === "burst_activation_lock")))) return false;
+    let grants = null;
+    for (const [uid, windows] of [[state.attackingUid, ["while_attacking", "while_battling"]],
+      [state.battlingUid, ["while_battling"]]]) {
+      const unit = uid === null || uid === undefined ? null : state.field.find((row) => row.uid === uid);
+      if (!unit || unit.waiting || effectsSuppressed(state, unit)) continue;
+      if (grants === null) grants = quotedGrantsByUnit(state, cards);
+      if ((grants.get(uid) || []).some(([entry]) => windows.includes(entry.window)
+        && entry.clauses.some((clause) => clause.kind === "burst_activation_lock"))) return true;
+    }
+    return false;
+  }
+
   /** アタックしている受け手が、ターンの間の付与で`kind`の「できない」を持つか(T17-TRIG、Q28965)。
    *  Python `_attacking_grant_lock`と同一。 */
   function attackingGrantLock(state, cards, uid, kind) {
@@ -12073,6 +12092,8 @@
       add_attack_ban: (ban) => state.timedAttackBans.push(clone(ban)),
       burst_effect_locked: () => Boolean(state.battleActive)
         && attackingGrantLock(state, cards, state.attackingUid, "burst_effect_lock"),
+      // 相手(この盤面の持ち主の相手)は今バーストを発動できないか。Stage6が開く前に聞く。
+      burst_activation_locked: () => burstActivationLocked(state, cards),
       // Stage6はアタックする体のuidで聞く(宣言の時点、以後そのバトルの間は固定)。
       attack_step_end_blocked: (uid) => {
         const unit = state.field.find(row => row.uid === uid && !row.waiting);
@@ -13949,7 +13970,7 @@
   });
   const FORBIDDEN_EVENT_TYPES = new Set([
     "attack_declared", "block_declared", "life_damaged", "battle_resolved",
-    "destroyed_by_battle", "burst_activated", "burst_declined",
+    "destroyed_by_battle", "burst_activated", "burst_declined", "burst_locked",
     "flash_defense_played", "flash_kourin_played", "flash_manifestation_played",
     "flash_removal_played", "trash_flash_played",
     "field_flash_resolved",
@@ -13977,6 +13998,9 @@
     // 開ける窓で、開かない盤面のほうが良いと比べて開かなかった記録(2026-10-11、
     // Python同一)。開いたときは`burst_activated`がその記録になる。
     "burst_declined",
+    // 開ける窓で、相手の「相手はバーストを発動できない」のために発動できなかった記録
+    // (T17-TRIG、Python同一)。バーストはセットのまま残る(Q22388)。
+    "burst_locked",
     // 6C-2B: 守り手が手札からフラッシュの防御札を使った記録。
     "flash_defense_played",
     // ライフが減った直後にトラッシュのフラッシュを使った記録(2026-10-08、Python同一)。
@@ -14838,6 +14862,12 @@
    *  `burst_declined`を書いてfalseを返す(開ける窓が無かったnullと区別する)。 */
   function openBurst(emit, owner, board, category, opponentBoard = null,
     { pendingAttackerUid = null, ownTurn = false, eventContext = null } = {}) {
+    // 相手の「相手はバーストを発動できない」(付与、T17-TRIG)の間はセットのまま残る(Q22388)。
+    if (opponentBoard && opponentBoard.burst_activation_locked?.()
+        && typeof board.burst_opens_on === "function" && board.burst_opens_on(category)) {
+      emit("burst_locked", owner, { condition: category });
+      return false;
+    }
     const decision = burstOpenDecision(board, category, opponentBoard,
       pendingAttackerUid, ownTurn, eventContext);
     if (decision && !decision.open) {
