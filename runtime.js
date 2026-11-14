@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v270-v1";
-  const STAGE_VERSION = "v270";
+  const ENGINE_SLICE = "stage4-v271-v1";
+  const STAGE_VERSION = "v271";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v270-portable-v215";
+  const RUNTIME_VERSION = "stage4-v271-portable-v216";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -12966,13 +12966,24 @@
               gate_source: group.source,
               imagin_limit_host: combinedSide(group.source,uid) ? uid : null,
             }));
-          const borrowedAttackDraw = (sourceUid) => {
-            if (!state.deck.length || !cards[unit.card_no].card_type.includes("スピリット")) return null;
+          const borrowedAttackEffect = (sourceUid) => {
+            if (!cards[unit.card_no].card_type.includes("スピリット")) return null;
             let best = null;
+            let bestDraw = 0;
             for (const donor of [...state.field].sort((left, right) => left.uid - right.uid)) {
               if (donor.uid === sourceUid || donor.waiting) continue;
               for (const row of cards[donor.card_no].attack_effects || []) {
-                if (row.brave_borrowable && (!best || row.amount > best.amount)) best = row;
+                if (!row.brave_borrowable) continue;
+                const effect = {...row, source_card_no: unit.card_no};
+                if (effect.kind === "draw") {
+                  if (state.deck.length && effect.amount > bestDraw) {
+                    best = effect;
+                    bestDraw = effect.amount;
+                  }
+                } else if (!best && combatTargetRows(state, cards, effect, uid)
+                  .some((target) => effect.kind !== "unit_core_remove" || target.cores > 0)) {
+                  best = effect;
+                }
               }
             }
             return best;
@@ -12989,12 +13000,9 @@
               let effect = clause;
               let sourceNo = instance.source_card_no;
               if (clause.kind === "brave_attack_borrow") {
-                const donor = borrowedAttackDraw(instance.source_uid);
-                if (!donor) continue;
-                sourceNo = unit.card_no;
-                effect = {kind: "draw", amount: donor.amount, mode: "on_attack",
-                  draw_from_bottom: donor.draw_from_bottom,
-                  source_card_no: sourceNo, effect_id: donor.effect_id};
+                effect = borrowedAttackEffect(instance.source_uid);
+                if (!effect) continue;
+                sourceNo = effect.source_card_no;
               }
               if (effect.kind === "attack_step_end" && !effectActive(effect, state, cards, uid)) continue;
               const group = effect.exclusive_group ?? null;
@@ -13029,7 +13037,7 @@
             && grantKeysActive(state, cards, instance, uid)
             && instance.clauses.some((effect) =>
               !(instance.gate_source.brave_mode === "spirit" && effect.combine_only)
-              && (effect.kind !== "brave_attack_borrow" || borrowedAttackDraw(instance.source_uid))
+              && (effect.kind !== "brave_attack_borrow" || borrowedAttackEffect(instance.source_uid))
               && effectActive(effect, state, cards, uid)
               // 任意の自己回復は回復状態なら対価/同名回数を温存(Python同一)。
               && (effect.kind !== "self_refresh"
