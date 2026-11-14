@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v277-v1";
-  const STAGE_VERSION = "v277";
+  const ENGINE_SLICE = "stage4-v278-v1";
+  const STAGE_VERSION = "v278";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v277-portable-v222";
+  const RUNTIME_VERSION = "stage4-v278-portable-v223";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -10840,6 +10840,8 @@
           if ("fixed_uid" in entry ? entry.fixed_uid !== unit.uid
             : !grantUnitMatches(state, cards, entry.protect, granterUid === unit.uid, unit, grantedKeywords)) continue;
           if (!result.has(unit.uid)) result.set(unit.uid, []);
+          // 〔重複不可〕は同じ付与を複数の付与元から受けても1つだけ(Q2328)。Python同一。
+          if (entry.non_stackable && result.get(unit.uid).some(([other]) => other.grant_id === entry.grant_id)) continue;
           result.get(unit.uid).push([entry, granterUid]);
         }
       }
@@ -12074,6 +12076,8 @@
         state.battleActive = false;
         state.effectGrants = state.effectGrants.filter(([, entry]) => entry.period !== "battle");
         state.battleDestroyers = [];
+        state.battleBlocked = [];
+        state.battleDelayedGrants = [];
         for (const unit of state.field) {
           delete unit.u_reflected_battle;
           delete unit.forced_block_effect;
@@ -12109,6 +12113,8 @@
         state.effectTextGrants = [];
         state.effectGrants = [];
         state.battleDestroyers = [];
+        state.battleBlocked = [];
+        state.battleDelayedGrants = [];
         state.handCostBonus = 0;
         state.deckDiscardedTurn = 0;
         state.deckDiscardProtection = null;
@@ -12930,6 +12936,7 @@
         // `bp_destroyed`は付与の受け手の窓だけ(T17-TRIG、Python同一)。
         const key = window === "destroy" ? "triggered_effects" : COMBAT_WINDOW_KEYS[window];
         if (window === "bp_destroyed" && !state.battleDestroyers.includes(uid)) state.battleDestroyers.push(uid);
+        if (window === "blocked" && !state.battleBlocked.includes(uid)) state.battleBlocked.push(uid);
         // 『バトル終了時』は**どちらの宣言から遅らせた節か**で選ぶ(6C)。
         // ブロック時由来の節は、その札がブロックしたバトルでしか発揮しない。
         const inWindow = (effect) => window !== "battle_end"
@@ -12957,6 +12964,14 @@
         const grantedRows = window === "attack" || (window === "destroy" && battleRole === "opponent")
           || (state.effectGrants.length && ["battle_end", "bp_destroyed"].includes(window))
           ? quotedGrantsByUnit(state, cards).get(uid) || [] : [];
+        // アタック時に発揮して遅らせた付与の節(SD69-RV002)。付与元が離れていても解く。Python同一。
+        if (window === "battle_end" && battleRole === "attack") {
+          for (const [delayedUid, clause, cardNo] of state.battleDelayedGrants) {
+            if (delayedUid !== uid || (clause.requires_blocked && !state.battleBlocked.includes(uid))
+              || (clause.count_min != null && state.count < clause.count_min)) continue;
+            rows.push([{ ...clause }, unit, cardNo]);
+          }
+        }
         for (const [entry, granterUid] of grantedRows) {
           if (entry.window !== window
             || (window === "destroy" && !(entry.destroyed_by || []).includes(battleRole))
@@ -12967,6 +12982,12 @@
             if (clause.requires_battle_destroyed && !state.battleDestroyers.includes(uid)) continue;
             rows.push([{ ...clause, effect_block_id: `${clause.effect_block_id}@${granterUid}`,
               grant_key: `${entry.grant_id}@${granterUid}` }, unit,
+              granter ? granter.card_no : clause.source_card_no]);
+          }
+          for (const clause of entry.battle_end_clauses || []) {
+            // 発揮済みなので`grant_key`(窓の途中で付与を失えば外す鍵、C3)は付けない。Python同一。
+            state.battleDelayedGrants.push([uid, { ...clause,
+              effect_block_id: `${clause.effect_block_id}@${granterUid}` },
               granter ? granter.card_no : clause.source_card_no]);
           }
         }
@@ -13333,6 +13354,10 @@
       effectGrants: [],
       // このバトルでBP比べにより相手を破壊した自分の体(T17-TRIG)。Python `battle_destroyers`。
       battleDestroyers: [],
+      // このバトルでブロックされた自分の体と、アタック時に発揮して終わりまで遅らせた付与の節
+      // [uid, 節, 出どころの札番号](T17-TRIG、SD69-RV002)。Python `battle_blocked`・`battle_delayed_grants`。
+      battleBlocked: [],
+      battleDelayedGrants: [],
       pendingRefreshSteps: [],
       life: 5, sealed: false,
       reserveHasSoul: true, countHasSoul: false, trashHasSoul: false, lifeHasSoul: false,
