@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v282-v1";
-  const STAGE_VERSION = "v282";
+  const ENGINE_SLICE = "stage4-v287-v1";
+  const STAGE_VERSION = "v287";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v282-portable-v227";
+  const RUNTIME_VERSION = "stage4-v287-portable-v232";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -911,6 +911,7 @@
   const BASIC_COLORS = ["赤", "紫", "緑", "白", "黄", "青"];
   const SUPPORTED_EFFECTS = new Set([
     "brave_attack_borrow",
+    "self_chosen_hand_discard",
     "self_remain",
     "attack_step_end", "timed_attack_life_cap",
     "effect_text_grant", "register_effect_grant",
@@ -936,6 +937,7 @@
   // 列挙していたため、実行系には実装済みの相手盤面干渉でも共有HTMLが入口で拒否した。
   const SUPPORTED_BURST_EFFECTS = new Set([
     "opponent_deck_discard",
+    "self_chosen_hand_discard",
     "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_suppress",
     "draw", "coreboost", "core_to_trash", "field_coreboost", "count_gain",
     "burst_free_play_self", "burst_return_self_to_hand", "burst_pay_own_effect",
@@ -6157,10 +6159,11 @@
           controller_symbol_colors:symbolColorsPresent(effectiveSymbols(state, cards))}});
       return true;
     }
-    if (["revealed_hand_discard", "blind_hand_discard"].includes(effect.kind)) {
+    if (["revealed_hand_discard", "blind_hand_discard", "self_chosen_hand_discard"].includes(effect.kind)) {
       const other = state.combatOpponent;
       const operation = effect.kind === "blind_hand_discard" ? "discard_blind_hand" : "discard_revealed_hand";
-      if (!other?.[operation] || !other[operation](effect.amount, effect.source_card_no, combatBoard(state, cards, targets))) return false;
+      if (!other?.[operation] || !other[operation](effect.amount, effect.source_card_no,
+        combatBoard(state, cards, targets), false, effect.kind === "self_chosen_hand_discard")) return false;
       return true;
     }
     if (effect.kind === "symbol_fix") {
@@ -10114,15 +10117,32 @@
     return false;
   }
 
+  function fallbackSpiritSummon(state, cards, targets) {
+    // Python の _fallback_spirit_summon と同じく、同額なら先に列挙された札。
+    let best = null;
+    for (const candidate of legalCandidates(state, cards, targets)) {
+      if (candidate.hand_index >= state.hand.length
+          || cards[candidate.card_no].card_type !== "スピリット"
+          || candidate.mode !== "normal" || candidate.total > state.reserve
+          || !leavesBurstHold(state, cards, candidate.total)
+          || state.heldRemoval.includes(candidate.card_no)) continue;
+      if (!best || candidate.total < best.total) best = candidate;
+    }
+    return best;
+  }
+
   /** メインステップのプレイを最後まで進める。`floor`は6C-3の残す額。
    *  Python `_play_out_main_step` と同一。 */
   function playOutMainStep(state, cards, targets, floor, held = []) {
     state.burstHoldFloor = floor;
     state.heldRemoval = held;
     try {
+      let mayFallback = state.summonFallback;
       while (true) {
-        const candidate = chooseCandidate(state, cards, targets);
+        const candidate = chooseCandidate(state, cards, targets)
+          ?? (mayFallback ? fallbackSpiritSummon(state, cards, targets) : null);
         if (!candidate || !play(state, cards, targets, candidate)) break;
+        mayFallback = false;
         resolveMainActivatedEffects(state, cards, targets);
         resolveTrashMainSummon(state, cards, targets);
         while (resolveCreatorCoreSummons(state, cards, targets)) { /* 使える経路を使い切る */ }
@@ -10615,6 +10635,7 @@
   // 空から埋めた——相手干渉を足したのにここへ登録しておらず、規則①が一度も
   // 効いていなかった(実データで51窓が印字順のまま)。
   const OPPONENT_FACING_KINDS = new Set([
+    "self_chosen_hand_discard",
     "opponent_deck_discard",
     "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_suppress",
     "unit_destroy", "unit_exhaust", "unit_core_remove",
@@ -10639,6 +10660,7 @@
     // ライフが実際に減ったかが条件。battle_end はブロックの有無と関係なく
     // 発揮するので代用できない(Python同一)。
     life_reduced: "life_reduced_effects",
+    life_replacement: "life_replacement_effects",
     // バトルしている相手の体の消滅/破壊(T17-WIN、Python同一)。
     opponent_destroyed: "opponent_destroyed_effects",
   };
@@ -12412,7 +12434,7 @@
           return levelFor(unit, cards, state) >= (guard.required_level || 0);
         });
       },
-      discard_revealed_hand: (amount, sourceCardNo, opponent = null, ownEffect = false) => executeHandEffect(state, () => {
+      discard_revealed_hand: (amount, sourceCardNo, opponent = null, ownEffect = false, chooseSelf = false) => executeHandEffect(state, () => {
         beginEffectFrame(state);
         const previous = state.combatOpponent;
         state.combatOpponent = opponent;
@@ -12420,6 +12442,11 @@
         if (!ownEffect && board.hand_protected(opponent)) return false;
         const visible = state.hand.filter(cn => ownEffect || !cards[cn].hand_effect_immune);
         if (!visible.length) return false;
+        if (chooseSelf) {
+          const selected = chooseDiscardsFromPool(cards, targets, visible, amount, false);
+          discardHandCards(state, cards, targets, selected, sourceCardNo, !ownEffect);
+          return selected.length > 0;
+        }
         record(state, cards, "cards_opened", {cards: [...visible], source: "hand",
           reason: "opponent_revealed_hand", source_card_no: sourceCardNo});
         const selected = visible.filter(cn => cards[cn].card_type.includes("スピリット"))
@@ -12659,6 +12686,7 @@
           ? Math.min(Math.max(cappedAmount, 0), state.life, ordinary)
           : Math.min(Math.max(cappedAmount, 0), state.life);
         if (taken <= 0) return 0;
+        if (!ownEffect && attacker?.replace_attack_loss?.(taken)) return 0;
         if (state.lifeHasSoul && taken > ordinary) {
           state.lifeHasSoul = false;
           // ボイドへ行った魂コアはどちらの追跡フラグも立てない(コア除去と同じ規則)。
@@ -13043,7 +13071,7 @@
           && (window !== "opponent_destroyed" || ((effect.opponent_destroyed_from || []).includes(side)
             && (effect.destroyed_roles || []).includes(battleRole)));
         // 『アタック時』に発揮して遅らせた印字の節は、宣言の時点のLvも合うときだけ(D54、Python同一)。
-        const declaredLevelOk = (effect, source) => window !== "opponent_destroyed" || source !== unit
+        const declaredLevelOk = (effect, source) => !["opponent_destroyed", "life_replacement"].includes(window) || source !== unit
           || !(effect.levels || []).length
           || (effect.levels || []).includes((state.battleDeclaredLevels || {})[uid]);
         const windowRows = (cardNo, source, contractBaseOnly = false) =>
@@ -13205,13 +13233,24 @@
             }
             return best;
           };
+          const combatClauseActive = (row, instance) => {
+            if (!row.combine_only) return true;
+            const slot = row.double_drive_host_slot;
+            if (!slot) return instance.gate_source.brave_mode !== "spirit";
+            const brave = state.field.find(unit => unit.uid === instance.source_uid);
+            if (!brave || brave.waiting || brave.brave_mode !== "combine") return false;
+            return ["left", "right"].every(side => {
+              const host = state.field.find(unit => unit.uid === brave.combined_sides?.[side] && !unit.waiting);
+              const card = host && unitInfo(state, cards, host);
+              return card?.card_type.includes("スピリット") && cardMatchesSlot(card, slot);
+            });
+          };
           const resolveCombatInstance = (instance) => {
             state.derivedEffectBuffer = [];
             // 「Aするか、Bする」(2026-10-13): 解いてみて良い方の枝だけ(Python同一)。
             const chosen = new Set();
             const decidedAlternatives = new Map();
-            const usable = (row) => !(instance.gate_source.brave_mode === "spirit"
-              && row.combine_only);
+            const usable = (row) => combatClauseActive(row, instance);
             for (const [clauseIndex, clause] of instance.clauses.entries()) {
               if (!usable(clause)) continue;
               let effect = clause;
@@ -13236,7 +13275,7 @@
                 effect_kind: effect.kind, fired_timing: instance.fired_timing, effect_tag: effect.effect_tag || null,
                 window, resolved: ok });
               resolved.push({ kind: effect.kind, effect_id: effect.effect_id ?? null,
-                resolved: Boolean(ok) });
+                resolved: Boolean(ok), ...(window === "life_replacement" ? { replaced: true } : {}) });
               if (effect.kind === "attack_step_end" && ok) break;
               if (effect.exclusive_group && ok) chosen.add(effect.exclusive_group);
               if (flushRequiredAfter(instance.clauses, clauseIndex)) {
@@ -13249,11 +13288,12 @@
           };
           const combatCandidateLegal = (instance) => !instance.gate_source
             ? (!instance.legal || instance.legal()) : (
-            turnLimitAvailable(state, cards, instance)
+            (window !== "life_replacement" || !resolved.length)
+            && turnLimitAvailable(state, cards, instance)
             // 付与元が窓の途中で離れた・条件を外れたら、受け手はもう持たない(C3、Python同一)。
             && grantKeysActive(state, cards, instance, uid)
             && instance.clauses.some((effect) =>
-              !(instance.gate_source.brave_mode === "spirit" && effect.combine_only)
+              combatClauseActive(effect, instance)
               && (effect.kind !== "brave_attack_borrow" || borrowedAttackEffect(instance.source_uid))
               && effectActive(effect, state, cards, uid)
               // 任意の自己回復は回復状態なら対価/同名回数を温存(Python同一)。
@@ -13566,6 +13606,7 @@
       blindHandRngState: [...new Stage5PortableRng.PortableRng(
         Stage5PortableRng.deriveStreamSeed(trialSeed, "blind_hand_discard")).state],
       combat: Boolean(options.combat),
+      summonFallback: Boolean(options.summon_fallback),
       // メインステップの方針。既定は従来どおりの`dig`(Python同一)。
       mainPolicy: validateMainPolicy(options.main_policy),
       effectWindowSeq: 0,
@@ -14182,7 +14223,7 @@
     "flash_battle_grant_played", "bp_destroyed_effects_resolved", "opponent_destroyed_effects_resolved",
     "attack_effects_resolved", "block_effects_resolved",
     "blocked_effects_resolved", "battle_end_effects_resolved",
-    "life_reduced_effects_resolved",
+    "life_reduced_effects_resolved", "life_replacement_effects_resolved",
     // 守り手が相手のターンの『相手の〜ステップ』を撃った記録(2026-10-10、Python同一)。
     "opponent_step_effect_resolved",
   ]);
@@ -14195,7 +14236,7 @@
     "blocked_effects_resolved", "battle_end_effects_resolved",
     // 『アタックによって相手のライフを減らしたとき』。ライフが実際に減ったかが
     // 条件なので、battle_end(ブロックの有無と無関係)とは別に出す(Python同一)。
-    "life_reduced_effects_resolved",
+    "life_reduced_effects_resolved", "life_replacement_effects_resolved",
     // 守り手が相手のターンの『相手の〜ステップ』を撃った記録(2026-10-10、Python同一)。
     "opponent_step_effect_resolved",
     // 6C-2: セット中バーストを実イベント(いまはライフ減少)で開いた記録。
@@ -14365,6 +14406,11 @@
       main_policy: match.main_policy ?? null,
       // デバッグ出力にどちらのプレイヤーかを付ける(棋譜には出ない。Python同一)。
       debug_label: playerId,
+      summon_fallback: packet.deck.cards.every(({card_no}) => {
+        const card = packet.definitions.find((definition) => definition.card_no === card_no)?.stage4;
+        return card?.card_type === "スピリット"
+          && !(card.enablers || []).some(({mode}) => mode === "on_play" || mode === "recurring");
+      }),
     }, seeds.deck_shuffle, true);
     return {
       player_id: playerId,
@@ -15710,9 +15756,15 @@
         }
         const before = defenderBoard.life();
         // アタックによる減少なので**アタッカーのコスト**を渡す。
+        let replaced = false;
         const taken = defenderBoard.damage_life(
           attacker.symbol_count, "reserve", { uid: attacker.uid, board: attackerBoard, cost: attacker.cost,
-            card_type: attacker.card_type || "", symbol_count: attacker.symbol_count });
+            card_type: attacker.card_type || "", symbol_count: attacker.symbol_count,
+            replace_attack_loss: amount => {
+              replaced = amount < before && Boolean(
+                emitTrigger(emit, attackerBoard, actor, uid, attacker, "life_replacement", defenderBoard));
+              return replaced;
+            } });
         if (taken) {
           emit("life_damaged", defenderId, { attacker, amount: taken,
             life_before: before, life_after: defenderBoard.life(), reason: "unblocked" });
@@ -15729,7 +15781,7 @@
           burstAfterLifeLoss(emit, defenderId, defenderBoard, attackerBoard);
         }
         emit("battle_resolved", actor, { attacker, blocker: null,
-          outcome: taken ? "life_damage" : "no_life_left" });
+          outcome: replaced ? "life_replaced" : (taken ? "life_damage" : "no_life_left") });
         if (defenderBoard.life() <= 0) {
           // 決着したバトルの終わりは作らない(Python同一)。
           emit("match_won", actor, { loser: defenderId, reason: "life_reached_zero" });
