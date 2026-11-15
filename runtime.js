@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v287-v1";
-  const STAGE_VERSION = "v287";
+  const ENGINE_SLICE = "stage4-v289-v1";
+  const STAGE_VERSION = "v289";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v287-portable-v232";
+  const RUNTIME_VERSION = "stage4-v289-portable-v234";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1953,8 +1953,8 @@
    *  アタック限定の保護は効果によるライフ減少を止めない。
    *  `cap`は減るたびにNまで、`total_cap`は発揮してから減った合計がNまで
    *  (`taken`は`damage_life`が控える)。 */
-  function lifeDamageAfterProtection(state, amount, attacker, ownEffect = false, source = null) {
-    for (const row of applicableLifeProtections(state, attacker, ownEffect, source)) {
+  function lifeDamageAfterProtection(amount, protections) {
+    for (const row of protections) {
       if (row.protection === "none") return 0;
       if (row.protection === "total_cap") {
         amount = Math.min(amount, Math.max(0, row.amount - (row.taken || 0)));
@@ -1967,9 +1967,10 @@
 
   /** この減少に効く保護の行。Python `_applicable_life_protections` と同一。
    *  `source_kind: unit`は発生源のスピリット/アルティメットで絞る(T89、Q31801)。 */
-  function applicableLifeProtections(state, attacker, ownEffect = false, source = null) {
+  function applicableLifeProtections(state, attacker, ownEffect, source, bypassColors) {
     return state.lifeProtections.filter((row) => {
       if (row.protection === "attack_total") return false;
+      if (row.source_colors?.some(color => bypassColors.has(color))) return false;
       if (ownEffect && !row.blocks_own_effects) return false;
       if (row.source_kind === "unit" && !lifeSourceMatches(row, source)) return false;
       if (row.source_kind === "attack" && !attacker) return false;
@@ -1997,7 +1998,8 @@
     const attackStep = state.ownAttackActive || Boolean(other?.in_attack_step?.());
     const caps = state.field.flatMap(unit =>
       (unitInfo(state, cards, unit)?.field_life_protections || []).map((rule, index) =>
-        ({...rule, _life_cap_id: `${unit.uid}:${unit.card_no}:${index}`})).filter(rule =>
+        ({...rule, _life_cap_id: `${unit.uid}:${unit.card_no}:${index}`,
+          source_colors: [...(unitInfo(state, cards, unit)?.colors || [])].sort()})).filter(rule =>
         ["per_source_turn", "per_source_attack", "attack_total"].includes(rule.protection)
         && (rule.protection !== "attack_total" || !unit.waiting)
         && (!rule.both_attack_steps || attackStep)
@@ -2009,7 +2011,9 @@
         && effectActive(rule, state, cards, unit.uid)));
     if (ownLife) {
       for (const row of state.lifeProtections) {
-        if (row.protection === "attack_total") caps.push({...row, _life_cap_id: `timed:${row.amount}`});
+        if (row.protection === "attack_total") {
+          caps.push({...row, _life_cap_id: `timed:${row.amount}:${(row.source_colors || []).join(",")}`});
+        }
       }
     }
     return caps;
@@ -2029,9 +2033,10 @@
       for (const [side, rule] of caps) {
         if (rule.protection === "attack_total") {
           const capKey = `${side}:${rule._life_cap_id}|attack_total`;
-          active[capKey] = state.lifeSourceCapStarts[capKey] || {
-            protection: "attack_total", start: state.spiritLifeTakenAttack.attack_total || 0,
-            amount: rule.amount};
+          active[capKey] = {
+            protection: "attack_total",
+            start: state.lifeSourceCapStarts[capKey]?.start ?? (state.spiritLifeTakenAttack.attack_total || 0),
+            amount: rule.amount, source_colors: side === "self" ? rule.source_colors || [] : []};
           continue;
         }
         for (const [sourceSide, source, combined] of sources) {
@@ -2064,11 +2069,12 @@
       state.combatOpponent].some(board => board?.in_battle?.());
   }
 
-  function attackLifeRoom(state, cards, amount, inBattle = lifeInBattle(state)) {
+  function attackLifeRoom(state, cards, amount, inBattle = lifeInBattle(state), bypassColors = new Set()) {
     if (!state.hasAttackTotal || !inBattle) return amount;
     syncLifeCapStarts(state, cards);
     for (const interval of Object.values(state.lifeSourceCapStarts)) {
-      if (interval.protection === "attack_total") {
+      if (interval.protection === "attack_total"
+          && !interval.source_colors?.some(color => bypassColors.has(color))) {
         const taken = (state.spiritLifeTakenAttack.attack_total || 0) - interval.start;
         amount = Math.min(amount, Math.max(0, interval.amount - taken));
       }
@@ -2163,7 +2169,9 @@
 
   /** Register a timed Life protection (Python `_combat_protect_life`). */
   function protectLife(state, cards, protection) {
-    state.lifeProtections.push({ ...protection });
+    const source = cards[protection.card_no || protection.source_card_no];
+    state.lifeProtections.push({ ...protection,
+      ...(source && !protection.source_colors ? {source_colors: [...(source.colors || [])].sort()} : {}) });
     record(state, cards, "life_protected", {
       protection: protection.protection, amount: protection.amount,
       scope: protection.scope, attacker_cost_min: protection.attacker_cost_min,
@@ -4146,6 +4154,25 @@
       .sort((left, right) => left.uid - right.uid);
   }
 
+  function doubleDriveHostsMatch(state, cards, brave, slot) {
+    return !brave.waiting && brave.brave_mode === "combine" && ["left", "right"].every(side => {
+      const host = state.field.find(unit => unit.uid === brave.combined_sides?.[side]
+        && !unit.waiting && !unit.battle_destroy_pending);
+      const card = host && unitInfo(state, cards, host);
+      return card?.card_type.includes("スピリット") && cardMatchesSlot(card, slot);
+    });
+  }
+
+  function activeDoubleDriveFollowups(state, cards, uid) {
+    const host = state.field.find(unit => unit.uid === uid);
+    if (!host || host.waiting || host.battle_destroy_pending || effectsSuppressed(state, host)) return [];
+    return combinedBraves(state, uid).flatMap(brave => {
+      const effect = unitInfo(state, cards, brave, uid)?.double_drive_followup;
+      return effect && doubleDriveHostsMatch(state, cards, brave, effect.double_drive_host_slot)
+        ? [{cardNo: brave.card_no, effect}] : [];
+    });
+  }
+
   /** 合体先になれるユニット(uid昇順)。Python `brave_combine_host_uids`と同一で、
    *  **待機中は除く**。合体先は1体に決まるので、可否だけでなく相手も返す。 */
   function capacityFilterMatches(card, filter) {
@@ -6033,8 +6060,10 @@
   function resolveEffectBody(state, cards, targets, effect, sourceUid) {
     if (!effectActive(effect, state, cards, sourceUid)) return false;
     if (effect.kind === "timed_attack_life_cap") {
+      const source = state.field.find(unit => unit.uid === sourceUid);
       protectLife(state, cards, {protection: "attack_total", amount: effect.amount,
-        scope: "turn", source_kind: "any", attacker_cost_min: null});
+        scope: "turn", source_kind: "any", attacker_cost_min: null,
+        source_colors: source ? [...unitInfo(state, cards, source).colors].sort() : []});
       return true;
     }
     // 印字の対価は、可否を見たあと**解決に入る直前**に1回だけ払う
@@ -11889,7 +11918,9 @@
           effectSummon(state, cards, targets, no, zoneName, reaction.pay, plan.mode, plan.total, no);
           state.deckDiscardProtection = reaction.scope;
           state.deckDiscardOwnProtection = reaction.kind !== "flash" ? reaction.scope : null;
-          for (const protection of reaction.life_protections || []) protectLife(state, cards, protection);
+          for (const protection of reaction.life_protections || []) {
+            protectLife(state, cards, {...protection, card_no: no});
+          }
         } finally {
           endEffectFrame(state);
           state.combatOpponent = previous;
@@ -12027,6 +12058,14 @@
       // 数える・条件が読む体(待機中を含む、T91-REF)。Python同一。
       present_units: () => combatUnits(state, cards, true),
       is_combined: uid => Boolean(combinedBraves(state, uid).length),
+      repeat_attack_source: uid => {
+        const host = state.field.find(unit => unit.uid === uid);
+        if (!host || host.heavy_exhausted) return null;
+        const followup = activeDoubleDriveFollowups(state, cards, uid)[0];
+        return followup && combatUnitRow(state, cards, host).can_attack !== false ? followup.cardNo : null;
+      },
+      life_protection_bypass_colors: uid => new Set(activeDoubleDriveFollowups(state, cards, uid)
+        .flatMap(({effect}) => effect.life_protection_bypass_colors || [])),
       // 場の体の札が効果の記述を持つか(T89)。Python同一。
       has_effect_text: uid => unitHasEffectText(state, cards, uid),
       in_battle: () => state.battleActive,
@@ -12651,12 +12690,14 @@
         const source = attacker;
         if (source?.damage_kind === "effect") attacker = null;
         // 自傷と違い**ライフ0まで削れる**(そこが勝敗の分かれ目そのもの)。
-        const protectedAmount = lifeDamageAfterProtection(
-          state, Math.max(amount, 0), attacker, ownEffect, source);
+        const bypassColors = !ownEffect && source?.uid != null
+          ? source.board?.life_protection_bypass_colors?.(source.uid) || new Set() : new Set();
+        const protections = applicableLifeProtections(state, attacker, ownEffect, source, bypassColors);
+        const protectedAmount = lifeDamageAfterProtection(Math.max(amount, 0), protections);
         const key = lifeSourceKey(source, ownEffect);
         syncLifeCapObservers(state, cards);
         const inBattle = lifeInBattle(state, source);
-        let cappedAmount = attackLifeRoom(state, cards, protectedAmount, inBattle);
+        let cappedAmount = attackLifeRoom(state, cards, protectedAmount, inBattle, bypassColors);
         if (key !== null) {
           const other = source.opponent_board || (!ownEffect ? source.board : null);
           const caps = [...lifeSourceCaps(state, cards).map(rule => ["self", rule]),
@@ -12665,6 +12706,7 @@
             ? source.board?.field?.().find(u => u.uid === source.uid) || source : source;
           for (const [side, rule] of caps) {
             if (rule.protection === "attack_total") continue;
+            if (side === "self" && rule.source_colors?.some(color => bypassColors.has(color))) continue;
             if (!(rule.attacker_types || ["スピリット"]).includes(lifeSourceType(source))) continue;
             if (rule.protection === "per_source_attack" && !inBattle) continue;
             if (rule.scope === "self" && ownEffect) continue;
@@ -12698,7 +12740,7 @@
         if (key !== null) state.spiritLifeTaken[key] = (state.spiritLifeTaken[key] || 0) + taken;
         if (key !== null && inBattle) state.spiritLifeTakenAttack[key] = (state.spiritLifeTakenAttack[key] || 0) + taken;
         // 合計で数える保護(`total_cap`)へ、実際に減った量を控える(Python同一)。
-        for (const row of applicableLifeProtections(state, attacker, ownEffect, source)) {
+        for (const row of protections) {
           if (row.protection === "total_cap") row.taken = (row.taken || 0) + taken;
         }
         return taken;
@@ -12896,7 +12938,7 @@
         record(state, cards, "cost_paid",
           { card_no: cardNo, payment: "cores", ...traceDetails });
         state.trashCards.splice(state.trashCards.indexOf(cardNo), 1);
-        protectLife(state, cards, effect);
+        protectLife(state, cards, {...effect, card_no: cardNo});
         if (route.after_trash_use === "exclude") {
           state.excludedCards.push(cardNo);
           record(state, cards, "card_excluded", { card_no: cardNo, source: "trash",
@@ -13238,12 +13280,7 @@
             const slot = row.double_drive_host_slot;
             if (!slot) return instance.gate_source.brave_mode !== "spirit";
             const brave = state.field.find(unit => unit.uid === instance.source_uid);
-            if (!brave || brave.waiting || brave.brave_mode !== "combine") return false;
-            return ["left", "right"].every(side => {
-              const host = state.field.find(unit => unit.uid === brave.combined_sides?.[side] && !unit.waiting);
-              const card = host && unitInfo(state, cards, host);
-              return card?.card_type.includes("スピリット") && cardMatchesSlot(card, slot);
-            });
+            return Boolean(brave && doubleDriveHostsMatch(state, cards, brave, slot));
           };
           const resolveCombatInstance = (instance) => {
             state.derivedEffectBuffer = [];
@@ -15618,10 +15655,21 @@
     const theirPreview = previewAttackWindows(defenderBoard, attackerBoard);
     const order = attackOrder(
       attackerBoard, defenderBoard, profiles, gift, publicPlanDamage, ownPreview);
-    for (let index = 0; index < order.length; index += 1) {
-      let uid = order[index];
+    let index = -1;
+    let previousUid = null;
+    while (previousUid !== null || index + 1 < order.length) {
+      const repeatSource = previousUid === null ? null : attackerBoard.repeat_attack_source?.(previousUid);
+      let uid;
+      if (repeatSource) {
+        uid = previousUid;
+      } else {
+        index += 1;
+        if (index === order.length) break;
+        uid = order[index];
+      }
+      previousUid = null;
       let attacker = attackerBoard.units().find((row) => row.uid === uid);
-      if (!attacker || attacker.exhausted) continue;
+      if (!attacker || (attacker.exhausted && !repeatSource)) continue;
       const blockers = defenderBoard.units().filter((row) => !row.exhausted);
       // 削り切りは**残りの宣言順**で測り直す(Python同一)。1体目が止められた／
       // 破壊された後も「ここから先で削り切れるか」で読み、崩れた計画に注ぎ足さない。
@@ -15643,7 +15691,9 @@
       const [seenBlockers, seenLife] = previewed(
         blockers, defenderBoard.life(), ownPreview, uid);
       const [reason, declined] = attackReason(
-        previewAttacker(attacker, ownPreview), seenBlockers, seenLife, profiles, gift, stepLethal,
+        repeatSource ? attacker : previewAttacker(attacker, ownPreview),
+        repeatSource ? blockers : seenBlockers, repeatSource ? defenderBoard.life() : seenLife,
+        profiles, gift, repeatSource ? null : stepLethal,
         planDamage, ownClock, ownClockIfAttacking, publicPlanDamage,
         laterAttackers);
       if (!reason) {
@@ -15658,9 +15708,13 @@
           return endLock || Boolean(attackerBoard.opponent_step_end_blocked?.("attack"));
       };
       stepLocked();
+      if (!repeatSource) previousUid = uid;
+      const moreAttacks = () => remainingAttackers(order, index, attackerBoard).length > 0
+        || (previousUid !== null && Boolean(attackerBoard.repeat_attack_source?.(previousUid)));
       attackerBoard.exhaust(uid);
       emit("attack_declared", actor, { attacker, reason,
-        attack_reasons: rowProfile(profiles, attacker).attack_reasons });
+        attack_reasons: rowProfile(profiles, attacker).attack_reasons,
+        ...(repeatSource ? { double_drive_source: repeatSource } : {}) });
       // 公式手順1(アタック宣言)の直後、手順2(ブロック)より前(page08)。
       emitTrigger(emit, attackerBoard, actor, uid, attacker, "attack", defenderBoard);
       adoptBattleSuccessor(attacker,attackerBoard);uid=attacker.uid;
@@ -15734,11 +15788,11 @@
             attacker_has_effect_text: Boolean(attackerBoard.has_effect_text?.(uid)),
             later_life: remainingAttackerRows(order, index, attackerBoard)
               .reduce((sum, row) => sum + row.symbol_count, 0) },
-          remainingAttackers(order, index, attackerBoard).length > 0);
+          moreAttacks());
         if (flashStopsTheBattle(flash, stepLocked())) {
-          if (flashStopBattle(emit, actor, defenderId, boards, attacker, null, flash)) {
-            return false;
-          }
+          const stopped = flashStopBattle(emit, actor, defenderId, boards, attacker, null, flash);
+          if (stopped === "won") return true;
+          if (stopped) return false;
           continue;
         }
         if (attackFlashGrant(emit, actor, attackerBoard, attacker.uid, defenderBoard)) {
@@ -15751,7 +15805,12 @@
                 {loser:owner,reason:'life_reached_zero'}); return true;
             }
           }
-          if (battleLeft(emit, actor, defenderId, boards, attacker, null)) continue;
+          const closed = battleLeft(emit, actor, defenderId, boards, attacker, null);
+          if (closed === "won") return true;
+          if (closed) {
+            if (flashEndsTheStepAfter(flash, stepLocked())) return false;
+            continue;
+          }
           attacker = overlayRow(attacker, attackerBoard);
         }
         const before = defenderBoard.life();
@@ -15787,7 +15846,7 @@
           emit("match_won", actor, { loser: defenderId, reason: "life_reached_zero" });
           return true;
         }
-        endBattle(emit, actor, defenderId, boards, uid, null);
+        if (endBattle(emit, actor, defenderId, boards, uid, null)) return true;
         // 『このバトルが終了したとき、アタックステップを終了する』はバトル終了時の
         // 効果をすべて解決した**後**に効く(Q17596、Python同一)。『ライフ保護』は
         // ステップを止めないので、ここでは何もしない。
@@ -15869,7 +15928,7 @@
         { life: 0, attacker_cost: freshAttacker.cost,
           unit: ["blocker_destroyed", "both_destroyed"].includes(
             battleOutcome(freshAttacker.bp, freshBlocker.bp)) },
-        remainingAttackers(order, index, attackerBoard).length > 0);
+        moreAttacks());
       if (flashStopsTheBattle(blockedFlash, stepLocked())) {
         const stopped = flashStopBattle(emit, actor, defenderId, boards, freshAttacker,
           freshBlocker, blockedFlash);
@@ -15889,7 +15948,10 @@
         }
         const closed = battleLeft(emit, actor, defenderId, boards, freshAttacker, freshBlocker);
         if (closed === "won") return true;
-        if (closed) continue;
+        if (closed) {
+          if (flashEndsTheStepAfter(blockedFlash, stepLocked())) return false;
+          continue;
+        }
         freshAttacker = overlayRow(freshAttacker, attackerBoard);
         freshBlocker = overlayRow(freshBlocker, defenderBoard);
       }
@@ -15897,6 +15959,7 @@
         emit('battle_resolved',actor,{attacker:freshAttacker,blocker:freshBlocker,
           outcome:freshAttacker.battle_absent?'attacker_left_field':'blocker_left_field'});
         if (endBattle(emit,actor,defenderId,boards,freshAttacker.uid,freshBlocker.uid)) return true;
+        if (flashEndsTheStepAfter(blockedFlash, stepLocked())) return false;
         continue;
       }
       const outcome = battleOutcome(freshAttacker.bp, freshBlocker.bp);
