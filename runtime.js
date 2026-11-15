@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v290-v1";
-  const STAGE_VERSION = "v290";
+  const ENGINE_SLICE = "stage4-v291-v1";
+  const STAGE_VERSION = "v291";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v290-portable-v235";
+  const RUNTIME_VERSION = "stage4-v291-portable-v236";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -2449,7 +2449,9 @@
     const candidates = combatFieldRows(state,cards).filter(row =>
       effect.target_types.some(kind => row.card_type.endsWith(kind)
         || (kind === "スピリット" && row.spirit_state))
-      && effect.target_lineages.some(lineage => (cards[row.card_no]?.lineages || []).includes(lineage))
+      // 系統を言わない「自分のスピリット1体」(BSC50-009、T17-WIN)は誰でも。Python同一。
+      && (!effect.target_lineages.length
+        || effect.target_lineages.some(lineage => (cards[row.card_no]?.lineages || []).includes(lineage)))
       && !resisted(state,cards,row,effect,sourceUid,true));
     candidates.sort((a,b) => Number(b.exhausted)-Number(a.exhausted)
       || b.symbol_count-a.symbol_count || b.bp-a.bp || b.cost-a.cost || a.uid-b.uid);
@@ -5842,14 +5844,20 @@
 
   /** 倍率(「〜Nにつき」)。倍率を持たない節は1、数えられない主語は0。
    *  Python `_amount_per_multiplier` と同一。 */
-  function amountPerMultiplier(effect, state, cards) {
+  function amountPerMultiplier(effect, state, cards, sourceUid = null) {
     // 払った枚数だけ撃つ節(v66)。Pythonは`resolve_enabler`の入口で同じ数を掛ける。
     if (effect.amount_per_paid) return state.lastPaymentCount;
     const spec = effect.amount_per;
     if (!spec) return 1;
     const per = spec.per || 1;
     let value;
-    if (spec.subject === "count") value = state.count;
+    if (spec.subject === "source_symbols") {
+      // 「このスピリットのシンボル1つにつき」(T17-WIN、CB13-018)。発揮元の今のシンボル数で、
+      // 数え方は`amount_per_source_symbol`と同じ。相打ちの破壊待機中も場にいる(Q14122)。Python同一。
+      const unit = state.field.find((row) => row.uid === sourceUid);
+      value = unit ? combatUnitRow(state, cards, unit, sourceUid).symbol_count : 0;
+    }
+    else if (spec.subject === "count") value = state.count;
     else if (spec.subject === "own_hand") value = state.hand.length;
     else if (spec.subject === "opponent_hand") {
       // 相手の手札の枚数(公開情報、2026-10-13、Python同一)。結ばれていなければ撃たない。
@@ -6076,7 +6084,7 @@
     const hitCost = ["unit_destroy", "opponent_deck_discard"].includes(effect.kind) && effect.amount_from_u_hit_cost
       ? (state.uTriggerHits.get(`${effect.requires_u_hit}@${sourceUid}`) || [])
         .reduce((sum, row) => sum + row.cost, 0) : 1;
-    const amount = (effect.amount ?? 0) * amountPerMultiplier(effect, state, cards) * hitCost;
+    const amount = (effect.amount ?? 0) * amountPerMultiplier(effect, state, cards, sourceUid) * hitCost;
     if (effect.kind === "opponent_deck_discard") {
       let source = state.field.find(unit => unit.uid === sourceUid);
       source = state.field.find(unit => unit.uid === source?.combined_host_uid) || source;
