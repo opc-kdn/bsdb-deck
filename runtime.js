@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v291-v1";
-  const STAGE_VERSION = "v291";
+  const ENGINE_SLICE = "stage4-v292-v1";
+  const STAGE_VERSION = "v292";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v291-portable-v236";
+  const RUNTIME_VERSION = "stage4-v292-portable-v237";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1913,7 +1913,8 @@
         record(state, cards, "effect_start", { card_no: source.card_no, uid: unit.uid,
           effect_kind: effect.kind, window });
         const traceMark = state.events.length;
-        const ok = resolveEffect(state, cards, targets, effect, unit.uid);
+        // 「入れ替える」は0枚でも解決済み(宣言の窓と同じ、Python同一)。
+        const ok = resolveEffect(state, cards, targets, effect, unit.uid) || effect.kind === "exchange";
         record(state, cards, "effect_complete", { card_no: source.card_no, uid: unit.uid,
           effect_kind: effect.kind, window, resolved: Boolean(ok) });
         if (ok) {
@@ -5017,7 +5018,9 @@
   }
 
   function clearRemovedFaceUpTop(state, amount) {
-    if (amount > 0 && state.faceUpTop === state.deck.at(-1)) state.faceUpTop = null;
+    // 1番上の札が離れるなら印を消す(Python `_observe_deck_exit`同一。印の番号と
+    // 見比べない——番号だけ見ると、同じ番号の次の札が表向きとして出てくる)。
+    if (amount > 0 && state.deck.length) state.faceUpTop = null;
   }
 
   // ---- 山札の「位置まで分かっている端」(Python `_consume_known_top` /
@@ -5091,6 +5094,11 @@
     if (!placed.length) return;
     if (destination === "top") state.knownTopCards.unshift(...[...placed].reverse());
     else state.knownBottomCards.unshift(...placed);
+    // デッキの上へ札を置いたら、下になった表向きの札は裏向きへ戻る(印字「1番上で
+    // なくなるとき裏向きに戻す」、Python `_cover_face_up_top`)。⚠️ 2026-11-15(T135)まで
+    // 印を残していたので、上に載った札を引いた後に下の札を表向きとして出していた。
+    // 上に置いた札を表向きにする効果は、この後で自分で印を立てる。
+    if (destination === "top") state.faceUpTop = null;
   }
 
   // 表向きトップはカード番号ではなく「現在トップにある物理コピー」の印。
@@ -7046,11 +7054,16 @@
           const index = remaining.indexOf(cardNo);
           if (index < 0 || !summonConditionsMet(cards[cardNo], state, cards)) continue;
           const maintenance = entryMaintenance(state, cards, cards[cardNo]);
-          if (maintenance > reclaimable(state, true, cards)) continue;
+          // 直接合体は維持コアが要らない(裁定3616、バーストの自己召喚と同じ)。⚠️ 2026-11-15
+          // (T133)まで、合体で出すのに維持コアぶんを払ってどこにも置かず、Pythonは出し方を
+          // 渡さず未定のまま場へ出していた(BSC49-CP01が公開したBSC49-060)。
+          const brave = braveMode(cards[cardNo], state, cards);
+          const total = brave === "combine" ? 0 : maintenance;
+          if (total > reclaimable(state, true, cards)) continue;
           remaining.splice(index, 1);
           state.hand.push(cardNo);
-          play(state, cards, targets, { card_no: cardNo, pay: 0, total: maintenance, by_own_effect: true,
-            maintenance, brave_mode: braveMode(cards[cardNo], state, cards),
+          play(state, cards, targets, { card_no: cardNo, pay: 0, total, by_own_effect: true,
+            maintenance, brave_mode: brave,
             allow_sacrifice: true, mode: "normal", completion_sink: completions });
         }
         const resolveRemainder = () => {
@@ -7610,16 +7623,20 @@
       record(state, cards, "effect_complete", { card_no: source.card_no, uid: source.uid,
         effect_kind: "after_burst_open", resolved });
     }
-    // バーストの節で出した別の札(`zone_summon`、2026-10-11)の召喚時効果は、自分を出す
-    // 節の完了より**先**に解く(Pythonは`runtime.reserve`へ出した順に積み、枠の終わりに
+    // バーストの節で出した別の札(`zone_summon`、2026-10-11)の召喚時効果と、自分を出す節の
+    // 完了は、**場へ出た順**に解く(Pythonは`runtime.reserve`へ出した順に積み、枠の終わりに
     // その順で解く)。ここで空にしないと、自分を出さないマジックのバーストでは、次に
     // 何かを召喚するまで召喚時効果が解かれずに残る。
-    while (state.deferredDerivedPlays.length) {
-      const play = state.deferredDerivedPlays.shift();
-      if (play.run) play.run(); else play();
-    }
-    while (state.deferredPlayCompletions.length) {
-      state.deferredPlayCompletions.shift()();
+    // ⚠️ 2026-11-15(T115)まで、別の札の召喚時効果を常に先に解いていた。「この効果発揮後、
+    // このカードを召喚する」の札はそれで合うが、「このカードを配置する。その後、1枚を
+    // 召喚できる」(BSC48-045 千間観音堂LT)では自分の完了が後ろへ回り、Pythonと逆だった。
+    while (state.deferredDerivedPlays.length || state.deferredPlayCompletions.length) {
+      const derived = state.deferredDerivedPlays[0];
+      const completion = state.deferredPlayCompletions[0];
+      if (derived && !(completion && completion.seq < derived.seq)) {
+        state.deferredDerivedPlays.shift();
+        if (derived.run) derived.run(); else derived();
+      } else state.deferredPlayCompletions.shift()();
     }
     return true;
   }
@@ -7645,7 +7662,12 @@
       .filter((row) => (cards[row.cardNo]?.card_type || "").includes("スピリット")
         && (cards[row.cardNo]?.lineages || []).some((lineage) => wanted.has(lineage)))
       .sort((a, b) => a.tier - b.tier || a.index - b.index)[0];
-    let pending = null;
+    // 印字の順は「セット→召喚→残ったカードは破棄」。召喚は残りを破棄する前に成立させ、
+    // 召喚時効果と完了は、先に待っている召喚(バーストの自己召喚)の後ろへ積んで、この効果の
+    // 後で解く(Python `_resolve_after_burst_open`は`deferred_batch`へ積み、残りを破棄して
+    // から`runtime.reserve`する)。⚠️ 2026-11-15(T135)まで、残りを先に破棄してから専用の
+    // 記録名`after_burst_open`で出し、召喚時効果をその場で解いていた(日下チヒロLv2。
+    // Pythonは通常の召喚`normal`で記録する)。
     if (summoned) {
       const card = cards[summoned.cardNo];
       const brave = braveMode(card, state, cards);
@@ -7653,9 +7675,11 @@
       const total = pay + (brave === "combine" ? 0 : entryMaintenance(state, cards, card));
       if (costAffordable(state, cards, pay, total, true)) {
         opened.splice(opened.indexOf(summoned.cardNo), 1);
-        pending = { card_no: summoned.cardNo, pay, total,
+        state.hand.push(summoned.cardNo);
+        play(state, cards, targets, { card_no: summoned.cardNo, pay, total,
           maintenance: entryMaintenance(state, cards, card), brave_mode: brave,
-          allow_sacrifice: true, mode: "after_burst_open" };
+          allow_sacrifice: true, mode: "normal",
+          completion_sink: state.deferredPlayCompletions });
       }
     }
     if (opened.length) {
@@ -7664,11 +7688,26 @@
         destination: "trash", reason: "after_burst_open_remainder",
         source_card_no: source.card_no });
     }
-    if (pending) {
-      state.hand.push(pending.card_no);
-      play(state, cards, targets, pending);
-    }
     return true;
+  }
+
+  /** `mark`より後に積まれた反応だけを流す(Python `runtime.flush_since(mark)`)。
+   *  それより前から待っている反応は退けておき、流し終えたら元の位置(先頭)へ戻す。
+   *  ⚠️ 2026-11-16(T115の続き)まで発揮待ちの窓は待っている反応を全部流していたので、
+   *  マジックの相手への節の対価で置いたソウルコアへの誘発(BS74-CX01のカウント+2)が、
+   *  続く自分の節の後・マジックがトラッシュへ行く前に解かれていた(Pythonは使用の完了の後)。 */
+  function flushCountReactionsSince(state, cards, targets, mark) {
+    const keys = ["pendingCountEvents", "pendingOpenBursts", "pendingEffectReactions"];
+    const older = keys.map((key) => {
+      const rows = state[key].splice(0);
+      state[key].push(...rows.filter((row) => !(row.seq < mark)));
+      return [key, rows.filter((row) => row.seq < mark)];
+    });
+    try {
+      flushCountReactions(state, cards, targets);
+    } finally {
+      for (const [key, rows] of older) state[key].unshift(...rows);
+    }
   }
 
   function flushCountReactions(state, cards, targets) {
@@ -7698,6 +7737,13 @@
         continue;
       }
       const payload = state.pendingCountEvents.shift();
+      // 提示は、ただちに発動するバーストの宣言と同じ時点(公式Q27939)。バーストを優先して
+      // 解き、そこから派生する効果・バースト発動後の効果を解いた後で、提示した札を解く
+      // (Q11465)。**提示できるのはこの時点で手札にある札だけ**で、バーストが後から引いた札は
+      // その増加に対しては提示できない。Python `resolve_count_reactions`同一。
+      // ⚠️ 2026-11-16(T115の続き)まで、バーストの後の手札で候補を作っていた(バーストで
+      // 引いたBS52-XX02を召喚。gekiha_g)。Pythonは逆に手札の反応を先に解いていた。
+      const presented = [...state.hand];
       if (state.burst) {
         const cardNo = state.burst;
         const reaction = (cards[cardNo]?.burst_reactions || []).find((row) =>
@@ -7705,10 +7751,12 @@
         if (reaction) {
           state.burst = null;
           state.burstOpen = cardNo;
+          const burstMark = state.derivedSeq;
           resolveBurstEffects(state, cards, targets, cardNo);
+          flushCountReactionsSince(state, cards, targets, burstMark);
         }
       }
-      resolveHandCountReactions(state,cards,targets,payload);
+      resolveHandCountReactions(state,cards,targets,payload,'count_increased',presented);
     }
   }
 
@@ -8638,6 +8686,9 @@
         return (selected.run || resolveInstance)(selected);
       };
       lastDepth = selected.priority_depth;
+      // この効果より前から待っている反応は、この効果の後では流さない(Pythonは
+      // `pending_mark`を取り、`runtime.flush_since(mark)`でこの効果が積んだ分だけ流す)。
+      const pendingMark = state.derivedSeq;
       const generated = [...(executeDestroyEffect(state, () => executeHandEffect(state,
         runSelected)) || [])];
       if (options.stop?.()) return;
@@ -8651,7 +8702,7 @@
         if (state.deferredFieldLeaves[i].effectBoundary) state.deferredFieldLeaves.splice(i,1)[0]();
         else i++;
       }
-      flushCountReactions(state, cards, targets);
+      flushCountReactionsSince(state, cards, targets, pendingMark);
       if (mergeDerived) {
         const depth = selected.priority_depth + 1;
         const derived = [];
@@ -9133,7 +9184,7 @@
     if (state.effectFrameDepth === 1) flushCountReactions(state, cards, targets);
     endEffectFrame(state);
     };
-    if(candidate.effect_kourin && state.effectFrameDepth>0)state.deferredDerivedPlays.push({run:finishKourin});
+    if(candidate.effect_kourin && state.effectFrameDepth>0)state.deferredDerivedPlays.push({seq:state.derivedSeq++,run:finishKourin});
     else finishKourin();
     return true;
   }
@@ -9261,7 +9312,7 @@
     if (state.effectFrameDepth === 1) flushCountReactions(state, cards, targets);
     endEffectFrame(state);
     };
-    if(candidate.effect_kourin && state.effectFrameDepth>0)state.deferredDerivedPlays.push({run:finishKourin});
+    if(candidate.effect_kourin && state.effectFrameDepth>0)state.deferredDerivedPlays.push({seq:state.derivedSeq++,run:finishKourin});
     else finishKourin();
     return true;
   }
@@ -9434,21 +9485,29 @@
       ...traceDetails });
     state.played.add(candidate.card_no);
     state.playCounts[state.turn] = (state.playCounts[state.turn] || 0) + 1;
+    // 手札カウント反応で召喚したときの「そうしたとき」節(`hand_reaction_effects`)は、
+    // 召喚と同じ印字効果の続きなので、召喚に続けてすぐ解く(D27。Python
+    // `resolve_hand_count_reaction`は`resolve_linked_effects`をその場で呼び、誘発と
+    // 自分の発揮待ちだけを予約する)。⚠️ 2026-11-15(T135)まで、先に待っている別の召喚の
+    // 完了がある間はこの節までその後ろへ回し、誘発より後に解いていた(プチフェニルの
+    // 表向き召喚の完了と、三賢神ラルヴァンダードのドロー・コアブーストの順がPythonと逆)。
+    const parentDepth = state.effectFrameDepth - Number(keepFundingFrame);
+    const waitsBehindExistingDerivedPlay = mode === "hand_reaction"
+      && parentDepth > 0 && state.deferredPlayCompletions.length > 0;
+    const resolveLinked = () => {
+      for (const effect of card.hand_reaction_effects || []) {
+        resolveEffect(state, cards, targets, effect, uid);
+      }
+    };
+    if (waitsBehindExistingDerivedPlay) resolveLinked();
     const preBody = () => {
+      if (mode === "hand_reaction" && !waitsBehindExistingDerivedPlay) resolveLinked();
       // Pythonは`_emit_card_played`で**カード自身の発揮待ちより前に**
       // 誘発を予約する。順序を合わせるため、ここで先に解く。
       resolveEventTriggers(state, cards, targets, "ally_summoned",
         { card_no: candidate.card_no, uid, source: mode, by_own_effect: Boolean(
           candidate.by_own_effect || ["burst_free_play", "burst_paid_followup", "hand_reaction",
             "face_up_draw_replacement", "trigger_counter", "shadow"].includes(mode)) });
-      // 手札カウント反応で召喚したときの「そうしたとき」節
-      // (`hand_reaction_effects`)。Pythonの予約batchと同じく、カード自身の
-      // 確定処理の中で解く。
-      if (mode === "hand_reaction") {
-        for (const effect of card.hand_reaction_effects || []) {
-          resolveEffect(state, cards, targets, effect, uid);
-        }
-      }
     };
     const playedArgs = () => [state, cards, targets, { ...card, card_no: candidate.card_no },
       uid, candidate.brave_mode, soulCoreUsedForSummonCost, watcherUnits,
@@ -9487,9 +9546,6 @@
       postBody();
     };
     const finishPlay = inFrame(resolvePlay);
-    const parentDepth = state.effectFrameDepth - Number(keepFundingFrame);
-    const waitsBehindExistingDerivedPlay = mode === "hand_reaction"
-      && parentDepth > 0 && state.deferredPlayCompletions.length > 0;
     // 効果の途中で出した召喚(`zone_summon`、v66)は、召喚時効果と完了を親の
     // 効果の窓が閉じた直後に解く(Pythonは`runtime.reserve`で同じ順になる)。
     // 専用の待ち行列にして、窓の直後に同期的に空にする——先読みの複製に
@@ -9498,6 +9554,7 @@
       // 親の窓が`mergeDerived`なら召喚時効果を派生の候補として取り込み、完了は
       // 窓の後(`post`)。取り込まれなければ`run`で従来どおりまとめて解く。
       state.deferredDerivedPlays.push({
+        seq: state.derivedSeq++,
         run: finishPlay,
         pre: inFrame(preBody),
         build: () => buildPlayedEffects(...playedArgs()),
@@ -9506,10 +9563,14 @@
     } else if (["burst_free_play", "burst_paid_followup"].includes(mode)
         || (mode === "face_up_draw_replacement" && parentDepth > 0)
         || waitsBehindExistingDerivedPlay) {
+      // `seq`は場へ出た順(Pythonの`runtime.reserve`の並び)。バーストの終わりで、効果で
+      // 出した別の札(`deferredDerivedPlays`)とこの順に解く。
+      finishPlay.seq = state.derivedSeq++;
       state.deferredPlayCompletions.push(finishPlay);
     } else if (Array.isArray(candidate.completion_sink)) {
       // 呼び出し元が残りの処理の後で解く(`reveal_play_remainder`。Pythonの
       // `deferred_batch`と同じ位置)。
+      finishPlay.seq = state.derivedSeq++;
       candidate.completion_sink.push(finishPlay);
     } else if (keepFundingFrame) {
       try { resolvePlay(); } finally { endEffectFrame(state); }
@@ -9620,9 +9681,22 @@
     if (!fromHand) pruneSidePlayable(state);
     state.mirage = cardNo;
     state.mirageFlashUsed.clear();
-    resolveMirageOnSet(state, cards, targets, cardNo);
-    record(state, cards, "mirage_set", { card_no: cardNo, source: "rule", cost: total });
+    finishMirageSet(state, cards, targets, cardNo, { source: "rule", cost: total });
     return true;
+  }
+
+  // セット時の節を解き、セットの記録を書いてから、節が積んだ反応を流す(Python
+  // `_finish_mirage_set`同一)。節は1つの効果なので枠で囲み、途中のカウント増加への反応は
+  // 節の終わりまで待たせる。外側で別の効果が解決中なら、その効果の終わりまで待つ。
+  // ⚠️ 2026-11-15(T136)まで流す口が無く、反応を次の別の効果まで持ち越していた
+  // (Pythonは逆に、カウント+1の直後に手札の反応が割り込んでいた)。
+  function finishMirageSet(state, cards, targets, cardNo, details) {
+    beginEffectFrame(state);
+    try {
+      resolveMirageOnSet(state, cards, targets, cardNo);
+      record(state, cards, "mirage_set", { card_no: cardNo, ...details });
+      if (state.effectFrameDepth === 1) flushDerivedPlayReactions(state, cards, targets);
+    } finally { endEffectFrame(state); }
   }
 
   // 『このミラージュのセット時』。セットの経路(ルール/効果)を問わない。
@@ -9652,8 +9726,7 @@
       state.seen.add(displaced);
       state.handGain += 1;
     }
-    resolveMirageOnSet(state, cards, targets, cardNo);
-    record(state, cards, "mirage_set", { card_no: cardNo, source, cost: 0, displaced });
+    finishMirageSet(state, cards, targets, cardNo, { source, cost: 0, displaced });
     return true;
   }
 
@@ -11478,9 +11551,14 @@
       const route = card?.trash_main_summon;
       if (!route || state.trashMainSummonNamesUsed.has(card.name)
           || !trashEffectAllowed(state, cards, cardNo, opponent)) continue;
-      const brave = braveMode(card, state, cards);
+      let brave = braveMode(card, state, cards);
       const cost = paymentForState(state, cards, card, "outside");
-      if (brave === "combine") cost.total = cost.pay;
+      // 合体先を残したまま払えないなら、スピリット状態で出す(メインの通常召喚・公開
+      // デッキトップの召喚と同じ退避。Python同一)。⚠️ 2026-11-15(T133)までここだけ退避が
+      // 無く、手札を除外してから`play`が「direct combination was selected without legal
+      // funding」で落ちていた。
+      if (brave === "combine" && combinePayment(state, cards, card, cost.pay, true)) cost.total = cost.pay;
+      else if (brave === "combine") brave = "spirit";
       if (!costAffordable(state, cards, cost.pay, cost.total, true)) continue;
       const discarded = state.hand.map((candidate, index) => ({ candidate, index,
         tier: accessTier(candidate, cards, targets), cost: cards[candidate]?.cost || 0 }))
@@ -13315,7 +13393,10 @@
                 state.combatOpponent || null)) continue;
               record(state, cards, "effect_start", { card_no: sourceNo, uid,
                 effect_kind: effect.kind, fired_timing: instance.fired_timing, effect_tag: effect.effect_tag || null, window });
-              const ok = resolveEffect(state, cards, targets, effect, uid);
+              // 「入れ替える」は入れ替えた札が0枚でも解決済み(Pythonは`EffectResult.success(changed)`、
+              // 召喚時の窓も同じ扱い)。⚠️ 2026-11-16(T115の続き)まで宣言の窓と場のフラッシュだけ
+              // 入れ替えの有無を成否に使い、0枚のときPythonと割れていた(BSC50-011のブロック時)。
+              const ok = resolveEffect(state, cards, targets, effect, uid) || effect.kind === "exchange";
               record(state, cards, "effect_complete", { card_no: sourceNo, uid,
                 effect_kind: effect.kind, fired_timing: instance.fired_timing, effect_tag: effect.effect_tag || null,
                 window, resolved: ok });
@@ -13413,7 +13494,12 @@
             combatCandidateLegal, {mergeDerived: true, watchers, stop: () => resolved.some(row => row.kind === "attack_step_end" && row.resolved)});
           // カウント反応など、この窓で増えたぶんの派生を先に流し、待機中の
           // 場離れは`endEffectFrame`で最後に確定する(Python runtime.end同一)。
-          flushCountReactions(state, cards, targets);
+          // 流すのは**この窓がいちばん外の枠のときだけ**。外側で別の効果が解決中なら、
+          // 予約はその効果の枠の終わりまで待つ(Pythonの`runtime.end`は深さ0へ戻るときだけ
+          // 流す)。⚠️ 2026-11-15(T135)まで無条件に流していたので、自分のフラッシュで
+          // カウントと手札が増えた後、相手の「手札が増えた後」のバーストがこちらの体を
+          // 破壊する窓の中で、待っていた手札のカウント反応が相手のバーストへ割り込んでいた。
+          if (state.effectFrameDepth === 1) flushCountReactions(state, cards, targets);
         } finally {
           endEffectFrame(state);
           state.combatOpponent = previousOpponent;
@@ -13434,7 +13520,7 @@
           try {
             resolveEventTriggers(state, cards, targets, "ally_attacked",
               { card_no: attacker.card_no, uid });
-            flushCountReactions(state, cards, targets);
+            if (state.effectFrameDepth === 1) flushCountReactions(state, cards, targets);
           } finally {
             state.combatOpponent = null;
             endEffectFrame(state);
