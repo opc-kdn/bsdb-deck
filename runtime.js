@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v292-v1";
-  const STAGE_VERSION = "v292";
+  const ENGINE_SLICE = "stage4-v293-v1";
+  const STAGE_VERSION = "v293";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v292-portable-v237";
+  const RUNTIME_VERSION = "stage4-v293-portable-v238";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -2767,6 +2767,22 @@
   function paymentAffordable(state, cards, targets, effect, sourceUid) {
     return !effect.payment
       || paymentPlan(state, cards, targets, effect, sourceUid) !== null;
+  }
+
+  /** `payment_bonus`を払った後の節(OMB)。Python `apply_payment_bonus`と同一。 */
+  function applyPaymentBonus(effect) {
+    const bonus = effect.payment_bonus;
+    const result = {...effect};
+    delete result.payment_bonus;
+    if (bonus.reveal) result.reveal = effect.reveal + bonus.reveal;
+    if (bonus.amount) {
+      result.amount = effect.amount + bonus.amount;
+      if (effect.condition_slots && effect.condition_slots.length) {
+        result.condition_slots = effect.condition_slots.map(
+          (slot) => ({...slot, limit: slot.limit + bonus.amount}));
+      }
+    }
+    return result;
   }
 
   /** 節の対価を実際に払う。Python `_pay_clause_payment` と同一。 */
@@ -5376,6 +5392,19 @@
     return cap === undefined ? Infinity : Math.max(0, cap - unit.cores);
   }
 
+  /** 召喚時の節に、ソウルコアを創界神へ置く`payment_bonus`があり、置き先がある(OMB)。
+   *  Python `_soul_bonus_on_summon`と同一。 */
+  function soulBonusOnSummon(state, cards, card) {
+    return (card.enablers || []).some((effect) => {
+      const bonus = effect.payment_bonus;
+      if (!bonus || bonus.payment.kind !== "soul_core_to_flag"
+        || ![undefined, null, "summon"].includes(effect.entry_trigger)) return false;
+      return state.field.some((unit) => !unit.waiting
+        && paymentUnitMatches(state, unit, cards, bonus.payment)
+        && creatorCoreRoom(state, cards, unit) > 0);
+    });
+  }
+
   /** 「自分の(赤1色の)創界神ネクサス1つにコア+N」。1個ずつ置ける最小uidへ。
    *  Python `_resolve_creator_core_gain`と同一。 */
   function resolveCreatorCoreGain(state, cards, effect) {
@@ -6090,6 +6119,15 @@
     // 印字の対価は、可否を見たあと**解決に入る直前**に1回だけ払う
     // （判定側で払うと、投機的な見積もりが資源を溶かす）。Python同一。
     if (!payClausePayment(state, cards, targets, effect, sourceUid)) return false;
+    // 対価で同じ効果の枚数を増やす文(OMB、BS74-002)。オープンより前に払う(公式Q)。
+    // 方針は節の対価と同じく「払えるなら払う」。山札が無ければ払わない。Python同一。
+    if (effect.payment_bonus && state.deck.length) {
+      const paid = {payment: effect.payment_bonus.payment, source_card_no: effect.source_card_no};
+      if (paymentPlan(state, cards, targets, paid, sourceUid) !== null
+          && payClausePayment(state, cards, targets, paid, sourceUid)) {
+        effect = applyPaymentBonus(effect);
+      }
+    }
     // 払った枚数だけ撃つ節（「オープンしたカード1枚につき」、v66）。0枚なら不発。
     if (effect.amount_per_paid && !state.lastPaymentCount) return false;
     // 倍率は`amount`へ掛けてから通常の解決へ渡す(Pythonも`resolve_enabler`の
@@ -9419,9 +9457,13 @@
         candidate.manifestation_creator_uid !== null
           && candidate.manifestation_creator_uid !== undefined ? "manifestation" : "use");
     }
+    // 召喚時の`payment_bonus`がソウルコアを創界神へ置く形なら、ソウルコアを召喚コストに
+    // 払う(OMB)。トラッシュからも置けるのでボーナスは失わず、通常コアが1個残る。Python同一。
     const preferSoulForPay = Boolean(card.soul_paid_on_play && state.reserveHasSoul
       && candidate.pay > 0
-      && [...state.hand, ...state.trashCards].some((cardNo) => cards[cardNo]?.is_brave));
+      && [...state.hand, ...state.trashCards].some((cardNo) => cards[cardNo]?.is_brave))
+      || Boolean(state.reserveHasSoul && candidate.pay > 0 && state.deck.length
+        && traceDetails.mode === "normal" && soulBonusOnSummon(state, cards, card));
     let soulCoreUsedForSummonCost = Boolean(preferSoulForPay
       || (state.reserveHasSoul
         && candidate.pay > state.reserve - Number(state.reserveHasSoul)));
