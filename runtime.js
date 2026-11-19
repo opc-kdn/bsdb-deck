@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v295-v1";
-  const STAGE_VERSION = "v295";
+  const ENGINE_SLICE = "stage4-v296-v1";
+  const STAGE_VERSION = "v296";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v295-portable-v239";
+  const RUNTIME_VERSION = "stage4-v296-portable-v240";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1607,9 +1607,68 @@
     let card = levelCostCardInfo(cards[unit.card_no], unit);
     const bonus = timedLevelCostBonus(state, cards, unit);
     if (bonus) card = levelCostCardInfo(card, {level_cost_bonus:bonus});
-    const level = levelFromThresholds(levelCores(unit), card?.level_thresholds);
-    return card?.count_level_thresholds
-      ? Math.max(level,levelFromThresholds(state.count,card.count_level_thresholds)) : level;
+    const raw = levelFromThresholds(levelCores(unit), card?.level_thresholds);
+    const level = card?.count_level_thresholds
+      ? Math.max(raw,levelFromThresholds(state.count,card.count_level_thresholds)) : raw;
+    // Lv扱い(T17-LV)はコアでLv1以上の体だけ(Q131・Q24934)。Python `card_level`の`treated_level`と同一。
+    if (level >= 1) {
+      const treated = levelTreatment(state, cards, unit);
+      if (treated !== null) return treated;
+    }
+    return level;
+  }
+
+  /** 札が持つ最高Lv(Q130・Q22754)。Python `max_printed_level`と同一。 */
+  function maxPrintedLevel(card) {
+    const levels = ['level_thresholds','count_level_thresholds'].flatMap(table =>
+      Object.entries(card?.[table] || {}).filter(([, need]) => need !== null && need !== undefined)
+        .map(([level]) => Number(level)));
+    return levels.length ? Math.max(...levels) : 0;
+  }
+
+  const LEVEL_TREATMENT_DECKS = new WeakMap();
+  const LEVEL_TREATING = new WeakSet();
+  /** この体を「最高Lvとして扱う」効果が今掛かっていれば、その最高Lv(T17-LV)。
+   *  発揮元のLvを読む間は扱いを掛けない(循環止め)。Python `_level_treatment`と同一。 */
+  function levelTreatment(state, cards, unit) {
+    if (unit.brave_mode === 'combine' || LEVEL_TREATING.has(state)) return null;
+    let present = LEVEL_TREATMENT_DECKS.get(cards);
+    if (present === undefined) {
+      present = Object.values(cards).some(card => card?.level_treatments?.length);
+      LEVEL_TREATMENT_DECKS.set(cards, present);
+    }
+    if (!present || !state.field.includes(unit)) return null;
+    LEVEL_TREATING.add(state);
+    try {
+      const card = fieldUnitInfo(state, cards, unit);
+      for (const source of [...state.field].sort((a, b) => a.uid - b.uid)) {
+        if (!cards[source.card_no]?.level_treatments?.length) continue;
+        for (const entry of unitInfo(state, cards, source)?.level_treatments || []) {
+          if (entry.window === 'own_attack_step' && !state.ownAttackActive) continue;
+          if (entry.window === 'both_attack_steps') {
+            const otherBoard = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
+            if (!(state.ownAttackActive || Boolean(otherBoard?.in_attack_step?.()))) continue;
+          }
+          if (entry.window === 'attacking'
+            && !(state.battleActive && state.attackingUid === unit.uid)) continue;
+          if (entry.levels.length && (effectsSuppressed(state, source)
+            || !entry.levels.includes(levelFor(source, cards, state)))) continue;
+          let matched;
+          if (entry.recipient === 'self') matched = source === unit;
+          else if (entry.recipient === 'host') {
+            matched = source.brave_mode === 'combine' && combinedWith(source, unit.uid)
+              && (card.card_type || '').includes('スピリット');
+          } else {
+            matched = grantRecipientMatches(entry.protect, source === unit, card,
+              unit.brave_mode === 'spirit', combinedBraves(state, unit.uid).length > 0);
+          }
+          if (matched) return maxPrintedLevel(card);
+        }
+      }
+      return null;
+    } finally {
+      LEVEL_TREATING.delete(state);
+    }
   }
 
   function printedBp(unit, cards, state) {
