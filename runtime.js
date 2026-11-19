@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v296-v1";
-  const STAGE_VERSION = "v296";
+  const ENGINE_SLICE = "stage4-v297-v1";
+  const STAGE_VERSION = "v297";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v296-portable-v240";
+  const RUNTIME_VERSION = "stage4-v297-portable-v241";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -1627,47 +1627,110 @@
   }
 
   const LEVEL_TREATMENT_DECKS = new WeakMap();
+  const LEVEL_IMPOSITION_DECKS = new WeakMap();
   const LEVEL_TREATING = new WeakSet();
-  /** この体を「最高Lvとして扱う」効果が今掛かっていれば、その最高Lv(T17-LV)。
-   *  発揮元のLvを読む間は扱いを掛けない(循環止め)。Python `_level_treatment`と同一。 */
+  function deckHas(cache, cards, key) {
+    let present = cache.get(cards);
+    if (present === undefined) {
+      present = Object.values(cards).some(card => card?.[key]?.length);
+      cache.set(cards, present);
+    }
+    return present;
+  }
+  /** 札が持つ最低Lv(Q19339・Q27035)。Python `min_printed_level`と同一。 */
+  function minPrintedLevel(card) {
+    const levels = ['level_thresholds','count_level_thresholds'].flatMap(table =>
+      Object.entries(card?.[table] || {}).filter(([, need]) => need !== null && need !== undefined)
+        .map(([level]) => Number(level)));
+    return levels.length ? Math.min(...levels) : 0;
+  }
+  function treatedValue(value, card) {
+    return value === 'max' ? maxPrintedLevel(card) : value === 'min' ? minPrintedLevel(card) : value;
+  }
+  /** この体に今掛かっているLv扱いのLv(T17-LV)。自分の最高Lvの継続・相手の盤面が掛ける継続の
+   *  Lv1・受け手へ登録された期間つきの扱い(後の行が勝つ)。継続どうしはターンプレイヤーが自分に
+   *  有利な方(Q119の同時)。発揮元のLvを読む間は扱いを掛けない(循環止め)。Python `_level_treatment`と同一。 */
   function levelTreatment(state, cards, unit) {
     if (unit.brave_mode === 'combine' || LEVEL_TREATING.has(state)) return null;
-    let present = LEVEL_TREATMENT_DECKS.get(cards);
-    if (present === undefined) {
-      present = Object.values(cards).some(card => card?.level_treatments?.length);
-      LEVEL_TREATMENT_DECKS.set(cards, present);
-    }
-    if (!present || !state.field.includes(unit)) return null;
+    const received = unit.level_treatments_received;
+    const otherBoard = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
+    const imposing = Boolean(otherBoard?.imposes_levels);
+    const own = deckHas(LEVEL_TREATMENT_DECKS, cards, 'level_treatments');
+    if (!received?.length && !own && !imposing) return null;
     LEVEL_TREATING.add(state);
     try {
       const card = fieldUnitInfo(state, cards, unit);
+      if (received?.length) return treatedValue(received[received.length - 1].treat_as, card);
+      if (!state.field.includes(unit)) return null;
+      const ownLevel = own ? ownLevelTreatment(state, cards, unit, card) : null;
+      const imposed = imposing ? otherBoard.imposed_level({card_type: card.card_type || '',
+        spirit_state_brave: unit.brave_mode === 'spirit',
+        battling: Boolean(state.battleActive && state.battlingUid === unit.uid)}) : null;
+      if (imposed !== null && imposed !== undefined && (ownLevel === null || !state.ownTurnActive)) {
+        return treatedValue(imposed, card);
+      }
+      return ownLevel;
+    } finally {
+      LEVEL_TREATING.delete(state);
+    }
+  }
+  function ownLevelTreatment(state, cards, unit, card) {
+    for (const source of [...state.field].sort((a, b) => a.uid - b.uid)) {
+      if (!cards[source.card_no]?.level_treatments?.length) continue;
+      for (const entry of unitInfo(state, cards, source)?.level_treatments || []) {
+        if (entry.window === 'own_attack_step' && !state.ownAttackActive) continue;
+        if (entry.window === 'both_attack_steps') {
+          const otherBoard = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
+          if (!(state.ownAttackActive || Boolean(otherBoard?.in_attack_step?.()))) continue;
+        }
+        if (entry.window === 'attacking'
+          && !(state.battleActive && state.attackingUid === unit.uid)) continue;
+        if (entry.levels.length && (effectsSuppressed(state, source)
+          || !entry.levels.includes(levelFor(source, cards, state)))) continue;
+        let matched;
+        if (entry.recipient === 'self') matched = source === unit;
+        else if (entry.recipient === 'host') {
+          matched = source.brave_mode === 'combine' && combinedWith(source, unit.uid)
+            && (card.card_type || '').includes('スピリット');
+        } else {
+          matched = grantRecipientMatches(entry.protect, source === unit, card,
+            unit.brave_mode === 'spirit', combinedBraves(state, unit.uid).length > 0);
+        }
+        if (matched) return maxPrintedLevel(card);
+      }
+    }
+    return null;
+  }
+  /** 相手の体`target`へ、自分の場が今掛けている継続のLv扱い(T17-LVの第2段)。無ければnull。
+   *  答える間は自分の側のLv扱いを掛けない。Python `_imposed_level`と同一。 */
+  function imposedLevel(state, cards, target) {
+    if (!deckHas(LEVEL_IMPOSITION_DECKS, cards, 'level_impositions') || !state.battleActive
+      || !((target.card_type || '').includes('スピリット') || target.spirit_state_brave)) return null;
+    const saved = LEVEL_TREATING.has(state);
+    LEVEL_TREATING.add(state);
+    try {
       for (const source of [...state.field].sort((a, b) => a.uid - b.uid)) {
-        if (!cards[source.card_no]?.level_treatments?.length) continue;
-        for (const entry of unitInfo(state, cards, source)?.level_treatments || []) {
-          if (entry.window === 'own_attack_step' && !state.ownAttackActive) continue;
-          if (entry.window === 'both_attack_steps') {
-            const otherBoard = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
-            if (!(state.ownAttackActive || Boolean(otherBoard?.in_attack_step?.()))) continue;
-          }
-          if (entry.window === 'attacking'
-            && !(state.battleActive && state.attackingUid === unit.uid)) continue;
+        if (!cards[source.card_no]?.level_impositions?.length) continue;
+        for (const entry of unitInfo(state, cards, source)?.level_impositions || []) {
           if (entry.levels.length && (effectsSuppressed(state, source)
             || !entry.levels.includes(levelFor(source, cards, state)))) continue;
-          let matched;
-          if (entry.recipient === 'self') matched = source === unit;
-          else if (entry.recipient === 'host') {
-            matched = source.brave_mode === 'combine' && combinedWith(source, unit.uid)
-              && (card.card_type || '').includes('スピリット');
+          if (entry.window === 'own_attack_step') {
+            const attacker = state.field.find(u => u.uid === state.attackingUid);
+            if (!(state.ownAttackActive && target.battling && attacker && !attacker.waiting)) continue;
+            const keyword = entry.attacker_keyword;
+            if (keyword && !(unitInfo(state, cards, attacker)?.keywords || []).includes(keyword)) continue;
           } else {
-            matched = grantRecipientMatches(entry.protect, source === unit, card,
-              unit.brave_mode === 'spirit', combinedBraves(state, unit.uid).length > 0);
+            const holder = state.field.find(u => u.uid === state.battlingUid);
+            if (!holder) continue;
+            if (!grantRecipientMatches(entry.holders, false, unitInfo(state, cards, holder) || {},
+              holder.brave_mode === 'spirit', combinedBraves(state, holder.uid).length > 0)) continue;
           }
-          if (matched) return maxPrintedLevel(card);
+          return entry.treat_as;
         }
       }
       return null;
     } finally {
-      LEVEL_TREATING.delete(state);
+      if (!saved) LEVEL_TREATING.delete(state);
     }
   }
 
@@ -12234,6 +12297,9 @@
       resolve_effect_reaction: reaction => resolveEventTriggerChoice(state,cards,targets,{
         ...reaction,foreign:false,sourceUid:reaction.source_uid,sourceCardNo:reaction.source_card_no}),
       in_attack_step: () => state.ownAttackActive,
+      // 相手の体へ掛ける継続のLv扱い(T17-LVの第2段)。Python `imposes_levels`/`imposed_level`と同一。
+      imposes_levels: deckHas(LEVEL_IMPOSITION_DECKS, cards, 'level_impositions'),
+      imposed_level: (target) => imposedLevel(state, cards, target),
       main_brave_options: () => mainBraveOptions(state,cards),
       play_main_brave: action => playMainBrave(state,cards,targets,action),
       effect_destroyed: effect ? subject => resolveEventTriggers(state, cards, targets,
