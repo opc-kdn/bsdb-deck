@@ -665,7 +665,26 @@ body[data-workspace="builder"] #deck-panel .pseudo-card{min-height:5.2rem}
       + "以下は表示中の棋譜の再現情報です。同じカードデータベース・実行版で再現してください。\n"
       + "```json\n" + JSON.stringify(report, null, 2) + "\n```";
   }
-  globalThis.BSDBTraceReport = Object.freeze({ text });
+  // 棋譜を出せずに止まったときの報告。表示できる棋譜が無いので`text`は使えず、
+  // 失敗した操作・その入力・エラー文と、分かった範囲の指紋だけを持つ
+  // （2026-11-19、Python/Worker不一致で止まると報告を取れなかった）。
+  function failureText(failure, surface) {
+    if (!failure?.request) throw new Error("報告できる失敗がありません。");
+    const report = {
+      format: "BattleSpiritsDB.failure-report", format_version: 1,
+      surface, action: failure.action, mode: failure.mode ?? null,
+      error: failure.error,
+      versions: failure.versions ?? {},
+      // request is constructed from allowlisted simulation inputs by each UI.
+      replay: failure.request,
+      comparison: failure.comparison ?? {},
+    };
+    return "BattleSpiritsDB 実行できなかったときの報告\n"
+      + "そのとき行った操作：\n"
+      + "以下は止まった実行の再現情報です。同じカードデータベース・実行版で再現してください。\n"
+      + "```json\n" + JSON.stringify(report, null, 2) + "\n```";
+  }
+  globalThis.BSDBTraceReport = Object.freeze({ text, failureText });
 })();
 
 // Shared by the PWA and the generated portable board.

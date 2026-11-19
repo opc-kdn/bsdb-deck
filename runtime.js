@@ -4325,7 +4325,12 @@
     if (!card.is_brave) return [];
     if(side===null && (card.combine_conditions || []).some(row=>row.combine_sides?.length)) {
       const hosts=['left','right'].flatMap(s=>braveCombineHosts(card,state,cards,conditionOnlyHost,s));
-      return [...new Map(hosts.map(host=>[host.uid,host])).values()].sort((a,b)=>a.uid-b.uid);
+      // 片側の候補と同じく疲労していない合体先から(Python `_combine_payment`)。uid順だけに
+      // 並べ直すと、異魔神(BS45-082)が疲労したスピリットへ合体してPythonと割れた(2026-11-19)。
+      return [...new Map(hosts.map(host=>[host.uid,host])).values()].sort((left, right) =>
+        Number(Boolean(left.heavy_exhausted)) - Number(Boolean(right.heavy_exhausted))
+        || Number(Boolean(left.exhausted)) - Number(Boolean(right.exhausted))
+        || left.uid - right.uid);
     }
     const conditions = (card.combine_conditions || []).filter(row=>side===null || (row.combine_sides || []).includes(side));
     return [...state.field].filter((unit) => {
@@ -7711,7 +7716,6 @@
   }
 
   function flushCountReactions(state, cards, targets) {
-    if (state.countReactionDeferral > 0) return;
     // 「破棄されたとき」(`discard_summons`)。Pythonでは同じ`runtime.reserve`の列に
     // 乗る。元効果の中では破棄がカウント増より先に起きる(「破棄したとき、
     // カウント+1」)ので、こちらを先に流す。
@@ -8083,8 +8087,13 @@
       brave_mode: selected.mode, printed_cost_waived: true });
     return play(state, cards, targets, { card_no: selected.cardNo,
       pay: 0, total: selected.total, maintenance: entryMaintenance(state, cards, cards[selected.cardNo]),
-      brave_mode: selected.mode, allow_sacrifice: true,
-      mode: "soul_paid_free_summon" });
+      brave_mode: selected.mode, allow_sacrifice: true, derived_play: true });
+    // modeは渡さない(=normal)。Pythonは`play_card`を既定のtrace_modeで呼ぶので、
+    // play_presentedは`mode: "normal"`と`creator_uid`・`brave_mode`を持つ。独自の
+    // modeを付けるとこの2鍵が落ちる。また効果の途中で出た札の召喚時効果(神託など)は
+    // 親の効果の後へ回す(`derived_play`、`effectSummon`と同じ)。どちらも抜けていて、
+    // ワノ式(SJ15-12)入りの試合が戦闘モードでPython/Worker不一致になった
+    // (2026-11-19、オメテオトル対ワノ式seed 10)。
   }
 
   function firedEffectTiming(timing, entryTrigger = null, entryEvent = "summon") {
@@ -9288,12 +9297,13 @@
           condition_slots: (effect.condition_slots || []).map((slot) => ({
             ...slot, limit: slot.limit === null ? null : (slot.limit ?? 0) + 1,
           })) } : effect) } : card;
-    // Pythonの予約batchは、煌臨時効果の途中で増えたカウント反応をbatch本体へ
-    // 戻ってから解決する。ファラの「その後」のバグ破壊も同じbatch内なので、
-    // ここで生じた反応だけは破壊（＝コア返却）の後まで待たせる。F契約煌臨
-    // そのものによる直前のカウント反応は上で既に解決済み。
+    // 煌臨時効果の途中で増えたカウントの反応は、増やした効果を解き終えた直後に解く
+    // （Python `_resolve_pending_effect_window`の`flush_since`、v292）。バグが出たときの
+    // ファラの誘発は「その後」の破壊を持たない（《F契約煌臨》していたときだけ）ので、
+    // 破壊（＝コア返却）の後まで待たせない。2026-11-19まではv291までのPython（batch本体へ
+    // 戻ってから解く）に合わせて待たせていて、オメテオトル対光契約でWorkerだけが
+    // 戻ったコアでBS52-XX02を召喚していた。F契約煌臨そのものによる反応は上で解決済み。
     const finishKourin=()=>{
-    if (faraSources) state.countReactionDeferral += 1;
     beginEffectFrame(state);
     resolveEventTriggers(state, cards, targets, "ally_summoned",
       { card_no: candidate.card_no, uid: host.uid, source: "kourin" });
@@ -9302,10 +9312,6 @@
       "kourin", state.summonGroup || null);
     for (let index = 0; index < faraSources; index += 1) {
       if (!consumePlatinumBug(state, cards)) break;
-    }
-    if (faraSources) {
-      state.countReactionDeferral -= 1;
-      flushCountReactions(state, cards, targets);
     }
     record(state, cards, "play_complete", { card_no: candidate.card_no, uid: host.uid,
       ...traceDetails });
@@ -13720,7 +13726,6 @@
       // 開発用の候補・順位診断。明示された配列へだけ書き、通常のstate/棋譜には
       // 出さない。Python `choice_debug` と同じ構造を返す。
       choiceDebug: Array.isArray(options.choice_debug) ? options.choice_debug : null,
-      countReactionDeferral: 0,
       bugCoreSupplyUsed: new Set(),
       // 同時に召喚した扱いの組(`discardHandCards`等が立てる、Python `current_summon_group`)。
       summonGroup: null,
