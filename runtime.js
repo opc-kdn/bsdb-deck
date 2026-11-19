@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v297-v1";
-  const STAGE_VERSION = "v297";
+  const ENGINE_SLICE = "stage4-v298-v1";
+  const STAGE_VERSION = "v298";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v297-portable-v241";
+  const RUNTIME_VERSION = "stage4-v298-portable-v242";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3455,6 +3455,84 @@
       }
     });
     return options;
+  }
+
+  /** T144-S: 自分の[ソウルコア]を名指しの創界神ネクサスへ置く対価。Python同一。 */
+  function soulFlashSummonPayment(route) {
+    return { kind: "soul_core_to_flag", amount: 1,
+      target_spec: `創界神ネクサスの「${route.creator_name}」` };
+  }
+
+  /** アタックステップのフラッシュで、ソウルコアを創界神へ置いて手札/セット中から自分を
+   *  召喚できる札(T144-S)。Python `_combat_soul_flash_summon_options`と同一。 */
+  function soulFlashSummonOptions(state, cards, targets, side) {
+    const windows = { own: ["own_attack", "both_attack"],
+      opponent: ["opponent_attack", "both_attack"] }[side] || [];
+    const sources = state.hand.map((cardNo, index) => [index, cardNo, "hand"])
+      .filter(([index, cardNo]) => state.hand.indexOf(cardNo) === index);
+    if (state.mirage) sources.push([-1, state.mirage, "mirage"]);
+    const options = [];
+    for (const [index, cardNo, zone] of sources) {
+      const card = cards[cardNo];
+      const route = (card?.soul_flash_summons || []).find((row) =>
+        row.source_zone === zone && windows.includes(row.window));
+      if (!route || card.is_brave
+          || (route.count_min !== null && route.count_min !== undefined && state.count < route.count_min)
+          || (route.once_per_turn_same_name
+            && state.blockTurnUsed.has(`soul_flash_summon\u0000${card.name}`))
+          || !summonConditionsMet(card, state, cards)) continue;
+      const plan = paymentPlan(state, cards, targets, { payment: soulFlashSummonPayment(route) }, null);
+      if (plan === null) continue;
+      const holder = plan.soulFrom;
+      if (holder && holder.cores - 1 < unitFloor(state, cards, holder)) continue;
+      const available = state.reserve - Number(plan.soulSource === "reserve");
+      if (!costAffordable(state, cards, 0, entryMaintenance(state, cards, card), false, available)) continue;
+      options.push({ card_no: cardNo, hand_index: index, source_zone: zone });
+    }
+    return options;
+  }
+
+  /** T144-S: 対価を払い、コスト0で召喚する。Python `_combat_play_soul_flash_summon`と同一。 */
+  function playSoulFlashSummon(state, cards, targets, cardNo, sourceZone, side, opponent = null) {
+    const option = soulFlashSummonOptions(state, cards, targets, side).find((row) =>
+      row.card_no === cardNo && row.source_zone === sourceZone);
+    if (!option) return null;
+    const card = cards[cardNo];
+    const route = card.soul_flash_summons.find((row) => row.source_zone === sourceZone);
+    const previous = [state.combatOpponent || null, MAIN_STEP_OPPONENTS.get(state)];
+    state.combatOpponent = opponent;
+    if (opponent) MAIN_STEP_OPPONENTS.set(state, opponent); else MAIN_STEP_OPPONENTS.delete(state);
+    let uid;
+    try {
+      if (route.once_per_turn_same_name) state.blockTurnUsed.add(`soul_flash_summon\u0000${card.name}`);
+      // 対価の誘発(【契約域】のカウント+2)を先に解いてから召喚する(Q29274の同型、
+      // `creator_core_summon`と同じ順)。Python同一。
+      beginEffectFrame(state);
+      try {
+        if (!payClausePayment(state, cards, targets,
+          { payment: soulFlashSummonPayment(route), source_card_no: cardNo }, null)) {
+          throw new Error("soul flash summon was offered without its payment");
+        }
+      } finally {
+        endEffectFrame(state);
+      }
+      if (!state.effectFrameDepth) flushCountReactions(state, cards, targets);
+      if (sourceZone === "mirage") {
+        // セット中のミラージュを召喚する。枠は空になり、セット中の効果の回数も消える。
+        state.mirage = null;
+        state.mirageFlashUsed.clear();
+      }
+      const before = state.uid;
+      const maintenance = entryMaintenance(state, cards, card);
+      play(state, cards, targets, { card_no: cardNo, pay: 0, total: maintenance, maintenance,
+        mode: "soul_flash_summon", allow_sacrifice: false, brave_mode: null,
+        ...(sourceZone === "mirage" ? { source_zone_name: "mirage" } : {}) });
+      uid = state.field.find((unit) => unit.uid > before && unit.card_no === cardNo)?.uid ?? null;
+    } finally {
+      state.combatOpponent = previous[0];
+      if (previous[1]) MAIN_STEP_OPPONENTS.set(state, previous[1]); else MAIN_STEP_OPPONENTS.delete(state);
+    }
+    return { card_no: cardNo, uid, source_zone: sourceZone, payment: "soul_core_to_creator" };
   }
 
   function flashManifestationOptions(state, cards, side) {
@@ -9553,7 +9631,7 @@
     const traceDetails = { mode, pay: candidate.pay, total: candidate.total, ...manifestationPayment };
     // トラッシュからの召喚も通常の召喚と同じ支払いなので、同じ鍵を持つ(2026-10-11、
     // Python `play_card`の`trace_mode`と同一。それまで`brave_mode`を書いていなかった)。
-    if (["normal", "manifestation", "trash_main_summon", "creator_core_summon", "trigger_counter", "deck_discard_protection", "shadow"].includes(mode)) {
+    if (["normal", "manifestation", "trash_main_summon", "creator_core_summon", "trigger_counter", "deck_discard_protection", "shadow", "soul_flash_summon"].includes(mode)) {
       traceDetails.creator_uid = candidate.manifestation_creator_uid ?? null;
       traceDetails.brave_mode = candidate.brave_mode;
     }
@@ -9601,8 +9679,9 @@
     } else if (candidate.source_zone_name) {
       // 効果が名指ししたゾーンから出す(v66、`zone_summon`。Python `play_card`の
       // `source_zone`)。手元の許可層は通さない。
+      // `mirage`はセット中のミラージュの召喚(T144-S)。枠は呼び出し側が空けている。
       const zone = { hand: state.hand, side: state.sideCards, deck: state.deck,
-        trash: state.trashCards }[candidate.source_zone_name];
+        trash: state.trashCards, mirage: [candidate.card_no] }[candidate.source_zone_name];
       if (candidate.source_zone_name === "deck") takeTopCard(state);
       else zone.splice(zone.indexOf(candidate.card_no), 1);
       pruneSidePlayable(state);
@@ -13248,6 +13327,10 @@
       // 手順4のフラッシュタイミングで手札から煌臨する口(2026-10-01、Python同一)。
       flash_kourin_options: (side) => flashKourinOptions(state, cards, side),
       flash_manifestation_options: side => flashManifestationOptions(state,cards,side),
+      // T144-S: ソウルコアを創界神へ置いて手札/セット中から召喚する口(Python同一)。
+      soul_flash_summon_options: side => soulFlashSummonOptions(state, cards, targets, side),
+      play_soul_flash_summon: (cardNo, sourceZone, side, opponent = null) =>
+        playSoulFlashSummon(state, cards, targets, cardNo, sourceZone, side, opponent),
       play_flash_manifestation: (cardNo,creatorUid,side,opponent=null,soulPayment=null,sourceZone=null) => {
         const option=flashManifestationOptions(state,cards,side).find(row =>
           row.card_no===cardNo && row.creators.includes(creatorUid)
@@ -14555,6 +14638,7 @@
     "attack_declared", "block_declared", "life_damaged", "battle_resolved",
     "destroyed_by_battle", "burst_activated", "burst_declined", "burst_locked",
     "flash_defense_played", "flash_kourin_played", "flash_manifestation_played",
+    "flash_self_summon_played",
     "flash_removal_played", "trash_flash_played",
     "field_flash_resolved",
     "flash_battle_grant_played", "bp_destroyed_effects_resolved", "opponent_destroyed_effects_resolved",
@@ -14591,6 +14675,8 @@
     // 公式手順4のフラッシュタイミングで手札から煌臨した記録(2026-10-01)。
     "flash_kourin_played",
     "flash_manifestation_played",
+    // ソウルコアを創界神へ置いて手札/セット中から召喚した記録(T144-S、Python同一)。
+    "flash_self_summon_played",
     // 公式手順2・4のフラッシュタイミングで手札の除去を撃った記録(2026-10-01)。
     "flash_removal_played",
     // 手順4の「このバトルの間、1体に」の付与と、BP比べで相手だけを破壊したときの窓
@@ -15712,6 +15798,30 @@
         boards[owner===actor ? defenderId : actor]);
       if (result) {
         emit("flash_manifestation_played",owner,{...result,side,step});
+        played.push(result);
+        if (owner === actor && order && !order.includes(result.uid)) order.push(result.uid);
+      }
+    }
+    played.push(...flashSelfSummon(emit, actor, defenderId, boards, step, threatened, order));
+    return played;
+  }
+
+  /** 顕現と同じ窓で、ソウルコアを創界神へ置いて手札/セット中から自分を召喚する(T144-S)。
+   *  Python `_flash_self_summon`と同一。 */
+  function flashSelfSummon(emit, actor, defenderId, boards, step, threatened, order = null) {
+    const played = [];
+    for (const [owner, side] of [[actor, "own"], [defenderId, "opponent"]]) {
+      if (owner === defenderId && !threatened()) continue;
+      const board = boards[owner];
+      const options = board.soul_flash_summon_options?.(side) || [];
+      if (!options.length) continue;
+      options.sort((a, b) => a.card_no < b.card_no ? -1 : a.card_no > b.card_no ? 1
+        : a.hand_index - b.hand_index);
+      const option = options[0];
+      const result = board.play_soul_flash_summon(option.card_no, option.source_zone, side,
+        boards[owner === actor ? defenderId : actor]);
+      if (result) {
+        emit("flash_self_summon_played", owner, {...result, side, step});
         played.push(result);
         if (owner === actor && order && !order.includes(result.uid)) order.push(result.uid);
       }
