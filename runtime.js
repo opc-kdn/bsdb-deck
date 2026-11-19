@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v294-v1";
-  const STAGE_VERSION = "v294";
+  const ENGINE_SLICE = "stage4-v295-v1";
+  const STAGE_VERSION = "v295";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v294-portable-v238";
+  const RUNTIME_VERSION = "stage4-v295-portable-v239";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -2762,6 +2762,38 @@
     if (kind === "count_gain_cost") return { count: Number(payment.amount || 1) };
     // ローダーが閉じた語彙しか載せないので、ここへは来ない。来たら払わない。
     return null;
+  }
+
+  /** 対価を払うと別の体の維持コアが割れてその体が場を離れるか(T144)。今は`soul_core_to_flag`
+   *  だけ。Python `_payment_sacrifices_unit`と同一。 */
+  function paymentSacrificesUnit(state, cards, targets, effect, sourceUid) {
+    if (effect.payment?.kind !== "soul_core_to_flag") return false;
+    const holder = paymentPlan(state, cards, targets, effect, sourceUid)?.soulFrom || null;
+    return Boolean(holder) && holder.cores - 1 < unitFloor(state, cards, holder);
+  }
+
+  // 体を失う対価の試行の中か(T144)。中では比べ直さない。
+  let SACRIFICE_TRIAL_DEPTH = 0;
+
+  /** 体を失う対価を払うか。払う枝と払わない枝を実際に解いて比べる(`chooseAlternative`、
+   *  解いた直後の`alternativeKey`)。払う枝はその節から派生した誘発まで流してから比べる。
+   *  同点・試せないときは払う。Python `_sacrifice_payment_wanted`と同一。 */
+  function sacrificePaymentWanted(state, cards, targets, effect, sourceUid) {
+    if (SACRIFICE_TRIAL_DEPTH || !paymentSacrificesUnit(state, cards, targets, effect, sourceUid)) return true;
+    const attempt = (branch) => {
+      if (branch === "skip") return true;
+      SACRIFICE_TRIAL_DEPTH += 1;
+      try {
+        const mark = state.derivedSeq;
+        resolveEffect(state, cards, targets, effect, sourceUid);
+        flushCountReactionsSince(state, cards, targets, mark);
+        // 比べるのは対価を払った後の盤面。不発でも払った結果は残るので候補から外さない(Python同一)。
+        return true;
+      } finally {
+        SACRIFICE_TRIAL_DEPTH -= 1;
+      }
+    };
+    return chooseAlternative(state, ["pay", "skip"], attempt, state.combatOpponent || null) !== "skip";
   }
 
   function paymentAffordable(state, cards, targets, effect, sourceUid) {
@@ -6116,6 +6148,8 @@
         source_colors: source ? [...unitInfo(state, cards, source).colors].sort() : []});
       return true;
     }
+    // 体を失う対価は、払う枝と払わない枝を解いて比べてから決める(T144、利用者11-19、Python同一)。
+    if (!sacrificePaymentWanted(state, cards, targets, effect, sourceUid)) return false;
     // 印字の対価は、可否を見たあと**解決に入る直前**に1回だけ払う
     // （判定側で払うと、投機的な見積もりが資源を溶かす）。Python同一。
     if (!payClausePayment(state, cards, targets, effect, sourceUid)) return false;
