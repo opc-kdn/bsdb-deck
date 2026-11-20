@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v298-v1";
-  const STAGE_VERSION = "v298";
+  const ENGINE_SLICE = "stage4-v299-v1";
+  const STAGE_VERSION = "v299";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v298-portable-v242";
+  const RUNTIME_VERSION = "stage4-v299-portable-v243";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3465,8 +3465,77 @@
 
   /** アタックステップのフラッシュで、ソウルコアを創界神へ置いて手札/セット中から自分を
    *  召喚できる札(T144-S)。Python `_combat_soul_flash_summon_options`と同一。 */
+  /** 〔ターンに1回：同名〕の鍵。《超顕現》は《超顕現》どうしで数える(Q31566)。Python同一。 */
+  function soulFlashOnceKey(route, card) {
+    return `${route.manifestation ? "super_manifestation" : "soul_flash_summon"}\u0000${card.name}`;
+  }
+
+  /** T144-T: 条件で名指しされた自分の創界神ネクサス(待機でない、uid昇順)。
+   *  Python `_soul_top_creators`と同一。 */
+  function soulTopCreators(state, cards, route) {
+    const wanted = normalizeCardName(route.creator_name);
+    return [...state.field].sort((a, b) => a.uid - b.uid).filter((unit) =>
+      !unit.waiting && isCreatorNexus(cards, unit)
+      && normalizeCardName(unitInfo(state, cards, unit)?.name || "").includes(wanted)
+      && (route.creator_cores_min == null || unit.cores >= route.creator_cores_min));
+  }
+
+  /** T144-T: 体の上に置くソウルコアの出どころ`[origin, holder]`。Python `_soul_top_source`と同一。 */
+  function soulTopSource(state, cards, route) {
+    if (route.soul_from === "creator") {
+      const holder = soulTopCreators(state, cards, route).find((unit) => unit.soul_core);
+      return holder ? ["creator", holder] : [null, null];
+    }
+    if (state.trashHasSoul) return ["trash", null];
+    if (state.reserveHasSoul) return ["reserve", null];
+    const holder = [...state.field].sort((a, b) => a.uid - b.uid).find((unit) =>
+      unit.soul_core && !unit.waiting && !isCreatorNexus(cards, unit)
+      && unit.cores - 1 >= unitFloor(state, cards, unit));
+    return holder ? ["field", holder] : [null, null];
+  }
+
+  /** Python `_soul_top_payable`と同一。リザーブから要るのは維持コア-1。 */
+  function soulTopPayable(state, cards, card, route) {
+    const maintenance = entryMaintenance(state, cards, card);
+    if (maintenance < 1 || !soulTopCreators(state, cards, route).length) return false;
+    if (soulTopSource(state, cards, route)[0] === null) return false;
+    return costAffordable(state, cards, 0, maintenance - 1, false,
+      state.reserve - Number(state.reserveHasSoul));
+  }
+
+  /** T144-T: ソウルコアを置き場から外し、《超顕現》なら創界神にコア+1する。
+   *  Python `_pay_soul_top`と同一。 */
+  function paySoulTop(state, cards, targets, cardNo, route) {
+    const [origin, holder] = soulTopSource(state, cards, route);
+    if (origin === "trash") {
+      state.spent -= 1;
+      state.trashHasSoul = false;
+    } else if (origin === "reserve") {
+      state.reserve -= 1;
+      state.reserveHasSoul = false;
+    } else if (origin === "field" || origin === "creator") {
+      holder.cores -= 1;
+      holder.soul_core = false;
+    } else {
+      throw new Error("soul-on-top summon was offered without a Soul Core");
+    }
+    if (origin === "creator") notifyCreatorCoreDecreased(state, cards, targets, holder, 1);
+    if (route.creator_core_gain) {
+      const target = soulTopCreators(state, cards, route).find((unit) =>
+        creatorCoreRoom(state, cards, unit) > 0);
+      if (target) {
+        target.cores += route.creator_core_gain;
+        recordCoreMove(state, cards, { amount: route.creator_core_gain, source: "void",
+          destination: "field", reason: "super_manifestation_creator",
+          source_card_no: cardNo, target_uid: target.uid });
+      }
+    }
+    return { origin: origin === "creator" ? "field" : origin, holder_uid: holder?.uid ?? null };
+  }
+
   function soulFlashSummonOptions(state, cards, targets, side) {
-    const windows = { own: ["own_attack", "both_attack"],
+    // 『自分のターン』の《超顕現》(T144-T)はアタックステップの窓でだけ開く。Python同一。
+    const windows = { own: ["own_attack", "both_attack", "self_turn"],
       opponent: ["opponent_attack", "both_attack"] }[side] || [];
     const sources = state.hand.map((cardNo, index) => [index, cardNo, "hand"])
       .filter(([index, cardNo]) => state.hand.indexOf(cardNo) === index);
@@ -3479,8 +3548,14 @@
       if (!route || card.is_brave
           || (route.count_min !== null && route.count_min !== undefined && state.count < route.count_min)
           || (route.once_per_turn_same_name
-            && state.blockTurnUsed.has(`soul_flash_summon\u0000${card.name}`))
+            && state.blockTurnUsed.has(soulFlashOnceKey(route, card)))
           || !summonConditionsMet(card, state, cards)) continue;
+      if (route.soul_to === "self") {
+        if (soulTopPayable(state, cards, card, route)) {
+          options.push({ card_no: cardNo, hand_index: index, source_zone: zone });
+        }
+        continue;
+      }
       const plan = paymentPlan(state, cards, targets, { payment: soulFlashSummonPayment(route) }, null);
       if (plan === null) continue;
       const holder = plan.soulFrom;
@@ -3499,12 +3574,13 @@
     if (!option) return null;
     const card = cards[cardNo];
     const route = card.soul_flash_summons.find((row) => row.source_zone === sourceZone);
+    if (route.soul_to === "self") return playSoulTopSummon(state, cards, targets, cardNo, route, opponent);
     const previous = [state.combatOpponent || null, MAIN_STEP_OPPONENTS.get(state)];
     state.combatOpponent = opponent;
     if (opponent) MAIN_STEP_OPPONENTS.set(state, opponent); else MAIN_STEP_OPPONENTS.delete(state);
     let uid;
     try {
-      if (route.once_per_turn_same_name) state.blockTurnUsed.add(`soul_flash_summon\u0000${card.name}`);
+      if (route.once_per_turn_same_name) state.blockTurnUsed.add(soulFlashOnceKey(route, card));
       // 対価の誘発(【契約域】のカウント+2)を先に解いてから召喚する(Q29274の同型、
       // `creator_core_summon`と同じ順)。Python同一。
       beginEffectFrame(state);
@@ -3533,6 +3609,37 @@
       if (previous[1]) MAIN_STEP_OPPONENTS.set(state, previous[1]); else MAIN_STEP_OPPONENTS.delete(state);
     }
     return { card_no: cardNo, uid, source_zone: sourceZone, payment: "soul_core_to_creator" };
+  }
+
+  /** T144-T: ソウルコアを召喚する体の上に置いて手札から召喚する(BS74-X13・《超顕現》)。
+   *  Python `_combat_play_soul_top_summon`と同一。 */
+  function playSoulTopSummon(state, cards, targets, cardNo, route, opponent = null) {
+    const card = cards[cardNo];
+    const previous = [state.combatOpponent || null, MAIN_STEP_OPPONENTS.get(state)];
+    state.combatOpponent = opponent;
+    if (opponent) MAIN_STEP_OPPONENTS.set(state, opponent); else MAIN_STEP_OPPONENTS.delete(state);
+    let uid;
+    try {
+      if (route.once_per_turn_same_name) state.blockTurnUsed.add(soulFlashOnceKey(route, card));
+      let soul;
+      beginEffectFrame(state);
+      try {
+        soul = paySoulTop(state, cards, targets, cardNo, route);
+      } finally {
+        endEffectFrame(state);
+      }
+      if (!state.effectFrameDepth) flushCountReactions(state, cards, targets);
+      const before = state.uid;
+      const maintenance = entryMaintenance(state, cards, card);
+      play(state, cards, targets, { card_no: cardNo, pay: 0, total: maintenance - 1, maintenance,
+        mode: route.manifestation ? "super_manifestation" : "soul_top_summon",
+        allow_sacrifice: false, brave_mode: null, soul_on_top: soul });
+      uid = state.field.find((unit) => unit.uid > before && unit.card_no === cardNo)?.uid ?? null;
+    } finally {
+      state.combatOpponent = previous[0];
+      if (previous[1]) MAIN_STEP_OPPONENTS.set(state, previous[1]); else MAIN_STEP_OPPONENTS.delete(state);
+    }
+    return { card_no: cardNo, uid, source_zone: "hand", payment: "soul_core_on_top" };
   }
 
   function flashManifestationOptions(state, cards, side) {
@@ -9631,7 +9738,7 @@
     const traceDetails = { mode, pay: candidate.pay, total: candidate.total, ...manifestationPayment };
     // トラッシュからの召喚も通常の召喚と同じ支払いなので、同じ鍵を持つ(2026-10-11、
     // Python `play_card`の`trace_mode`と同一。それまで`brave_mode`を書いていなかった)。
-    if (["normal", "manifestation", "trash_main_summon", "creator_core_summon", "trigger_counter", "deck_discard_protection", "shadow", "soul_flash_summon"].includes(mode)) {
+    if (["normal", "manifestation", "trash_main_summon", "creator_core_summon", "trigger_counter", "deck_discard_protection", "shadow", "soul_flash_summon", "soul_top_summon", "super_manifestation"].includes(mode)) {
       traceDetails.creator_uid = candidate.manifestation_creator_uid ?? null;
       traceDetails.brave_mode = candidate.brave_mode;
     }
@@ -9706,8 +9813,9 @@
       traceDetails.soul_core_used_for_summon_cost = soulCoreUsedForSummonCost;
     }
     const soulInTrashBefore = state.trashHasSoul;
+    // T144-T: 呼び出し側が置き場から外したソウルコアを体の上へ置く(`total`は維持コア-1)。
     const soulForUnit = payFromReserve(state, candidate.pay,
-      candidate.total - candidate.pay, preferSoulForPay);
+      candidate.total - candidate.pay, preferSoulForPay) || Boolean(candidate.soul_on_top);
     soulCoreUsedForSummonCost = Boolean(state.trashHasSoul && !soulInTrashBefore);
     if (card.soul_paid_on_play) traceDetails.soul_core_used_for_summon_cost = soulCoreUsedForSummonCost;
     state.reserve -= candidate.total;
@@ -9717,7 +9825,8 @@
     record(state, cards, "cost_paid", { card_no: candidate.card_no,
       payment: mode === "free_deploy" ? "none"
         : preserveSoul ? "manifestation_soul_waived"
-        : candidate.mode === "manifestation" ? "soul_core_and_cores" : "cores",
+        : candidate.mode === "manifestation" ? "soul_core_and_cores"
+        : candidate.soul_on_top ? "soul_core_on_top" : "cores",
       ...traceDetails });
     // ドライビングフォースの配置元は、提示・コスト確定・支払いの間は元zoneに
     // 残り、支払い後に初めて場へ移る(Pythonのtrace時点と同じ)。
@@ -9756,6 +9865,11 @@
         soul_core: soulForUnit, kourin_stack: [],
         // 「手元から召喚していたとき」のための出どころ(v66、Python同一)。
         ...(takenFrom === "side" ? { summoned_from: "side" } : {}) });
+      if (candidate.soul_on_top) {
+        recordCoreMove(state, cards, { amount: 1, source: candidate.soul_on_top.origin,
+          destination: "field", reason: "soul_on_top",
+          source_uid: candidate.soul_on_top.holder_uid, target_uid: uid });
+      }
     }
     // バーストから出す枝は、召喚が確定した時点でバーストゾーンを離れる
     // (Python `burst_open[0] = None` と同じ位置)。
@@ -9795,7 +9909,7 @@
     const playedArgs = () => [state, cards, targets, { ...card, card_no: candidate.card_no },
       uid, candidate.brave_mode, soulCoreUsedForSummonCost, watcherUnits,
       watchEvent(card, mode), summonGroup, Boolean(candidate.suppress_summon_effects),
-      mode === "manifestation"];
+      ["manifestation", "super_manifestation"].includes(mode)];
     const postBody = () => {
         if (isMagic && staysOnField) {
           state.uid += 1;
