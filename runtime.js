@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v299-v1";
-  const STAGE_VERSION = "v299";
+  const ENGINE_SLICE = "stage4-v300-v1";
+  const STAGE_VERSION = "v300";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v299-portable-v243";
+  const RUNTIME_VERSION = "stage4-v300-portable-v244";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3486,12 +3486,59 @@
       const holder = soulTopCreators(state, cards, route).find((unit) => unit.soul_core);
       return holder ? ["creator", holder] : [null, null];
     }
+    const lifeOk = soulTopLifeSafe(state, cards);
+    if (lifeOk && lifeLossBurstSet(state, cards)) return ["life", null];
     if (state.trashHasSoul) return ["trash", null];
     if (state.reserveHasSoul) return ["reserve", null];
     const holder = [...state.field].sort((a, b) => a.uid - b.uid).find((unit) =>
       unit.soul_core && !unit.waiting && !isCreatorNexus(cards, unit)
       && unit.cores - 1 >= unitFloor(state, cards, unit));
-    return holder ? ["field", holder] : [null, null];
+    if (holder) return ["field", holder];
+    return lifeOk ? ["life", null] : [null, null];
+  }
+
+  /** ライフのソウルコアを置いてもすぐ負けないか(T144-T、利用者11-20)。
+   *  Python `_soul_top_life_safe`と同一。 */
+  function soulTopLifeSafe(state, cards) {
+    if (!state.lifeHasSoul || !canPayLife(state, cards, 1)) return false;
+    const other = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
+    const burn = other?.visible_attack_life_burn?.() ?? 0;
+    return state.life - 1 > burn;
+  }
+
+  /** 「ライフ減少後」で開くバーストをセットしているか。Python `_life_loss_burst_set`と同一。 */
+  function lifeLossBurstSet(state, cards) {
+    return Boolean(state.burst) && (cards[state.burst]?.burst_conditions || []).includes("ライフ減少後");
+  }
+
+  /** 印字のLvだけを見る(停止中は満たさない)。Python `enabler_level_met`と同一。
+   *  `effectActive`は対価・戦闘中かなども見るので、見えている効果の数え上げには使わない。 */
+  function printedLevelMet(effect, state, cards, unit) {
+    if (effectsSuppressed(state, unit)) return false;
+    const hasLevels = Array.isArray(effect.levels) && effect.levels.length;
+    const required = effect.required_level;
+    if ((required === null || required === undefined) && !hasLevels) return true;
+    const level = levelFor(unit, cards, state);
+    if (required !== null && required !== undefined && level < required) return false;
+    return !hasLevels || effect.levels.includes(level);
+  }
+
+  /** この盤面のアタック時に見えている「相手のライフのコアを減らす」の合計(公開情報)。
+   *  Python `_visible_attack_life_burn`と同一。 */
+  function visibleAttackLifeBurn(state, cards) {
+    let total = 0;
+    for (const unit of [...state.field].sort((a, b) => a.uid - b.uid)) {
+      const card = unitInfo(state, cards, unit) || {};
+      const type = card.card_type || "";
+      if (unit.waiting || !(type.includes("スピリット") || type.includes("アルティメット"))) continue;
+      for (const effect of card.attack_effects || []) {
+        if (effect.kind === "life_core_remove" && effect.mode === "on_attack"
+            && printedLevelMet(effect, state, cards, unit)) {
+          total += effect.amount_max || effect.amount || 0;
+        }
+      }
+    }
+    return total;
   }
 
   /** Python `_soul_top_payable`と同一。リザーブから要るのは維持コア-1。 */
@@ -3507,7 +3554,10 @@
    *  Python `_pay_soul_top`と同一。 */
   function paySoulTop(state, cards, targets, cardNo, route) {
     const [origin, holder] = soulTopSource(state, cards, route);
-    if (origin === "trash") {
+    if (origin === "life") {
+      subtractLife(state, 1);
+      state.lifeHasSoul = false;
+    } else if (origin === "trash") {
       state.spent -= 1;
       state.trashHasSoul = false;
     } else if (origin === "reserve") {
@@ -13443,6 +13493,8 @@
       flash_manifestation_options: side => flashManifestationOptions(state,cards,side),
       // T144-S: ソウルコアを創界神へ置いて手札/セット中から召喚する口(Python同一)。
       soul_flash_summon_options: side => soulFlashSummonOptions(state, cards, targets, side),
+      // 相手が自分のライフを削ってよいかの判断に使う、アタック時のライフ減少の合計(T144-T)。
+      visible_attack_life_burn: () => visibleAttackLifeBurn(state, cards),
       play_soul_flash_summon: (cardNo, sourceZone, side, opponent = null) =>
         playSoulFlashSummon(state, cards, targets, cardNo, sourceZone, side, opponent),
       play_flash_manifestation: (cardNo,creatorUid,side,opponent=null,soulPayment=null,sourceZone=null) => {
@@ -15932,12 +15984,19 @@
       options.sort((a, b) => a.card_no < b.card_no ? -1 : a.card_no > b.card_no ? 1
         : a.hand_index - b.hand_index);
       const option = options[0];
-      const result = board.play_soul_flash_summon(option.card_no, option.source_zone, side,
-        boards[owner === actor ? defenderId : actor]);
+      const other = boards[owner === actor ? defenderId : actor];
+      const lifeBefore = board.life();
+      const result = board.play_soul_flash_summon(option.card_no, option.source_zone, side, other);
       if (result) {
         emit("flash_self_summon_played", owner, {...result, side, step});
         played.push(result);
         if (owner === actor && order && !order.includes(result.uid)) order.push(result.uid);
+        // 対価でライフのソウルコアを動かしたら、自分の「ライフ減少後」のバーストを開ける
+        // (Q19493、召喚と派生を解いた後＝D56)。T144-T、Python同一。
+        const lifeAfter = board.life();
+        if (lifeAfter > 0 && lifeAfter < lifeBefore) {
+          openBurst(emit, owner, board, BURST_LIFE_LOSS, other, { ownTurn: owner === actor });
+        }
       }
     }
     return played;
