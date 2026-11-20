@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v300-v1";
-  const STAGE_VERSION = "v300";
+  const ENGINE_SLICE = "stage4-v301-v1";
+  const STAGE_VERSION = "v301";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v300-portable-v244";
+  const RUNTIME_VERSION = "stage4-v301-portable-v245";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -15951,33 +15951,148 @@
   /** 公式手順4のフラッシュタイミングで手札から煌臨する。Python `_flash_kourin` と同一。
    *  手番側が先で撃てるなら撃つ(アタッカーへ)、守り手は失うものがあるときだけ
    *  (ブロッカーへ)。札は(宿主の優先→カード番号→手札の位置)で選ぶ。 */
-  function flashManifestation(emit, actor, defenderId, boards, step, threatened, order = null) {
+  /** 返しの自分のターンに通る打点(T147、1手先)。Python `_next_turn_landed`と同一。
+   *  自分の体はリフレッシュで立つ。相手の体は自分のリフレッシュでは回復しないので、
+   *  ブロッカーはいま回復状態の相手の体だけ。順は場の順。 */
+  function nextTurnLanded(board, opponentBoard, profiles) {
+    const life = opponentBoard.life();
+    if (life <= 0) return 0;
+    const attackers = board.units().filter(canAttack).map((row) => ({ ...row, exhausted: false }));
+    const blockers = opponentBoard.units().filter((row) => !row.exhausted);
+    const [landed] = stepDamageThrough(attackers, blockers, life, profiles);
+    return Math.min(landed, life);
+  }
+
+  /** 守り側から見た枝の値(T147)。大きいほど良い。Python `_defender_outlook_key`と同一。
+   *  incomingは "pending"(ブロック前、先頭にブロックされうる1体) / "unblocked"(シンボルを
+   *  そのまま足す) / "blocked"(数えない)。 */
+  function defenderOutlookKey(board, opponentBoard, profiles, attackerUid, incoming) {
+    const ownLife = board.life();
+    const theirUnits = opponentBoard.units();
+    const row = theirUnits.find((r) => r.uid === attackerUid);
+    let later = theirUnits.filter((r) => canAttack(r) && !r.exhausted && r.uid !== attackerUid);
+    let current = 0;
+    if (row && incoming === "pending") later = [{ ...row, exhausted: false }, ...later];
+    else if (row && incoming === "unblocked") current = row.symbol_count;
+    let through = 0;
+    if (ownLife - current > 0) {
+      const walls = board.units().filter((r) => !r.exhausted);
+      [through] = stepDamageThrough(later, walls, ownLife - current, profiles);
+    }
+    const damageIn = Math.min(ownLife, current + through);
+    const theirLife = opponentBoard.life();
+    const landed = nextTurnLanded(board, opponentBoard, profiles);
+    return [damageIn < ownLife ? 1 : 0, theirLife <= 0 || landed >= theirLife ? 1 : 0,
+      -damageIn, landed];
+  }
+
+  /** 辞書順の比較(left > right)。 */
+  function keyGreater(left, right) {
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return left[index] > right[index];
+    }
+    return false;
+  }
+
+  /** 守り側の窓へ渡す比べ方(T147)。Python `_defender_outlook`と同一。 */
+  function defenderOutlook(profiles, attackerUid, incoming, retarget) {
+    return { key: (board, other) => defenderOutlookKey(board, other, profiles, attackerUid(), incoming),
+      retarget };
+  }
+
+  /** play()を試して戻し、その枝の値を返す(撃てなければnull)。Python `_defender_trial_key`。 */
+  function defenderTrialKey(board, opponentBoard, play, outlook) {
+    const ownState = board.trial_snapshot();
+    const theirState = opponentBoard.trial_snapshot();
+    try {
+      const result = play();
+      return result ? outlook.key(board, opponentBoard) : null;
+    } finally {
+      board.trial_restore(ownState);
+      opponentBoard.trial_restore(theirState);
+    }
+  }
+
+  function outlookReady(outlook, board, opponentBoard) {
+    return Boolean(outlook) && [board, opponentBoard].every((each) =>
+      typeof each.trial_snapshot === "function" && typeof each.trial_restore === "function");
+  }
+
+  /** 失うものが無い守り側が、撃つと返しのターンが良くなるか(T147)。Python
+   *  `_defender_fires_for_outlook`と同一。厳密に良いときだけ撃つ。 */
+  function defenderFiresForOutlook(board, opponentBoard, play, outlook) {
+    if (!outlookReady(outlook, board, opponentBoard)) return false;
+    const hold = outlook.key(board, opponentBoard);
+    const fired = defenderTrialKey(board, opponentBoard, play, outlook);
+    return fired !== null && keyGreater(fired, hold);
+  }
+
+  /** 守り側の除去の狙いを枝を解いて比べて決める(T147)。撃たないならnull。
+   *  Python `_defender_removal_target`と同一。 */
+  function defenderRemovalTarget(board, opponentBoard, fire, fallback, wanted, outlook) {
+    const base = [...fallback];
+    if (!outlookReady(outlook, board, opponentBoard)) return wanted ? base : null;
+    if (wanted && !outlook.retarget) return base;
+    const same = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+    const others = opponentBoard.units().filter((row) => !row.exhausted)
+      .map((row) => [row.uid]).filter((prefer) => !same(prefer, base));
+    let best;
+    let bestKey;
+    let candidates;
+    if (wanted) {
+      bestKey = defenderTrialKey(board, opponentBoard, () => fire(base), outlook);
+      if (bestKey === null) return base;
+      best = base;
+      candidates = others;
+    } else {
+      best = null;
+      bestKey = outlook.key(board, opponentBoard);
+      candidates = [base, ...others];
+    }
+    for (const prefer of candidates) {
+      const key = defenderTrialKey(board, opponentBoard, () => fire(prefer), outlook);
+      if (key !== null && keyGreater(key, bestKey)) {
+        best = prefer;
+        bestKey = key;
+      }
+    }
+    return best;
+  }
+
+  function flashManifestation(emit, actor, defenderId, boards, step, threatened, order = null,
+    outlook = null) {
     const played = [];
     for (const [owner, side] of [[actor,"own"],[defenderId,"opponent"]]) {
-      if (owner === defenderId && !threatened()) continue;
+      // 守り側は失うものがあれば撃つ。無ければ返しのターンが良くなるときだけ(T147)。
+      const quiet = owner === defenderId && !threatened();
+      if (quiet && !outlook) continue;
       const board = boards[owner];
       const options = board.flash_manifestation_options?.(side) || [];
       if (!options.length) continue;
       options.sort((a,b) => a.card_no < b.card_no ? -1 : a.card_no > b.card_no ? 1 : a.hand_index-b.hand_index);
       const option = options[0];
-      const result = board.play_flash_manifestation(option.card_no,option.creators[0],side,
-        boards[owner===actor ? defenderId : actor]);
+      const other = boards[owner===actor ? defenderId : actor];
+      const play = () => board.play_flash_manifestation(option.card_no,option.creators[0],side,other);
+      if (quiet && !defenderFiresForOutlook(board, other, play, outlook)) continue;
+      const result = play();
       if (result) {
-        emit("flash_manifestation_played",owner,{...result,side,step});
+        emit("flash_manifestation_played",owner,{...result,side,step,...(quiet ? {motive: "next_turn"} : {})});
         played.push(result);
         if (owner === actor && order && !order.includes(result.uid)) order.push(result.uid);
       }
     }
-    played.push(...flashSelfSummon(emit, actor, defenderId, boards, step, threatened, order));
+    played.push(...flashSelfSummon(emit, actor, defenderId, boards, step, threatened, order, outlook));
     return played;
   }
 
   /** 顕現と同じ窓で、ソウルコアを創界神へ置いて手札/セット中から自分を召喚する(T144-S)。
    *  Python `_flash_self_summon`と同一。 */
-  function flashSelfSummon(emit, actor, defenderId, boards, step, threatened, order = null) {
+  function flashSelfSummon(emit, actor, defenderId, boards, step, threatened, order = null,
+    outlook = null) {
     const played = [];
     for (const [owner, side] of [[actor, "own"], [defenderId, "opponent"]]) {
-      if (owner === defenderId && !threatened()) continue;
+      const quiet = owner === defenderId && !threatened();
+      if (quiet && !outlook) continue;
       const board = boards[owner];
       const options = board.soul_flash_summon_options?.(side) || [];
       if (!options.length) continue;
@@ -15985,10 +16100,13 @@
         : a.hand_index - b.hand_index);
       const option = options[0];
       const other = boards[owner === actor ? defenderId : actor];
+      const play = () => board.play_soul_flash_summon(option.card_no, option.source_zone, side, other);
+      if (quiet && !defenderFiresForOutlook(board, other, play, outlook)) continue;
       const lifeBefore = board.life();
-      const result = board.play_soul_flash_summon(option.card_no, option.source_zone, side, other);
+      const result = play();
       if (result) {
-        emit("flash_self_summon_played", owner, {...result, side, step});
+        emit("flash_self_summon_played", owner, {...result, side, step,
+          ...(quiet ? { motive: "next_turn" } : {})});
         played.push(result);
         if (owner === actor && order && !order.includes(result.uid)) order.push(result.uid);
         // 対価でライフのソウルコアを動かしたら、自分の「ライフ減少後」のバーストを開ける
@@ -16002,11 +16120,13 @@
     return played;
   }
 
-  function flashKourin(emit, actor, defenderId, boards, attackerUid, blockerUid, threatened, order = null) {
+  function flashKourin(emit, actor, defenderId, boards, attackerUid, blockerUid, threatened, order = null,
+    outlook = null) {
     const played = [];
     for (const [owner, side, prefer] of [[actor, "own", attackerUid],
       [defenderId, "opponent", blockerUid]]) {
-      if (owner === defenderId && !threatened()) continue;
+      const quiet = owner === defenderId && !threatened();
+      if (quiet && !outlook) continue;
       const board = boards[owner];
       // 口を持たない盤面(テストの簡易盤面など)では窓を開かない(Python同一)。
       if (!board.flash_kourin_options) continue;
@@ -16020,19 +16140,22 @@
         return a[2] < b[2] ? row : best;
       });
       const host = option.hosts.includes(prefer) ? prefer : option.hosts[0];
-      const result = board.play_flash_kourin(option.card_no, host, side,
-        boards[owner === actor ? defenderId : actor]);
+      const other = boards[owner === actor ? defenderId : actor];
+      const play = () => board.play_flash_kourin(option.card_no, host, side, other);
+      if (quiet && !defenderFiresForOutlook(board, other, play, outlook)) continue;
+      const result = play();
       if (!result) continue;
-      emit("flash_kourin_played", owner, { ...result, side });
+      emit("flash_kourin_played", owner, { ...result, side, ...(quiet ? { motive: "next_turn" } : {}) });
       played.push(result);
     }
-    played.push(...flashManifestation(emit,actor,defenderId,boards,4,threatened,order));
+    played.push(...flashManifestation(emit,actor,defenderId,boards,4,threatened,order,outlook));
     return played;
   }
 
   /** 公式手順2・4のフラッシュタイミングで手札のフラッシュの除去を撃つ。
    *  Python `_flash_removal` と同一。札は(コスト→カード番号→手札の位置)。 */
-  function flashRemoval(emit, actor, defenderId, boards, step, wants, prefer, order=null, index=0) {
+  function flashRemoval(emit, actor, defenderId, boards, step, wants, prefer, order=null, index=0,
+    outlook=null) {
     const played = [];
     for (const [owner, side] of [[actor, "own"], [defenderId, "opponent"]]) {
       const board = boards[owner];
@@ -16048,7 +16171,11 @@
           if (owner===actor && recovered && !order.slice(index+1).includes(recovered.uid)) order.push(recovered.uid);
         }
       }
-      if (!board.flash_removal_options || !wants[side]()) continue;
+      if (!board.flash_removal_options) continue;
+      const wanted = wants[side]();
+      // 守り側は失うものが無くても返しのターンが良くなるなら撃ち、狙いも枝を解いて選ぶ(T147)。
+      const weighed = owner === defenderId && Boolean(outlook);
+      if (!wanted && !weighed) continue;
       const options = board.flash_removal_options();
       const other = boards[owner === actor ? defenderId : actor];
       options.push(...(board.mirage_flash_options?.(other) || []).filter(row=>row.has_target));
@@ -16059,13 +16186,21 @@
         if (row.card_no !== best.card_no) return row.card_no < best.card_no ? row : best;
         return row.hand_index < best.hand_index ? row : best;
       });
-        const result = option.source_zone === "field"
-          ? board.play_field_removal_flash(option.uid,option.effect_id,option.payment_index,other,prefer[side])
-          : option.source_zone === "mirage"
-        ? board.play_mirage_flash(option.effect_id,other,prefer[side])
-        : board.play_flash_removal(option.card_no,other,prefer[side]);
+      const fire = (target) => option.source_zone === "field"
+        ? board.play_field_removal_flash(option.uid,option.effect_id,option.payment_index,other,target)
+        : option.source_zone === "mirage"
+          ? board.play_mirage_flash(option.effect_id,other,target)
+          : board.play_flash_removal(option.card_no,other,target);
+      let target = [...prefer[side]];
+      if (weighed) {
+        target = defenderRemovalTarget(board, other, fire, target, wanted, outlook);
+        if (!target) continue;
+      }
+      const result = fire(target);
       if (!result) continue;
-      emit("flash_removal_played", owner, { ...result, side, step });
+      const moved = target.length !== prefer[side].length || target.some((v, i) => v !== prefer[side][i]);
+      const motive = !weighed ? {} : !wanted ? { motive: "next_turn" } : moved ? { motive: "retarget" } : {};
+      emit("flash_removal_played", owner, { ...result, side, step, ...motive });
       played.push(result);
     }
     return played;
@@ -16315,7 +16450,8 @@
           bp: attackerAfterWindow.bp };
       }
       if (flashManifestation(emit,actor,defenderId,boards,2,
-        () => attacker.symbol_count > 0 && defenderBoard.life() > 0,order).length) {
+        () => attacker.symbol_count > 0 && defenderBoard.life() > 0,order,
+        defenderOutlook(profiles, () => uid, "pending", false)).length) {
         if (battleLeft(emit,actor,defenderId,boards,attacker,null)) continue;
         attacker = overlayRow(attacker,attackerBoard);
         uid = attacker.uid;
@@ -16324,7 +16460,8 @@
       if (flashRemoval(emit, actor, defenderId, boards, 2,
         { own: () => defenderBoard.units().some((row) => !row.exhausted),
           opponent: () => attacker.symbol_count > 0 && defenderBoard.life() > 0 },
-        { own: [], opponent: [uid] }, order,index).length) {
+        { own: [], opponent: [uid] }, order,index,
+        defenderOutlook(profiles, () => uid, "pending", true)).length) {
         if (battleLeft(emit, actor, defenderId, boards, attacker, null)) continue;
         attacker = overlayRow(attacker, attackerBoard);
         uid = attacker.uid;
@@ -16348,7 +16485,8 @@
       if (!blocker) {
         // 手順4で手札から煌臨する(2026-10-01、Python同一)。
         if (flashKourin(emit, actor, defenderId, boards, uid, null,
-          () => Math.min(attacker.symbol_count, defenderBoard.life()) > 0,order).length) {
+          () => Math.min(attacker.symbol_count, defenderBoard.life()) > 0,order,
+          defenderOutlook(profiles, () => uid, "unblocked", false)).length) {
           if (battleLeft(emit, actor, defenderId, boards, attacker, null)) continue;
           attacker = overlayRow(attacker, attackerBoard);
           uid = attacker.uid;
@@ -16357,7 +16495,8 @@
         if (flashRemoval(emit, actor, defenderId, boards, 4,
           { own: () => false,
             opponent: () => attacker.symbol_count > 0 && defenderBoard.life() > 0 },
-          { own: [], opponent: [uid] }).length) {
+          { own: [], opponent: [uid] }, null, 0,
+          defenderOutlook(profiles, () => uid, "unblocked", true)).length) {
           if (battleLeft(emit, actor, defenderId, boards, attacker, null)) continue;
           attacker = overlayRow(attacker, attackerBoard);
           uid = attacker.uid;
@@ -16474,7 +16613,8 @@
           .includes(battleOutcome(nowAttacker.bp, nowBlocker.bp)));
       };
       if (flashKourin(emit, actor, defenderId, boards, uid, freshBlocker.uid,
-        blockerThreatened,order).length) {
+        blockerThreatened,order,
+        defenderOutlook(profiles, () => uid, "blocked", false)).length) {
         const closed = battleLeft(emit, actor, defenderId, boards, freshAttacker, freshBlocker);
         if (closed === "won") return true;
         if (closed) continue;
@@ -16492,7 +16632,8 @@
       };
       if (flashRemoval(emit, actor, defenderId, boards, 4,
         { own: attackerThreatened, opponent: blockerThreatened },
-        { own: [freshBlocker.uid], opponent: [uid] }, order,index).length) {
+        { own: [freshBlocker.uid], opponent: [uid] }, order,index,
+        defenderOutlook(profiles, () => uid, "blocked", false)).length) {
         const closed = battleLeft(emit, actor, defenderId, boards, freshAttacker, freshBlocker);
         if (closed === "won") return true;
         if (closed) continue;
