@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v303-v1";
-  const STAGE_VERSION = "v303";
+  const ENGINE_SLICE = "stage4-v304-v1";
+  const STAGE_VERSION = "v304";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v303-portable-v247";
+  const RUNTIME_VERSION = "stage4-v304-portable-v248";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -932,6 +932,8 @@
     "unit_destroy", "unit_exhaust", "unit_core_remove", "unit_bounce",
     "unit_heavy_exhaust", "unit_bp_down", "life_core_remove", "field_core_remove",
     "reserve_core_remove", "soul_core_remove", "creator_core_remove", "u_trigger",
+    // 相手のトラッシュの札をゲームから除外(T148)。
+    "trash_exile",
   ]);
   // Python `resolve_burst_effects`が実際に解ける語彙と同一。以前は資源系だけを
   // 列挙していたため、実行系には実装済みの相手盤面干渉でも共有HTMLが入口で拒否した。
@@ -947,6 +949,8 @@
     "poison_blade", "reserve_core_remove", "soul_core_remove",
     // 相手の創界神ネクサスのコアをボイドへ(2026-10-08)。
     "creator_core_remove",
+    // 相手のトラッシュの札をゲームから除外(T148)。
+    "trash_exile",
     // 自分の別の札を手札/トラッシュから出す(2026-10-11、`zone_summon`を流用)。
     "zone_summon",
   ]);
@@ -2930,6 +2934,8 @@
     delete result.payment_bonus;
     // 対価で耐性を貫く(T144-U)。節の貫通に足す。
     if (bonus.pierce) result.pierce = [...(effect.pierce || []), ...bonus.pierce];
+    // 対価で、この効果で破壊した対象を除外する(T148、BS75-013)。
+    if (bonus.exile_destroyed) result.exile_destroyed = bonus.exile_destroyed;
     if (bonus.reveal) result.reveal = effect.reveal + bonus.reveal;
     if (bonus.amount) {
       result.amount = effect.amount + bonus.amount;
@@ -4259,7 +4265,7 @@
     try {
       const traceMark=state.events.length;
       const result = finalizeFieldLeaveImpl(state,cards,unit,cause,destination);
-      if (!['trash','hand','deck_top','deck_bottom','vanish','soul'].includes(result)) return result;
+      if (!['trash','hand','deck_top','deck_bottom','excluded','vanish','soul'].includes(result)) return result;
       const survivors=[];
       for (const brave of braves) {
         if (placeDetachedBrave(state,cards,brave,unit,cause,
@@ -4350,6 +4356,8 @@
       const bases = stack.slice(0, -1).filter((cardNo) => !cards[cardNo]?.is_token);
       state.trashCards.push(...bases);
       if (destination === "hand") state.hand.push(unit.card_no);
+      // フィールドから直接除外(T148、Q27102・Q30755)。トラッシュを経ない(Python同一)。
+      else if (destination === "excluded") state.excludedCards.push(unit.card_no);
       // 山札は下→上なので、トップは末尾。Pythonの``deck.append``/``deck.insert(0, …)``と同じ。
       else if (destination === "deck_top") {
         state.deck.push(unit.card_no);
@@ -5904,7 +5912,9 @@
     "opponent_deck_discard",
     "field_coreboost", "count_gain", "burst_free_play_self", "zone_summon",
     "unit_destroy", "unit_exhaust", "unit_core_remove", "unit_bounce",
-    "unit_heavy_exhaust", "unit_bp_down", "life_core_remove", "field_core_remove"];
+    "unit_heavy_exhaust", "unit_bp_down", "life_core_remove", "field_core_remove",
+    // 相手のトラッシュの札をゲームから除外(T148、Python `_USEFUL_BURST_KINDS`同一)。
+    "trash_exile"];
 
   function burstEffectIsUseful(card, effect) {
     if (effect.kind === "burst_pay_own_effect") {
@@ -6563,7 +6573,9 @@
     // 方針は節の対価と同じく「払えるなら払う」。山札が無ければ払わない。対価で耐性を貫く文
     // (T144-U)は、貫いて選ぶ対象が変わるときだけ払う。Python同一。
     if (effect.payment_bonus && (effect.payment_bonus.pierce
-      ? pierceBonusGains(state, cards, effect, sourceUid) : state.deck.length)) {
+      ? pierceBonusGains(state, cards, effect, sourceUid)
+      : effect.payment_bonus.exile_destroyed ? exileBonusGains(state, cards, effect, sourceUid)
+      : state.deck.length)) {
       const paid = {payment: effect.payment_bonus.payment, source_card_no: effect.source_card_no};
       if (paymentPlan(state, cards, targets, paid, sourceUid) !== null
           && payClausePayment(state, cards, targets, paid, sourceUid)) {
@@ -7171,7 +7183,10 @@
           const rows = combatTargetRows(state, cards, part, sourceUid).slice(0, part.amount);
           for (const row of unguardedTargets(board, rows, part)) selected.set(row.uid, row);
         }
-        const applied = [...selected.values()].filter((row) => board.destroy(row.uid, "effect", combatBoard(state, cards, targets, effect, sourceUid)));
+        const exiled = destroyedExileUids(effect, board, [...selected.values()]);
+        const applied = [...selected.values()].filter((row) => board.destroy(row.uid, "effect",
+          combatBoard(state, cards, targets, effect, sourceUid), false, true,
+          exiled.has(row.uid) ? "excluded" : "trash"));
         if (effect.b3_followup_id) state.movedCards = applied.map((row) => row.card_no);
         return applied.length > 0;
       }
@@ -7197,7 +7212,11 @@
         return Boolean(moved || destroyed);
       }
       const rows = combatTargetRows(state, cards, effect, sourceUid);
-      if (!rows.length) return false;
+      if (!rows.length) {
+        // 「…1体と相手の…トラッシュにあるカード1枚を除外する」は体がいなくても札を除外(Python同一)。
+        return Boolean(effect.with_trash_exile) && resolveTrashExile(state, cards, targets,
+          { ...effect, amount: effect.with_trash_exile, target_all: false }, sourceUid);
+      }
       if (effect.kind === "unit_core_remove") {
         // amountは**1体あたりのコア数**なので、対象は1体だけ選ぶ。
         const target = unguardedTargets(board, rows.slice(0, 1), effect);
@@ -7238,7 +7257,10 @@
       const affected = unguardedTargets(board, picked, effect);
       let applied;
       if (effect.kind === "unit_destroy") {
-        applied = affected.filter((row) => board.destroy(row.uid, "effect", combatBoard(state, cards, targets, effect, sourceUid)));
+        const exiled = destroyedExileUids(effect, board, affected);
+        applied = affected.filter((row) => board.destroy(row.uid, "effect",
+          combatBoard(state, cards, targets, effect, sourceUid), false, true,
+          exiled.has(row.uid) ? "excluded" : "trash"));
         if (effect.b3_followup_id) state.movedCards = applied.map((row) => row.card_no);
         if (applied.length && effect.destroy_life_amount) {
           board.damage_life(effect.destroy_life_amount, "reserve", lifeLossSource(state, cards, effect, sourceUid));
@@ -7259,8 +7281,15 @@
       }
       // 除去対価が成立した後だけ本人を1段階回復(Python同一)。
       if (applied.length && effect.refresh_self) refreshSourceUnit(state, cards, sourceUid);
+      if (effect.kind === "unit_bounce" && effect.with_trash_exile) {
+        // BS74-X03(T148)。体を除外できなくても札は除外する(Python同一)。
+        const exiledCards = resolveTrashExile(state, cards, targets,
+          { ...effect, amount: effect.with_trash_exile, target_all: false }, sourceUid);
+        return exiledCards || applied.length > 0;
+      }
       return applied.length > 0;
     }
+    if (effect.kind === "trash_exile") return resolveTrashExile(state, cards, targets, effect, sourceUid);
     if (effect.kind === "stash_top") {
       const cardsToStash = peekTopSlice(state, amount);
       clearRemovedFaceUpTop(state, cardsToStash.length);
@@ -10422,6 +10451,73 @@
     return before.length !== after.length || before.some((value, index) => value !== after[index]);
   }
 
+  /** 対価で破壊した対象を除外する上乗せ(T148)を払う値打ちがあるか: 対象になりうる相手の体に
+   *  トラッシュから使える札がある。Python `_exile_bonus_gains`と同一。 */
+  function exileBonusGains(state, cards, effect, sourceUid) {
+    const board = state.combatOpponent;
+    if (!board || typeof board.trash_reuse !== "function") return false;
+    return combatTargetRows(state, cards, effect, sourceUid).some(row => board.trash_reuse(row.card_no));
+  }
+
+  /** 「この効果で破壊した対象N体/すべてを除外する」で除外する体(T148)。体数なら持ち主の
+   *  `trash_reuse`→コスト→uidの順。Python `_destroyed_exile_uids`と同一。 */
+  function destroyedExileUids(effect, board, rows) {
+    const exile = effect.exile_destroyed;
+    if (!exile) return new Set();
+    if (exile === "all") return new Set(rows.map(row => row.uid));
+    const reuse = typeof board.trash_reuse === "function" ? board.trash_reuse : () => 0;
+    const ranked = [...rows].sort((left, right) => reuse(right.card_no) - reuse(left.card_no)
+      || (right.cost || 0) - (left.cost || 0) || left.uid - right.uid);
+    return new Set(ranked.slice(0, Number(exile)).map(row => row.uid));
+  }
+
+  /** 相手のトラッシュの札をゲームから除外する(T148)。選ぶのは持ち主の盤面の口。
+   *  Python `_resolve_trash_exile`と同一。 */
+  function resolveTrashExile(state, cards, targets, effect, sourceUid) {
+    const board = state.combatOpponent;
+    if (!board || typeof board.exile_trash !== "function") return false;
+    const sourceNo = effect.source_card_no
+      || state.field.find(unit => unit.uid === sourceUid)?.card_no || null;
+    const moved = board.exile_trash(effect.target_all ? null : effect.amount, {
+      card_no: sourceNo, lineages: [...(cards[sourceNo]?.lineages || [])].sort(),
+      board: combatBoard(state, cards, targets, effect, sourceUid)});
+    return moved.length > 0;
+  }
+
+  /** この札がトラッシュから使えるか(1/0)。Python `_trash_reuse_value`と同一。 */
+  function trashReuseValue(cards, cardNo) {
+    const card = cards[cardNo] || {};
+    return Number(Boolean(card.trash_flash_use || card.trash_main_summon
+      || (card.trash_effects && card.trash_effects.length)
+      || (card.play_routes || []).some(route => route.source_zone === "trash" && route.readable)));
+  }
+
+  /** 相手の効果で自分のトラッシュの札を除外する(T148)。Python `_combat_exile_trash`と同一。 */
+  function combatExileTrash(state, cards, amount, source = {}) {
+    if (state.field.some(unit => unitInfo(state, cards, unit)?.trash_exile_immune === "group")) return [];
+    const locks = [...trashEffectLocks(state, cards),
+      ...(source?.board?.trash_effect_locks?.(true) || [])];
+    const lineages = source?.lineages || [];
+    if (locks.some(rule => !(rule.except_lineages || []).some(value => lineages.includes(value)))) return [];
+    const pool = state.trashCards.map((cardNo, index) => ({cardNo, index})).filter(({cardNo}) =>
+      !(cards[cardNo]?.trash_exile_immune === "self" || cards[cardNo]?.trash_effect_immunity === "all"
+        || (cards[cardNo]?.effect_immune_zones || []).includes("trash")));
+    const ranked = pool.sort((left, right) =>
+      trashReuseValue(cards, right.cardNo) - trashReuseValue(cards, left.cardNo)
+      || (cards[right.cardNo]?.cost || 0) - (cards[left.cardNo]?.cost || 0)
+      || right.index - left.index);
+    const picked = amount === null ? ranked : ranked.slice(0, Math.max(0, amount));
+    for (const {index} of [...picked].sort((left, right) => right.index - left.index)) {
+      state.trashCards.splice(index, 1);
+    }
+    for (const {cardNo} of picked) {
+      state.excludedCards.push(cardNo);
+      record(state, cards, "card_excluded", {card_no: cardNo, source: "trash",
+        reason: "opponent_effect", source_card_no: source?.card_no ?? null});
+    }
+    return picked.map(({cardNo}) => cardNo);
+  }
+
   /** 撃つ対象を、絞りに合う並びから切り出す。「すべて」(`target_all`)は全部、「合計Nまで」
    *  (`target_total`)は合計の上限で選んだ組、ほかは`amount`体。Python `_combat_pick_targets`
    *  の`limit`と同一。⚠️ 2026-10-11まで「除去を残すか」(`removalHoldPlan`)だけが`amount`で
@@ -10990,7 +11086,7 @@
     const context = (threat) => ({ own_turn: true,
       bounce_to_hand: threat.kind === "unit_bounce"
         ? (threat.bounce_destination || "hand") === "hand" : null });
-    const blocked = (row, threat) => resistanceBlocks(row.resist, threat.kind,
+    const blocked = (row, threat) => resistanceBlocks(row.resist, resistanceEffectKind(threat),
       threat.source_type, threat.source_colors, threat.source_cost, context(threat),
       threat.pierce);
     // 創界神ネクサスはソウルコアの置き場所にしない(2026-10-08、Python同一)。
@@ -11293,6 +11389,8 @@
     "creator_core_remove",
     // 相手のリザーブのコア・ソウルコアの名指しをトラッシュへ(2026-10-02、Python同一)。
     "reserve_core_remove", "soul_core_remove",
+    // 相手のトラッシュの札をゲームから除外(T148、Python同一)。
+    "trash_exile",
   ]);
   // 戦闘の窓と、そのIRの置き場所。Python `stage4_conditions.COMBAT_WINDOW_KEYS`
   // と**同じ表**でなければならない(片側にだけ窓を足すと、その窓の節を一方だけが
@@ -11798,6 +11896,13 @@
   /** 相手の効果(種類・出どころ)が耐性に止められるか。Python `resistance_blocks`と同一。
    *  `context`は撃つ側だけが知っていること(v395)。null/undefinedは「分からない」で、
    *  止める側に倒す。 */
+  /** 耐性の照合に渡す効果の種類。ゲームから除外する除去(T148)は`unit_exile`(「手札/デッキに
+   *  戻らない」は除外を止めない)。Python `resistance_effect_kind`と同一。 */
+  function resistanceEffectKind(effect) {
+    if (effect.kind === "unit_bounce" && effect.bounce_destination === "excluded") return "unit_exile";
+    return effect.kind;
+  }
+
   function resistanceBlocks(resistRows, effectKind, sourceType, sourceColors, sourceCost,
     context = {}, pierces = []) {
     for (const row of resistRows || []) {
@@ -11914,7 +12019,7 @@
       source_level: sourceUnit ? levelFor(sourceUnit, cards, state) : null,
       controller_symbol_colors: symbolColorsPresent(symbols),
     };
-    return resistanceBlocks(row.resist, effect.kind,
+    return resistanceBlocks(row.resist, resistanceEffectKind(effect),
       source ? (source.card_type ?? null) : null,
       source ? [...(source.colors || [])].sort() : null,
       source ? (source.cost ?? null) : null, context,
@@ -13043,6 +13148,9 @@
       suppresses_deck_protection: row => suppressesDeckProtection(state, cards, row),
       deck_discard_caps: (opponent, shared = false, sourceType = null, ownEffect = false) => deckDiscardCaps(state, cards, opponent, shared, sourceType, ownEffect),
       trash_effect_locks: (shared = false) => trashEffectLocks(state, cards, shared),
+      // 相手の効果でトラッシュの札を除外する口と、除外する札・破壊した体の選び方(T148)。
+      exile_trash: (amount, source = {}) => combatExileTrash(state, cards, amount, source),
+      trash_reuse: (cardNo) => trashReuseValue(cards, cardNo),
       summon_condition_context: () => ({main_step: Boolean(state.ownMainActive),
         restrictions: activeSummonWitnessRestrictions(state, cards)}),
       discard_deck: (count, opponent, sourceNo, sourceType = null, sourceUid = null) => discardOpponentDeck(state, cards, targets, count, opponent, sourceNo, sourceType, sourceUid),
@@ -13274,7 +13382,8 @@
         return battleLossRole(state, cards, unit);
       },
       // `byOpponent`は「相手による」破壊か(Python `_combat_destroy`と同一)。偽は反射したUの自分の効果だけ。
-      destroy: (uid, cause, opponent = null, deferLeave = false, byOpponent = true) => {
+      // `destination`は破壊した札の行き先。「この効果で破壊した対象を除外する」(T148)は"excluded"。
+      destroy: (uid, cause, opponent = null, deferLeave = false, byOpponent = true, destination = "trash") => {
         const unit = state.field.find((row) => row.uid === uid);
         if (!unit || unit.waiting || unit.destroying
             || (cause === "effect" && unit.battle_destroy_pending)) return null;
@@ -13303,9 +13412,9 @@
           const unit = state.field.find(row => row.uid === uid);
           if (!unit || (deferLeave && !unit.battle_destroy_pending)) return "other";
           delete unit.battle_destroy_pending;
-          const destination = finalizeFieldLeave(state, cards, unit, cause);
+          const landed = finalizeFieldLeave(state, cards, unit, cause, destination);
           // 下の札/煌臨元の破棄では、本体の「破壊後」を成立させない。
-          return destination === "trash" ? "trash" : "other";
+          return landed === "trash" ? "trash" : "other";
         };
         return deferLeave ? finish : finish();
       },
