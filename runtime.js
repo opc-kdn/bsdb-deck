@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v301-v1";
-  const STAGE_VERSION = "v301";
+  const ENGINE_SLICE = "stage4-v302-v1";
+  const STAGE_VERSION = "v302";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v301-portable-v245";
+  const RUNTIME_VERSION = "stage4-v302-portable-v246";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -2928,6 +2928,8 @@
     const bonus = effect.payment_bonus;
     const result = {...effect};
     delete result.payment_bonus;
+    // 対価で耐性を貫く(T144-U)。節の貫通に足す。
+    if (bonus.pierce) result.pierce = [...(effect.pierce || []), ...bonus.pierce];
     if (bonus.reveal) result.reveal = effect.reveal + bonus.reveal;
     if (bonus.amount) {
       result.amount = effect.amount + bonus.amount;
@@ -6511,8 +6513,10 @@
     // （判定側で払うと、投機的な見積もりが資源を溶かす）。Python同一。
     if (!payClausePayment(state, cards, targets, effect, sourceUid)) return false;
     // 対価で同じ効果の枚数を増やす文(OMB、BS74-002)。オープンより前に払う(公式Q)。
-    // 方針は節の対価と同じく「払えるなら払う」。山札が無ければ払わない。Python同一。
-    if (effect.payment_bonus && state.deck.length) {
+    // 方針は節の対価と同じく「払えるなら払う」。山札が無ければ払わない。対価で耐性を貫く文
+    // (T144-U)は、貫いて選ぶ対象が変わるときだけ払う。Python同一。
+    if (effect.payment_bonus && (effect.payment_bonus.pierce
+      ? pierceBonusGains(state, cards, effect, sourceUid) : state.deck.length)) {
       const paid = {payment: effect.payment_bonus.payment, source_card_no: effect.source_card_no};
       if (paymentPlan(state, cards, targets, paid, sourceUid) !== null
           && payClausePayment(state, cards, targets, paid, sourceUid)) {
@@ -7172,7 +7176,7 @@
       // 「BP合計Nまで好きなだけ」(`target_total`)は合計の上限で組を選ぶ(Python同一)。
       const picked = effect.target_all ? rows
         : effect.target_total ? selectTotalCappedTargets(
-          rows, effect.target_total.stat, effect.target_total.cap)
+          rows, effect.target_total.stat, effect.target_total.cap, effect.target_total.limit)
         : smartBounce ? selectBounceTargets(
         rows, amount, effect.bounce_destination || "hand", {
           ownLife: state.life,
@@ -10337,6 +10341,34 @@
     return output;
   }
 
+  /** この節が今選ぶ対象(T144-U)。Python `_pierce_bonus_targets`と同一。 */
+  function pierceBonusTargets(state, cards, effect, sourceUid) {
+    const board = state.combatOpponent;
+    if (!board) return [];
+    if (effect.kind === "creator_core_remove") {
+      const rows = board.field().filter((row) => row.creator_nexus && row.cores > 0
+        && !resisted(state, cards, row, effect, sourceUid));
+      return planCreatorCoreRemoval(rows, effect.amount ?? null, effect.scope || "one")
+        .map(([uid, count]) => `${uid}:${count}`);
+    }
+    const picked = [];
+    for (const group of effect.target_groups || [effect]) {
+      const part = {...effect, ...group};
+      for (const row of limitTargetRows(combatTargetRows(state, cards, part, sourceUid), part)) {
+        picked.push(row.uid);
+      }
+    }
+    return picked;
+  }
+
+  /** 対価で耐性を貫く上乗せ(T144-U)を払う値打ちがあるか: 貫くと選ぶ対象が変わる。
+   *  Python `_pierce_bonus_gains`と同一。 */
+  function pierceBonusGains(state, cards, effect, sourceUid) {
+    const before = pierceBonusTargets(state, cards, effect, sourceUid);
+    const after = pierceBonusTargets(state, cards, applyPaymentBonus(effect), sourceUid);
+    return before.length !== after.length || before.some((value, index) => value !== after[index]);
+  }
+
   /** 撃つ対象を、絞りに合う並びから切り出す。「すべて」(`target_all`)は全部、「合計Nまで」
    *  (`target_total`)は合計の上限で選んだ組、ほかは`amount`体。Python `_combat_pick_targets`
    *  の`limit`と同一。⚠️ 2026-10-11まで「除去を残すか」(`removalHoldPlan`)だけが`amount`で
@@ -10344,7 +10376,8 @@
   function limitTargetRows(rows, effect, amount = effect.amount) {
     if (effect.target_all) return rows;
     if (effect.target_total) {
-      return selectTotalCappedTargets(rows, effect.target_total.stat, effect.target_total.cap);
+      return selectTotalCappedTargets(rows, effect.target_total.stat, effect.target_total.cap,
+        effect.target_total.limit);
     }
     return rows.slice(0, amount);
   }
@@ -10368,9 +10401,11 @@
   /** 「BP合計Nまで好きなだけ」の組を選ぶ(2026-10-11)。Python
    *  `select_total_capped_targets`と同一——シンボル数→体数→BP→コストの大きい順、
    *  同じならuidの小さい組。候補は並び順の上位12体。 */
-  function selectTotalCappedTargets(rows, stat, cap) {
-    const key = { bp: "bp", cost: "cost", level: "level" }[stat];
+  /** 「シンボル合計3つまで…2つまで」(T144-U)は`limit`で体数も縛る。Python同一。 */
+  function selectTotalCappedTargets(rows, stat, cap, limit = null) {
+    const key = { bp: "bp", cost: "cost", level: "level", symbol_count: "symbol_count" }[stat];
     const pool = [...rows].slice(0, 12);
+    const maxSize = Math.min(pool.length, limit ?? pool.length);
     let best = [];
     let bestRank = null;
     const compare = (left, right) => {
@@ -10389,7 +10424,7 @@
       }
       return 0;
     };
-    for (let size = 1; size <= pool.length; size += 1) {
+    for (let size = 1; size <= maxSize; size += 1) {
       for (const picked of rowCombinations(pool, size)) {
         if (picked.reduce((sum, row) => sum + (row[key] || 0), 0) > cap) continue;
         const rank = [
