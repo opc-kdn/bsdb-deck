@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v304-v1";
-  const STAGE_VERSION = "v304";
+  const ENGINE_SLICE = "stage4-v305-v1";
+  const STAGE_VERSION = "v305";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v304-portable-v248";
+  const RUNTIME_VERSION = "stage4-v305-portable-v249";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -871,6 +871,64 @@
   const PENDING_HAND_NOTIFICATIONS = new WeakMap();
   const NOTIFICATION_TRIAL_DEPTHS = new WeakMap();
   const TRACE_RECORD_OBSERVERS = new WeakMap();
+  // T149: 相手の効果で自分の体が場を離れた合図(Stage6が置く)。Python `field_leave_observer`。
+  const FIELD_LEAVE_OBSERVERS = new WeakMap();
+
+  function notificationsQuiet(state) {
+    return Boolean(state.burstEventContext?.preview || NOTIFICATION_TRIAL_DEPTHS.get(state));
+  }
+
+  /** 相手の盤面で起きた出来事の合図を、この盤面の効果の完了で配る(T149)。
+   *  手札が増えた合図と同じ列・同じ配る位置(T130で一緒に動く)。Python `_defer_effect_notification`。 */
+  function deferEffectNotification(state, callback) {
+    if (notificationsQuiet(state)) return false;
+    const pending = PENDING_HAND_NOTIFICATIONS.get(state) || [];
+    pending.push(callback);
+    PENDING_HAND_NOTIFICATIONS.set(state, pending);
+    return true;
+  }
+
+  function deliverEffectNotification(state, item) {
+    if (typeof item === "function") {
+      if (!notificationsQuiet(state)) item();
+    } else notifyEffectHandIncrease(state, item);
+  }
+
+  function leaveSubjectType(state, cards, unit) {
+    if (!unit) return null;
+    return unit.brave_mode === "spirit" ? "スピリット" : (unitInfo(state, cards, unit).card_type || "");
+  }
+
+  /** セット中バーストの印字が、この離れ方で開けるか(T149)。Python `_leave_burst_reach`。 */
+  function leaveBurstReach(state, cards, subjectType, how) {
+    if (!state.burst || !subjectType) return null;
+    let reach = null;
+    for (const scope of cards[state.burst]?.burst_leave_scopes || []) {
+      if (!scope.target_types.some((kind) => subjectType.includes(kind))) continue;
+      if (scope.condition === BURST_OWN_DESTROYED) {
+        if (how === "destroy" || (how === "vanish" && !scope.destroy_only)) return "trash";
+      } else if (scope.condition === BURST_OWN_LEFT_FIELD) reach = "other";
+    }
+    return reach;
+  }
+
+  /** 相手の効果で自分の体が場を離れた。開けるバーストがあればStage6へ知らせる(T149)。
+   *  Python `_announce_opponent_effect_leave`。 */
+  function announceOpponentEffectLeave(state, cards, subjectType, how, landed) {
+    const observer = FIELD_LEAVE_OBSERVERS.get(state);
+    if (!observer || landed === null || landed === undefined || landed === false
+      || landed === "soul" || notificationsQuiet(state)) return;
+    const reach = leaveBurstReach(state, cards, subjectType, landed === "trash" ? how : "other");
+    if (reach !== null) observer(reach);
+  }
+
+  /** 相手の効果で場を離れる体を離し、持ち主のバーストへ知らせる。Python `_finalize_opponent_effect_leave`。 */
+  function finalizeOpponentEffectLeave(state, cards, unit, how, destination = "trash") {
+    const subjectType = state.field.includes(unit) ? leaveSubjectType(state, cards, unit) : null;
+    const landed = finalizeFieldLeave(state, cards, unit, "effect", destination);
+    announceOpponentEffectLeave(state, cards, subjectType, how, landed);
+    return landed;
+  }
 
   function executeDestroyEffect(state, run) {
     state.destroyEffectScopes.push(new Set());
@@ -5384,7 +5442,7 @@
     if (type === "effect_complete" && !HAND_EFFECT_SCOPES.get(state)?.length) {
       const pending = PENDING_HAND_NOTIFICATIONS.get(state) || [];
       PENDING_HAND_NOTIFICATIONS.delete(state);
-      for (const amount of pending) notifyEffectHandIncrease(state, amount);
+      for (const amount of pending) deliverEffectNotification(state, amount);
     }
   }
 
@@ -12843,7 +12901,7 @@
           if (unit.cores < unitFloor(state, cards, unit)) {
             const completeLeave = () => {
               notifyOwnRemovedByOpponentEffect(state,cards,targets,unit,opponent);
-              finalizeFieldLeave(state,cards,unit,"effect");
+              finalizeOpponentEffectLeave(state,cards,unit,"vanish");
             };
             if (opponent?.defer_field_leave) {
               unit.waiting = true;
@@ -12912,7 +12970,7 @@
           destination, reason: "unit_core_remove", source_uid: uid });
         if (unit.cores < unitFloor(state, cards, unit)) {
           notifyOwnRemovedByOpponentEffect(state,cards,targets,unit);
-          finalizeFieldLeave(state, cards, unit, "effect");
+          finalizeOpponentEffectLeave(state, cards, unit, "vanish");
           if (onVanish) onVanish();
         }
         settleBraveCapacity(state,cards,traceMark);
@@ -13052,7 +13110,8 @@
       bounce: (uid, destination) => {
         const unit = state.field.find((row) => row.uid === uid);
         if (!unit) return false;
-        return finalizeFieldLeave(state, cards, unit, "effect", destination);
+        // 「相手の効果で…消滅/破壊されたとき」は戻す・除外では起きない。離脱後のバーストだけ(T149)。
+        return finalizeOpponentEffectLeave(state, cards, unit, "other", destination);
       },
       // 手札へ返した公開カードを次ターンに払い直せるか、配置/召喚時効果を
       // 再利用できるか。相手の実手札は見ない。Python `_combat_bounce_reuse_risk`同一。
@@ -13122,7 +13181,7 @@
           reason: "soul_core_remove", source_uid: holder === "reserve" ? null : holder });
         if (unit && unit.cores < unitFloor(state, cards, unit)) {
           notifyOwnRemovedByOpponentEffect(state,cards,targets,unit);
-          finalizeFieldLeave(state, cards, unit, "effect");
+          finalizeOpponentEffectLeave(state, cards, unit, "vanish");
         }
         return true;
       },
@@ -13412,7 +13471,10 @@
           const unit = state.field.find(row => row.uid === uid);
           if (!unit || (deferLeave && !unit.battle_destroy_pending)) return "other";
           delete unit.battle_destroy_pending;
+          const subjectType = leaveSubjectType(state, cards, unit);
           const landed = finalizeFieldLeave(state, cards, unit, cause, destination);
+          // 戦闘の破壊はStage6が開く。ここは相手の効果の破壊(T149、Python同一)。
+          if (cause === "effect" && byOpponent) announceOpponentEffectLeave(state, cards, subjectType, "destroy", landed);
           // 下の札/煌臨元の破棄では、本体の「破壊後」を成立させない。
           return landed === "trash" ? "trash" : "other";
         };
@@ -13521,6 +13583,9 @@
       // ここはルールの層で、呼ばれたら開く。開くかどうかはStage6
       // (`burstOpenDecision`)が比べてから呼ぶ(2026-10-11)。
       set_effect_hand_observer: (observer) => EFFECT_HAND_OBSERVERS.set(state, observer),
+      // T149: 相手の効果で自分の体が場を離れた合図と、離した側の効果の完了で配る口(Python同名)。
+      set_field_leave_observer: (observer) => FIELD_LEAVE_OBSERVERS.set(state, observer),
+      defer_effect_notification: (callback) => deferEffectNotification(state, callback),
       trigger_burst: (category, opponent, eventContext = null) => {
         const cardNo = state.burst;
         if (!cardNo) return null;
@@ -17089,6 +17154,19 @@
           openBurst((kind, who, details) => emit(kind, who, details, phase), owner,
             runners[owner].board, "相手手札増加後", runners[playerId].board,
             { ownTurn: currentActor === owner, eventContext: { hand_increased: amount } });
+        });
+        // T149: 相手の効果で自分の体が場を離れた。離した側の効果の完了で開く(Python `unit_left`)。
+        board.set_field_leave_observer((reached) => {
+          const owner = playerId;
+          const source = otherPlayer(owner);
+          runners[source].board.defer_effect_notification(() => {
+            const step = [...runners[currentActor].board.events()].reverse()
+              .find((event) => event.type.startsWith("step_"))?.type || "step_main";
+            const phase = step.startsWith("step_attack") ? "attack" : step === "step_end" ? "end" : step === "step_refresh" ? "refresh" : "main";
+            flushExternalMainEvents(source, phase);
+            burstAfterFieldLeave((kind, who, details) => emit(kind, who, details, phase), owner,
+              runners[owner].board, reached, runners[source].board, currentActor === owner);
+          });
         });
       }
     }
