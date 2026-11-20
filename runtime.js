@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v302-v1";
-  const STAGE_VERSION = "v302";
+  const ENGINE_SLICE = "stage4-v303-v1";
+  const STAGE_VERSION = "v303";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v302-portable-v246";
+  const RUNTIME_VERSION = "stage4-v303-portable-v247";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3437,6 +3437,7 @@
     state.hand.forEach((cardNo, handIndex) => {
       if (seen.has(cardNo)) return;
       seen.add(cardNo);
+      if (!handUseAllowed(state, cards, cardNo)) return;
       const card = cards[cardNo];
       if (!card || !(card.kourin_kind || card.has_kourin)) return;
       if ((isSealedKourin(card) || card.kourin_kind === "超契約") && state.sealedKourinNames.has(card.name)) return;
@@ -3594,6 +3595,7 @@
     if (state.mirage) sources.push([-1, state.mirage, "mirage"]);
     const options = [];
     for (const [index, cardNo, zone] of sources) {
+      if (zone === "hand" && !handUseAllowed(state, cards, cardNo)) continue;
       const card = cards[cardNo];
       const route = (card?.soul_flash_summons || []).find((row) =>
         row.source_zone === zone && windows.includes(row.window));
@@ -3621,6 +3623,7 @@
 
   /** T144-S: 対価を払い、コスト0で召喚する。Python `_combat_play_soul_flash_summon`と同一。 */
   function playSoulFlashSummon(state, cards, targets, cardNo, sourceZone, side, opponent = null) {
+    if (sourceZone === "hand" && !handUseAllowed(state, cards, cardNo, opponent)) return null;
     const option = soulFlashSummonOptions(state, cards, targets, side).find((row) =>
       row.card_no === cardNo && row.source_zone === sourceZone);
     if (!option) return null;
@@ -3700,6 +3703,7 @@
     const options = [], seen = new Set();
     const pool = [...state.hand, ...sidePool(state,cards,"manifestation")];
     pool.forEach((cardNo, handIndex) => {
+      if (!cardUseAllowed(state, cards, cardNo, "manifestation")) return;
       const card = cards[cardNo];
       if (seen.has(cardNo) || !card?.manifestation_flash_ready
           || !windows.includes(card.manifestation_timing)
@@ -3953,7 +3957,7 @@
   /** 手札のフラッシュのマジックを1枚撃つ(除去・付与の共通)。Python
    *  `_combat_play_flash_removal_unchecked`と同一。 */
   function playFlashMagic(state, cards, targets, cardNo, opponent, prefer) {
-    if (!opponent) return null;
+    if (!opponent || !cardUseAllowed(state, cards, cardNo, "use", opponent)) return null;
     const card = cards[cardNo];
     const cost = paymentForState(state, cards, card);
     const previous = [state.combatOpponent || null, MAIN_STEP_OPPONENTS.get(state),
@@ -3986,6 +3990,7 @@
     state.hand.forEach((cardNo, handIndex) => {
       if (seen.has(cardNo)) return;
       seen.add(cardNo);
+      if (!handUseAllowed(state, cards, cardNo)) return;
       const card = cards[cardNo];
       if (!card || card.card_type !== "マジック") return;
       const effects = [...(card.enablers || []).filter((effect) => effect.mode === "on_play"),
@@ -4010,6 +4015,7 @@
     state.hand.forEach((cardNo, handIndex) => {
       if (seen.has(cardNo)) return;
       seen.add(cardNo);
+      if (!cardUseAllowed(state, cards, cardNo)) return;
       const card = cards[cardNo];
       if (!card || card.card_type !== "マジック") return;
       const effects = [...(card.enablers || []).filter((effect) => effect.mode === "on_play"),
@@ -4449,6 +4455,7 @@
     if (manifestationWaiverAvailable(state, card)
         && manifestationPossible(state, cards, creator, maintenance, allowSacrifice, true)) {
       for (const [zone, pool] of [["side", state.sideCards], ["hand", state.hand]]) {
+        if (zone === "hand" && !handUseAllowed(state, cards, cardNo)) continue;
         if (card.manifestation_soul_waiver.zones.includes(zone) && pool.includes(cardNo)) {
           options.push({soul_payment: "waived", source_zone: zone});
         }
@@ -4456,7 +4463,7 @@
     }
     const sidePaid = state.sideCards.includes(cardNo)
       && sidePermissions(state, cards, cardNo).has("manifestation");
-    if ((sidePaid || state.hand.includes(cardNo))
+    if ((sidePaid || state.hand.includes(cardNo) && handUseAllowed(state, cards, cardNo))
         && manifestationPossible(state, cards, creator, maintenance, allowSacrifice)) {
       options.push({soul_payment: "paid", source_zone: sidePaid ? "side" : "hand"});
     }
@@ -4564,13 +4571,50 @@
       .sort((left, right) => left.uid - right.uid);
   }
 
-  function doubleDriveHostsMatch(state, cards, brave, slot) {
-    return !brave.waiting && brave.brave_mode === "combine" && ["left", "right"].every(side => {
+  function doubleDriveHostsMatch(state, cards, brave, slot, continuous = false) {
+    return (continuous || !brave.waiting) && brave.brave_mode === "combine" && ["left", "right"].every(side => {
       const host = state.field.find(unit => unit.uid === brave.combined_sides?.[side]
-        && !unit.waiting && !unit.battle_destroy_pending);
+        && (continuous || !unit.waiting && !unit.battle_destroy_pending));
       const card = host && unitInfo(state, cards, host);
       return card?.card_type.includes("スピリット") && cardMatchesSlot(card, slot);
     });
+  }
+
+  function handUseLocks(state, cards) {
+    return state.field.flatMap(unit => {
+      const card = unitInfo(state, cards, unit);
+      const rule = card?.double_drive_hand_lock;
+      if (!rule || state.count < rule.count_min
+          || !doubleDriveHostsMatch(state, cards, unit, rule.double_drive_host_slot, true)) return [];
+      if (!Object.values(unit.combined_sides || {}).some(hostUid =>
+        unitInfo(state, cards, unit, hostUid)?.double_drive_hand_lock)) return [];
+      const bypass = state.ownAttackActive && state.field.some(source => {
+        const sourceCard = unitInfo(state, cards, source);
+        const guard = sourceCard?.double_drive_magic_bypass;
+        return guard && card.name.includes(guard.source_name_contains)
+          && levelFor(source, cards, state) >= guard.required_level;
+      });
+      return [{ ignore_magic_protection: !!bypass }];
+    });
+  }
+
+  function handUseAllowed(state, cards, cardNo, opponent = null) {
+    opponent = opponent || state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
+    if (!opponent?.hand_use_locks) return true;
+    const card = cards[cardNo];
+    return opponent.hand_use_locks().every(lock => {
+      const ignored = lock.ignore_magic_protection ? ["マジック"] : [];
+      return card.hand_effect_immune && !ignored.includes(card.card_type)
+        || card.hand_use_immune || combatBoard(state, cards, new Set()).hand_protected(opponent, ignored);
+    });
+  }
+
+  function cardUseAllowed(state, cards, cardNo, action = "use", opponent = null) {
+    return state.sideCards.includes(cardNo) && sidePermissions(state, cards, cardNo).has(action)
+      || action === "manifestation" && state.sideCards.includes(cardNo)
+        && manifestationWaiverAvailable(state, cards[cardNo])
+        && cards[cardNo].manifestation_soul_waiver.zones.includes("side")
+      || handUseAllowed(state, cards, cardNo, opponent);
   }
 
   function activeDoubleDriveFollowups(state, cards, uid) {
@@ -5106,9 +5150,12 @@
       .forEach((cardNo, handIndex) => {
       if ((only && !only.has(cardNo)) || seen.has(cardNo)) return;
       seen.add(cardNo);
+      const handAvailable = handIndex < handSize && handUseAllowed(state, cards, cardNo);
+      if (handIndex < handSize && !handAvailable
+          && !["use", "kourin", "manifestation"].some(action => cardUseAllowed(state, cards, cardNo, action))) return;
       const card = cards[cardNo];
       if (!card) return;
-      const allowed = handIndex < handSize ? null : sidePermissions(state, cards, cardNo);
+      const allowed = handAvailable ? null : sidePermissions(state, cards, cardNo);
       const may = (action) => allowed === null || allowed.has(action);
       if ((isSealedKourin(card) || card.kourin_kind === "超契約") && state.sealedKourinNames.has(card.name)) return;
       const allowSacrifice = accessTier(cardNo, cards, targets) <= 1;
@@ -8203,6 +8250,7 @@
    *  過ぎているのでトラッシュへ(Q27519)。発動したらセット中のバーストと同じ解き方。 */
   function resolveHandCountReactions(state,cards,targets,payload,event='count_increased',candidates=null) {
       for (const cardNo of (candidates || [...state.hand])) {
+        if (!handUseAllowed(state, cards, cardNo)) continue;
         const card = cards[cardNo];
         const reaction = (card?.[event==='soul_core_to_count'?'hand_soul_count_reactions':'hand_count_reactions'] || []).find((row) =>
           row.event === event && (event!=='count_increased' || requirementMet(row, payload.new_count)));
@@ -9757,6 +9805,10 @@
   }
 
   function play(state, cards, targets, candidate) {
+    const action = ["kourin", "kourin_from_soul"].includes(candidate.mode) ? "kourin"
+      : candidate.manifestation_creator_uid != null ? "manifestation" : "use";
+    if (!candidate.source_zone_name && !candidate.source_zone
+        && !cardUseAllowed(state, cards, candidate.card_no, action)) return null;
     if (candidate.mode === "kourin") return playKourin(state, cards, targets, candidate);
     if (candidate.mode === "kourin_from_soul") {
       return playKourinFromSoul(state, cards, targets, candidate);
@@ -10104,6 +10156,7 @@
   }
 
   function performMirageSet(state, cards, targets, cardNo) {
+    if (!cardUseAllowed(state, cards, cardNo, "mirage_set")) return false;
     const card = cards[cardNo];
     const total = card?.mirage_cost;
     // 手札から。カードが許していれば手元から(v66、`side_grants`)。旧ミラージュは
@@ -10671,6 +10724,7 @@
     if (state.speculative) return false;
     for (const [zone, pile] of [["hand", state.hand], ["trash", state.trashCards]]) {
       for (const cardNo of [...new Set(pile)]) {
+        if (zone === "hand" && !handUseAllowed(state, cards, cardNo)) continue;
         const card = cards[cardNo];
         const route = card?.creator_core_summon;
         if (!route || route.source_zone !== zone) continue;
@@ -12474,6 +12528,7 @@
     if (resolveDeckDiscardInterrupt(state,cards,targets,opponent,sourceType,sourceUid)) return 0;
     for (const [zoneName, zone] of [["hand", state.hand], ["trash", state.trashCards]]) {
       for (const no of [...zone]) {
+        if (zoneName === "hand" && !handUseAllowed(state, cards, no, opponent)) continue;
         const reaction = cards[no]?.deck_discard_response;
         if (reaction?.kind !== "paid_summon" || !reaction.zones.includes(zoneName)) continue;
         if (zoneName === "trash" && !trashEffectAllowed(state, cards, no, opponent)) continue;
@@ -12498,6 +12553,7 @@
     }
     for (const no of [...state.hand]) {
       const reaction = cards[no]?.deck_discard_response;
+      if (!handUseAllowed(state, cards, no, opponent)) continue;
       if (!reaction?.zones.includes("hand")) continue;
       if (reaction.kind === "discard") {
         state.hand.splice(state.hand.indexOf(no), 1); state.trashCards.push(no);
@@ -12601,6 +12657,7 @@
         for (const no of [...state.hand]) {
           const card = cards[no];
           if (card.target_redirect?.kind !== "shadow") continue;
+          if (!handUseAllowed(state, cards, no, opponent)) continue;
           const cost = paymentForState(state, cards, card, "hand");
           const plan = effectSummonPlan(state, cards, no, cost.pay);
           if (!plan) continue;
@@ -12699,6 +12756,7 @@
         .map((row) => [...(unitInfo(state, cards, row)?.colors || [])].sort()),
       // 6C-3: 相手盤面の公開情報の要約を受け取る口。メインステップの方針
       // (バーストのためにコアを残すか)が読む。Python `_observe_opponent` と同一。
+      bind_opponent: opponentBoard => MAIN_STEP_OPPONENTS.set(state, opponentBoard),
       observe_opponent: (summary, opponentBoard = null) => {
         state.opponentView = summary ? { ...summary } : null;
         if (opponentBoard) MAIN_STEP_OPPONENTS.set(state, opponentBoard);
@@ -13023,9 +13081,12 @@
         return true;
       },
       hand_card_cost: (cardNo) => handCostInfo(state, cards, cards[cardNo], "hand").cost,
-      hand_protected: (opponent = null) => {
+      hand_use_locks: () => handUseLocks(state, cards),
+      hand_use_allowed: (cardNo, opponent = null) => handUseAllowed(state, cards, cardNo, opponent),
+      hand_protected: (opponent = null, ignoredTypes = []) => {
         // 発揮元や合体先が待機中でも、待機前から発揮していた保護は続く(Q31511、T91)。
         return state.field.some((unit) => {
+          if (ignoredTypes.includes(unitInfo(state, cards, unit)?.card_type)) return false;
           const guard = unitInfo(state, cards, unit)?.counter_hand_protection;
           if (!guard || (guard.hand_max != null && state.hand.length > guard.hand_max)) return false;
           if (guard.field_slot && !board.has_field_card(guard.field_slot.alternatives)) return false;
@@ -13102,6 +13163,7 @@
         if (forbidden && !board.hand_protected(opponent)) return null;
         const colors = new Set(hits.flatMap((row) => row.colors || []));
         for (const cardNo of [...state.hand]) {
+          if (!handUseAllowed(state, cards, cardNo, opponent)) continue;
           const card = cards[cardNo] || {};
           const counter = card.trigger_counter;
           if (!counter) continue;
@@ -13414,6 +13476,7 @@
         const options = [];
         // 手元の札もマジックとして使えるなら並べる(v66、Python同一)。
         [...state.hand, ...sidePool(state, cards, "use")].forEach((cardNo, handIndex) => {
+          if (!cardUseAllowed(state, cards, cardNo)) return;
           const card = cards[cardNo] || {};
           for (const effect of card.flash_effects || []) {
             if (!flashCountMet(state, effect)) continue;
@@ -13435,6 +13498,7 @@
       // Stage6が起こす。同じカードの他の節は撃たない——印字より狭く撃つ側の
       // 読み落としで、窓を広げる前に足す。Python `_combat_play_flash` と同一。
       play_flash: (cardNo, effectId) => {
+        if (!cardUseAllowed(state, cards, cardNo)) return null;
         if (!state.hand.includes(cardNo)
             && !sidePool(state, cards, "use").includes(cardNo)) return null;
         const card = cards[cardNo] || {};
@@ -13533,6 +13597,7 @@
       play_soul_flash_summon: (cardNo, sourceZone, side, opponent = null) =>
         playSoulFlashSummon(state, cards, targets, cardNo, sourceZone, side, opponent),
       play_flash_manifestation: (cardNo,creatorUid,side,opponent=null,soulPayment=null,sourceZone=null) => {
+        if (!cardUseAllowed(state, cards, cardNo, "manifestation", opponent)) return null;
         const option=flashManifestationOptions(state,cards,side).find(row =>
           row.card_no===cardNo && row.creators.includes(creatorUid)
           && (soulPayment === null || row.soul_payment === soulPayment)
@@ -13559,6 +13624,7 @@
           ...(option.source_zone ? {source_zone:option.source_zone} : {})};
       },
       play_flash_kourin: (cardNo, hostUid, side, opponent = null) => {
+        if (!handUseAllowed(state, cards, cardNo, opponent)) return null;
         const option = flashKourinOptions(state, cards, side).find(
           (row) => row.card_no === cardNo && row.hosts.includes(hostUid));
         if (!option) return null;
@@ -14346,6 +14412,7 @@
       }
       const mirageChoices = [...state.hand, ...sidePool(state, cards, "mirage_set")]
         .filter((cardNo) => {
+        if (!cardUseAllowed(state, cards, cardNo, "mirage_set")) return false;
         const card = cards[cardNo];
         return card?.mirage_cost !== null && card?.mirage_cost !== undefined
           && (card.enablers || []).some((effect) => effect.mode === "on_set"
@@ -16386,6 +16453,10 @@
     // ⓪ 分母はステップの入口で1度だけ測る（このステップのあいだ手札は動かない）。
     const attackerBoard = boards[actor];
     const defenderBoard = boards[defenderId];
+    // The defender may not have reached its first Main Step yet.
+    for (const [board, other] of [[attackerBoard, defenderBoard], [defenderBoard, attackerBoard]]) {
+      board.bind_opponent?.(other);
+    }
     // **〔ターンに1回〕の数え直しはここではない**(ユーザー裁定、Python同一)。
     // 切り替わるのはエンドステップで、両者ぶんをターン境界がまとめて叩く。
     // 窓を渡す代償は**ステップの入口で1度だけ**測る(Python同一)。
