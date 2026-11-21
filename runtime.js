@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v306-v1";
-  const STAGE_VERSION = "v306";
+  const ENGINE_SLICE = "stage4-v307-v1";
+  const STAGE_VERSION = "v307";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v306-portable-v250";
+  const RUNTIME_VERSION = "stage4-v307-portable-v251";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -973,7 +973,7 @@
     "self_remain",
     "attack_step_end", "timed_attack_life_cap",
     "effect_text_grant", "register_effect_grant",
-    "draw", "coreboost", "self_coreboost", "self_core_move", "trash_core_return", "field_coreboost", "count_gain", "symbol_grant", "symbol_fix", "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_level_treat", "ally_level_treat", "unit_suppress", "life_core_gain", "u_trigger_invoke", "self_refresh", "ally_refresh", "guard_battle_refresh", "block_restriction", "force_block", "attack_ban", "u_trigger_step", "attack_step_lock", "extra_refresh_step",
+    "draw", "coreboost", "self_coreboost", "self_core_move", "trash_core_return", "field_coreboost", "count_gain", "symbol_grant", "symbol_fix", "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_level_treat", "ally_level_treat", "unit_suppress", "life_core_gain", "u_trigger_invoke", "self_refresh", "ally_refresh", "guard_battle_refresh", "block_restriction", "force_block", "designate_attack", "attack_ban", "u_trigger_step", "attack_step_lock", "extra_refresh_step",
     "search", "recover", "self_recover", "side_recover", "stash_top", "opponent_deck_discard",
     "oracle_mill", "oracle_pickup", "oracle_watch", "deck_discard_draw",
     "hand_filter", "core_to_trash", "life_core_move", "token_spawn",
@@ -4709,6 +4709,68 @@
       && (condition.cost_max == null || row.cost <= condition.cost_max));
   }
 
+  /** 指定アタックの出どころ＝アタックしている体(設計C4)。Python `_designation_source`同一。 */
+  function designationSource(state, cards, unit, pierce) {
+    const card = unitInfo(state, cards, unit) || {};
+    const colors = new Set(card.colors || []);
+    for (const brave of combinedBraves(state, unit.uid)) {
+      for (const color of (unitInfo(state, cards, brave) || {}).colors || []) colors.add(color);
+    }
+    return {source_type: card.card_type, source_colors: [...colors].sort(),
+      source_cost: card.cost || 0,
+      context: {own_turn: state.ownTurnActive, source_level: levelFor(unit, cards, state),
+        source_has_soul: Boolean(unit.soul_core),
+        controller_symbol_colors: symbolColorsPresent(effectiveSymbols(state, cards))},
+      pierce: pierce.map((row) => ({...row}))};
+  }
+
+  /** 預かった指定アタックの節から1体を選ぶ(T28-TARGET TGT-1)。Python
+   *  `_resolve_pending_designation`同一。 */
+  function resolvePendingDesignation(state, cards, uid, opponent) {
+    const entries = [...(state.pendingDesignations || [])];
+    state.pendingDesignations = [];
+    const unit = state.field.find((row) => row.uid === uid);
+    if (!entries.length || !unit || unit.waiting || !opponent) return;
+    const previous = state.combatOpponent;
+    state.combatOpponent = opponent;
+    try {
+      const attacker = combatUnitRow(state, cards, unit);
+      const battleUnits = opponent.units();
+      const battleUids = new Set(battleUnits.map((row) => row.uid));
+      const found = entries.map((effect) => {
+        const source = designationSource(state, cards, unit, activePierces(state, cards, effect, unit));
+        const rows = combatTargetRows(state, cards, {...effect, amount: 1, pierce: [{}]}, uid)
+          .filter((row) => battleUids.has(row.uid) && blockerCanBlock(attacker, row)
+            && !resistanceBlocks(row.resist || [], "designate_attack", source.source_type,
+              source.source_colors, source.source_cost, source.context, source.pierce));
+        return {effect, source, rows};
+      });
+      const pool = new Map();
+      for (const {rows} of found) for (const row of rows) if (!pool.has(row.uid)) pool.set(row.uid, row);
+      const ready = battleUnits.filter((row) => !row.exhausted && blockerCanBlock(attacker, row));
+      const winners = [...pool.values()].filter((row) => attacker.bp > row.bp);
+      if (!winners.length || (!ready.length && opponent.life() <= attacker.symbol_count)) return;
+      const key = (row) => [row.cost ?? 0, row.bp, -row.uid];
+      const target = winners.reduce((best, row) => {
+        const [a, b] = [key(row), key(best)];
+        for (let i = 0; i < 3; i += 1) if (a[i] !== b[i]) return a[i] > b[i] ? row : best;
+        return best;
+      });
+      const chosen = found.filter(({rows}) => rows.some((row) => row.uid === target.uid));
+      const pierce = [];
+      for (const {source} of chosen) for (const row of source.pierce) {
+        if (!pierce.some((seen) => JSON.stringify(seen) === JSON.stringify(row))) pierce.push(row);
+      }
+      unit.designation = {target_uid: target.uid, effect_ids: chosen.map(({effect}) => effect.effect_id),
+        source: {...chosen[0].source, pierce}};
+      record(state, cards, "designation_declared", {card_no: unit.card_no, uid,
+        target_uid: target.uid, target_card_no: target.card_no ?? null,
+        effect_ids: chosen.map(({effect}) => effect.effect_id), reason: "favorable_battle"});
+    } finally {
+      state.combatOpponent = previous;
+    }
+  }
+
   function combinedBraves(state, hostUid) {
     if (hostUid === null || hostUid === undefined) return [];
     return state.field
@@ -5085,7 +5147,7 @@
   function clearBraveReceivedEffects(unit) {
     for(const key of ['effects_suppressed_this_turn','level_cost_bonus','attack_forbidden_this_turn',
       'timed_symbol_fixes','forced_block_effect','block_restriction_effect','battle_blocker_types',
-      'bp_penalties','timed_symbol_grants','skip_next_refresh','u_reflected_battle'])delete unit[key];
+      'designation','bp_penalties','timed_symbol_grants','skip_next_refresh','u_reflected_battle'])delete unit[key];
   }
 
   function bravePlacementLegal(state,cards,brave,placement) {
@@ -6783,6 +6845,13 @@
       const unit = paymentSourceUnit(state, sourceUid);
       if (!unit) return false;
       unit.forced_block_effect = effect.effect_id;
+      return true;
+    }
+    // 指定アタック(T28-TARGET)。窓の最後に1体を選ぶので、ここでは節を預かるだけ(Python同一)。
+    if (effect.kind === "designate_attack") {
+      if (state.uTargetContext?.reflected || state.attackingUid === null
+        || state.attackingUid === undefined || !state.combatOpponent) return false;
+      (state.pendingDesignations ||= []).push(effect);
       return true;
     }
     if (effect.kind === "unit_suppress") {
@@ -11500,6 +11569,9 @@
       ...activeResistances(state, cards, unit),
       ...(restriction && state.battleActive && state.attackingUid===unit.uid
         ? {block_restriction:{blocker_types:[...restriction.blocker_types]}} : {}),
+      // 指定アタック(T28-TARGET、Python `_combat_unit_row`同一)。指定したときだけ。
+      ...(unit.designation && state.battleActive && state.attackingUid === unit.uid
+        ? {designation:{target_uid:unit.designation.target_uid,...structuredClone(unit.designation.source)}} : {}),
       ...(force && state.battleActive && state.attackingUid === unit.uid ? {force_block:{
         source_type:card.card_type, source_colors:[...(card.colors || [])].sort(),
         source_cost:card.cost || 0, context:{own_turn:state.ownTurnActive,
@@ -13111,6 +13183,7 @@
           delete unit.u_reflected_battle;
           delete unit.forced_block_effect;
           delete unit.block_restriction_effect; delete unit.battle_blocker_types;
+          delete unit.designation;
           if (unit.bp_penalties) {
             unit.bp_penalties = unit.bp_penalties.filter((row) => row.scope !== "battle");
           }
@@ -13159,6 +13232,7 @@
         for (const unit of state.field) {
           delete unit.forced_block_effect;
           delete unit.block_restriction_effect; delete unit.battle_blocker_types;
+          delete unit.designation;
           if (unit.bp_penalties) unit.bp_penalties = [];
           delete unit.effects_suppressed_this_turn;
           if (unit.level_cost_bonus) unit.floor -= unit.level_cost_bonus;
@@ -14008,7 +14082,8 @@
       resolve_trigger: (uid, window, opponent, battleRole) => {
         const unit = state.field.find((row) => row.uid === uid);
         if (window === "attack") state.attackingUid = unit && !unit.waiting ? uid : null;
-        if (window === "attack" && unit) { delete unit.forced_block_effect; delete unit.block_restriction_effect; delete unit.battle_blocker_types; }
+        if (window === "attack" && unit) { delete unit.forced_block_effect; delete unit.block_restriction_effect; delete unit.battle_blocker_types; delete unit.designation; }
+        if (window === "attack") state.pendingDesignations = [];
         if (!unit || unit.waiting) return [];
         if (window === "attack" || window === "block") {
           state.battleActive = true;
@@ -14339,6 +14414,7 @@
         // 窓の中で撃ったアルティメットトリガーのヒット/ガードを配る(Python同一)。
         if (resolved.some(row => row.kind === "attack_step_end" && row.resolved)) {
           state.uTriggerEvents.length = 0;
+          state.pendingDesignations = [];
           return resolved;
         }
         dispatchUTriggerEvents(state, cards, targets, opponent);
@@ -14358,6 +14434,7 @@
             endEffectFrame(state);
           }
         }
+        if (window === "attack") resolvePendingDesignation(state, cards, uid, opponent || null);
         return resolved;
       },
       life: () => state.life,
@@ -14481,6 +14558,7 @@
       // このバトルでブロックされた自分の体と、アタック時に発揮して終わりまで遅らせた付与の節
       // [uid, 節, 出どころの札番号](T17-TRIG、SD69-RV002)。Python `battle_blocked`・`battle_delayed_grants`。
       battleBlocked: [],
+      pendingDesignations: [],
       battleDelayedGrants: [],
       // このバトルの自分の体が消滅/破壊されてトラッシュへ置かれた記録と、相打ちで待機中に
       // 窓を開いた体(T17-WIN)。Python `battle_losses`・`battle_losses_announced`。
@@ -15093,7 +15171,7 @@
     maxTeamMatching, namedTeamCount,
     opponentChoiceOrder,
     // アルティメットトリガーの区切りの縛り(テストがPythonと突き合わせる、2026-10-12)。
-    uHitGateMet, blockerCanBlock, forcedBlockerRows,
+    uHitGateMet, blockerCanBlock, forcedBlockerRows, resistanceBlocks,
     // バーストを開くかの比較(Stage6 `burstBoardRank`)も同じ公開盤面の物差し。
     publicStepDamage, UNREACHABLE_CLOCK,
     trialGoldenSignature, verifyGolden,
@@ -15195,6 +15273,7 @@
     "life_reduced_effects_resolved", "life_replacement_effects_resolved",
     // 守り手が相手のターンの『相手の〜ステップ』を撃った記録(2026-10-10、Python同一)。
     "opponent_step_effect_resolved",
+    "designation_invalidated",
   ]);
   const COMBAT_EVENT_TYPES = new Set([
     "attack_declared", "block_declared", "battle_resolved", "life_damaged",
@@ -15208,6 +15287,8 @@
     "life_reduced_effects_resolved", "life_replacement_effects_resolved",
     // 守り手が相手のターンの『相手の〜ステップ』を撃った記録(2026-10-10、Python同一)。
     "opponent_step_effect_resolved",
+    // 指定アタックがブロック宣言の時点で無効になった記録(T28-TARGET C6、Python同一)。
+    "designation_invalidated",
     // 6C-2: セット中バーストを実イベント(いまはライフ減少)で開いた記録。
     "burst_activated",
     // 開ける窓で、開かない盤面のほうが良いと比べて開かなかった記録(2026-10-11、
@@ -15259,6 +15340,8 @@
     // アタックの窓で付いた一時シンボル(2026-08-31)。
     "symbol_granted", "unit_refreshed", "unit_remained", "effects_suppressed", "attack_step_locked", "refresh_step_scheduled",
     "opponent_turn_end",
+    // アタック時に指定アタックで1体を指定した記録(T28-TARGET、Python同一)。
+    "designation_declared",
     // 自分のターンの『〜ステップ』の節を、そのステップで撃った記録(2026-10-10)。
     "step_effect",
     // ほかの札の「自分のスピリットがアタックしたとき」を撃った記録(2026-10-10)。
@@ -16729,6 +16812,26 @@
     return endsStep;
   }
 
+  /** 指定アタックをブロック宣言の時点で確かめ直す(T28-TARGET C6・C7・U1)。
+   *  Python `_designated_blocker`同一。 */
+  function designatedBlocker(emit, actor, attackerBoard, defenderBoard, uid) {
+    const fresh = attackerBoard.units().find((row) => row.uid === uid) || null;
+    const designation = fresh?.designation;
+    if (!designation) return null;
+    const target = defenderBoard.units().find((row) => row.uid === designation.target_uid) || null;
+    let cause = null;
+    if (!target) cause = "left";
+    else if (!Stage5PortableSimulation.blockerCanBlock(fresh, target)) cause = "unblockable";
+    else if (Stage5PortableSimulation.resistanceBlocks(target.resist || [], "designate_attack",
+      designation.source_type, designation.source_colors, designation.source_cost,
+      designation.context, designation.pierce)) cause = "resisted";
+    if (cause !== null) {
+      emit("designation_invalidated", actor, {attacker: uid, target_uid: designation.target_uid, cause});
+      return null;
+    }
+    return target;
+  }
+
   function resolveAttackStep(actor, defenderId, boards, emit, profiles, plan) {
     // ⓪ 分母はステップの入口で1度だけ測る（このステップのあいだ手札は動かない）。
     const attackerBoard = boards[actor];
@@ -16835,7 +16938,9 @@
         attacker = { ...attacker, symbol_count: attackerAfterWindow.symbol_count,
           bp: attackerAfterWindow.bp };
       }
-      if (flashManifestation(emit,actor,defenderId,boards,2,
+      // 指定アタック(T28-TARGET)。通ればブロック前のフラッシュ(手順2)を開かない(Python同一)。
+      const designated = designatedBlocker(emit, actor, attackerBoard, defenderBoard, uid);
+      if (!designated && flashManifestation(emit,actor,defenderId,boards,2,
         () => attacker.symbol_count > 0 && defenderBoard.life() > 0,order,
         defenderOutlook(profiles, () => uid, "pending", false)).length) {
         if (battleLeft(emit,actor,defenderId,boards,attacker,null)) continue;
@@ -16843,7 +16948,7 @@
         uid = attacker.uid;
       }
       // 公式手順2(ブロック宣言の前)のフラッシュタイミング(2026-10-01、Python同一)。
-      if (flashRemoval(emit, actor, defenderId, boards, 2,
+      if (!designated && flashRemoval(emit, actor, defenderId, boards, 2,
         { own: () => defenderBoard.units().some((row) => !row.exhausted),
           opponent: () => attacker.symbol_count > 0 && defenderBoard.life() > 0 },
         { own: [], opponent: [uid] }, order,index,
@@ -16864,9 +16969,11 @@
       else delete attacker.force_block;
       // アタック時効果／バースト後の現在盤面から後続も取り直す(Python同一)。
       laterAttackers = remainingAttackerRows(order, index, attackerBoard, ownPreview);
-      const blockDecision = chooseBlockerDecision(
-        attacker, currentBlockers, defenderBoard.life(), profiles, publicPlanDamage,
-        laterAttackers);
+      // 指定された体は疲労状態でもブロック宣言したことになる(Q315・Q318、Python同一)。
+      const blockDecision = designated ? {blocker: designated, reason: "designated_attack"}
+        : chooseBlockerDecision(
+          attacker, currentBlockers, defenderBoard.life(), profiles, publicPlanDamage,
+          laterAttackers);
       const blocker = blockDecision.blocker;
       if (!blocker) {
         // 手順4で手札から煌臨する(2026-10-01、Python同一)。
