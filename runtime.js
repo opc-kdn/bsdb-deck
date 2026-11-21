@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v305-v1";
-  const STAGE_VERSION = "v305";
+  const ENGINE_SLICE = "stage4-v306-v1";
+  const STAGE_VERSION = "v306";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v305-portable-v249";
+  const RUNTIME_VERSION = "stage4-v306-portable-v250";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -973,7 +973,7 @@
     "self_remain",
     "attack_step_end", "timed_attack_life_cap",
     "effect_text_grant", "register_effect_grant",
-    "draw", "coreboost", "self_coreboost", "self_core_move", "trash_core_return", "field_coreboost", "count_gain", "symbol_grant", "symbol_fix", "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_suppress", "life_core_gain", "u_trigger_invoke", "self_refresh", "ally_refresh", "guard_battle_refresh", "block_restriction", "force_block", "attack_ban", "u_trigger_step", "attack_step_lock", "extra_refresh_step",
+    "draw", "coreboost", "self_coreboost", "self_core_move", "trash_core_return", "field_coreboost", "count_gain", "symbol_grant", "symbol_fix", "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_level_treat", "ally_level_treat", "unit_suppress", "life_core_gain", "u_trigger_invoke", "self_refresh", "ally_refresh", "guard_battle_refresh", "block_restriction", "force_block", "attack_ban", "u_trigger_step", "attack_step_lock", "extra_refresh_step",
     "search", "recover", "self_recover", "side_recover", "stash_top", "opponent_deck_discard",
     "oracle_mill", "oracle_pickup", "oracle_watch", "deck_discard_draw",
     "hand_filter", "core_to_trash", "life_core_move", "token_spawn",
@@ -998,7 +998,7 @@
   const SUPPORTED_BURST_EFFECTS = new Set([
     "opponent_deck_discard",
     "self_chosen_hand_discard",
-    "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_suppress",
+    "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_level_treat", "unit_suppress",
     "draw", "coreboost", "core_to_trash", "field_coreboost", "count_gain",
     "burst_free_play_self", "burst_return_self_to_hand", "burst_pay_own_effect",
     "unit_destroy", "unit_exhaust", "unit_core_remove", "unit_bounce",
@@ -1714,15 +1714,16 @@
    *  有利な方(Q119の同時)。発揮元のLvを読む間は扱いを掛けない(循環止め)。Python `_level_treatment`と同一。 */
   function levelTreatment(state, cards, unit) {
     if (unit.brave_mode === 'combine' || LEVEL_TREATING.has(state)) return null;
-    const received = unit.level_treatments_received;
+    const registering = Boolean(unit.level_treatments_received?.length || state.timedLevelTreatments?.length);
     const otherBoard = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state);
     const imposing = Boolean(otherBoard?.imposes_levels);
     const own = deckHas(LEVEL_TREATMENT_DECKS, cards, 'level_treatments');
-    if (!received?.length && !own && !imposing) return null;
+    if (!registering && !own && !imposing) return null;
     LEVEL_TREATING.add(state);
     try {
       const card = fieldUnitInfo(state, cards, unit);
-      if (received?.length) return treatedValue(received[received.length - 1].treat_as, card);
+      const registered = registering ? registeredLevelTreatment(state, cards, unit, card) : null;
+      if (registered !== null) return treatedValue(registered, card);
       if (!state.field.includes(unit)) return null;
       const ownLevel = own ? ownLevelTreatment(state, cards, unit, card) : null;
       const imposed = imposing ? otherBoard.imposed_level({card_type: card.card_type || '',
@@ -1735,6 +1736,84 @@
     } finally {
       LEVEL_TREATING.delete(state);
     }
+  }
+  /** 効果で登録された期間つきの扱いのうち、この体に掛かる最後の1つ(`treat_as`、無ければnull、T17-LVの
+   *  第3段)。体へ書いた1体の扱いと盤面の「すべて」の行(D40)を登録の順番で比べる(Q8863)。
+   *  Python `_registered_level_treatment`と同一。 */
+  function registeredLevelTreatment(state, cards, unit, card) {
+    let best = null;
+    for (const row of unit.level_treatments_received || []) {
+      const seq = row.seq ?? 0;
+      if (best === null || seq >= best[0]) best = [seq, row.treat_as];
+    }
+    const kind = card.card_type || '';
+    const spiritState = unit.brave_mode === 'spirit';
+    for (const row of state.timedLevelTreatments || []) {
+      if (best !== null && row.seq < best[0]) continue;
+      if (row.protect) {
+        if (!grantRecipientMatches(row.protect, false, card, spiritState,
+          combinedBraves(state, unit.uid).length > 0)) continue;
+      } else if (!row.target_types.some(word => kind.endsWith(word) || (word === 'スピリット' && spiritState))) continue;
+      best = [row.seq, row.treat_as];
+    }
+    return best === null ? null : best[1];
+  }
+  /** 期間つきのLv扱いをこの盤面へ登録する(T17-LVの第3段)。「すべて」は盤面の行(D40)、そうでなければ
+   *  体へ書く。扱いはコアの数を変えないので消滅は起きない(Q131)。Python `_register_level_treatment`と同一。 */
+  function registerLevelTreatment(state, cards, uids, treatAs, scope, allEffect = null, source = null) {
+    const units = [...new Set(uids || [])].map(n => state.field.find(row => row.uid === n))
+      .filter(unit => unit && !unit.waiting);
+    if (!units.length && !allEffect) return false;
+    state.levelTreatmentSeq = (state.levelTreatmentSeq || 0) + 1;
+    const row = {treat_as: treatAs, scope, seq: state.levelTreatmentSeq};
+    if (allEffect) {
+      if (allEffect.protect) row.protect = structuredClone(allEffect.protect);
+      else row.target_types = [...allEffect.target_types];
+      (state.timedLevelTreatments ||= []).push(row);
+      record(state, cards, 'level_treated', {card_no: source?.card_no ?? null, uid: null,
+        treat_as: treatAs, scope, target: 'all'});
+      return true;
+    }
+    for (const unit of units) {
+      (unit.level_treatments_received ||= []).push({...row});
+      record(state, cards, 'level_treated', {card_no: unit.card_no, uid: unit.uid, treat_as: treatAs, scope});
+    }
+    return true;
+  }
+  /** 期間の切れた扱いを捨てる。`scope`がnullならすべて(ターンの終わり)。Python `_expire_level_treatments`。 */
+  function expireLevelTreatments(state, scope = null) {
+    state.timedLevelTreatments = (state.timedLevelTreatments || [])
+      .filter(row => scope !== null && row.scope !== scope);
+    for (const unit of state.field) {
+      if (!unit.level_treatments_received) continue;
+      const kept = unit.level_treatments_received.filter(row => scope !== null && row.scope !== scope);
+      if (kept.length) unit.level_treatments_received = kept;
+      else delete unit.level_treatments_received;
+    }
+  }
+  /** 自分の体へ期間つきのLv扱い(T17-LVの第3段)。Python `_resolve_ally_level_treat`と同一。 */
+  function resolveAllyLevelTreat(state, cards, effect, sourceUid) {
+    const source = {card_no: effect.source_card_no
+      || state.field.find(row => row.uid === sourceUid)?.card_no || null};
+    if (effect.recipient === 'self') {
+      const unit = state.field.find(row => row.uid === sourceUid);
+      if (!unit || unit.waiting || unit.brave_mode === 'combine') return false;
+      return registerLevelTreatment(state, cards, [sourceUid], effect.treat_as, effect.scope, null, source);
+    }
+    if (effect.target_all) {
+      return registerLevelTreatment(state, cards, [], effect.treat_as, effect.scope, effect, source);
+    }
+    let best = null;
+    for (const unit of [...state.field].sort((a, b) => a.uid - b.uid)) {
+      if (unit.waiting || unit.brave_mode === 'combine') continue;
+      const card = unitInfo(state, cards, unit);
+      if (!grantRecipientMatches(effect.protect, false, card, unit.brave_mode === 'spirit',
+        combinedBraves(state, unit.uid).length > 0)) continue;
+      const gain = treatedValue(effect.treat_as, card) - levelFor(unit, cards, state);
+      if (gain > 0 && (best === null || gain > best[0])) best = [gain, unit.uid];
+    }
+    return best !== null
+      && registerLevelTreatment(state, cards, [best[1]], effect.treat_as, effect.scope, null, source);
   }
   function ownLevelTreatment(state, cards, unit, card) {
     for (const source of [...state.field].sort((a, b) => a.uid - b.uid)) {
@@ -6736,6 +6815,22 @@
           effect.target_all ? effect : null));
       } finally { state.combatOpponent = previous; }
     }
+    if (effect.kind === 'unit_level_treat') {
+      // 相手の体へ期間つきのLv扱い(T17-LVの第3段)。Python同名の枝と同一。
+      const previous = state.combatOpponent;
+      const board = previous || MAIN_STEP_OPPONENTS.get(state);
+      state.combatOpponent = board;
+      try {
+        let rows = combatTargetRows(state, cards, effect, sourceUid);
+        if (effect.treat_as === 1) rows = rows.filter(row => (row.level || 0) > 1);
+        const selected = unguardedTargets(board, limitTargetRows(rows, effect), effect);
+        return Boolean((selected.length || effect.target_all) && board?.treat_level?.(
+          selected.map(row => row.uid), effect.treat_as, effect.scope,
+          effect.target_all ? effect : null,
+          {card_no: effect.source_card_no || state.field.find(row => row.uid === sourceUid)?.card_no || null}));
+      } finally { state.combatOpponent = previous; }
+    }
+    if (effect.kind === 'ally_level_treat') return resolveAllyLevelTreat(state, cards, effect, sourceUid);
     if (effect.kind === "guard_battle_refresh") {
       const unit = state.battleActive && state.field.find(row => row.uid === state.battlingUid);
       if (!unit || unit.waiting || !unitInfo(state, cards, unit).card_type.includes("アルティメット")) return false;
@@ -11437,7 +11532,7 @@
   const OPPONENT_FACING_KINDS = new Set([
     "self_chosen_hand_discard",
     "opponent_deck_discard",
-    "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_suppress",
+    "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_level_treat", "unit_suppress",
     "unit_destroy", "unit_exhaust", "unit_core_remove",
     "unit_bounce", "unit_heavy_exhaust", "unit_bp_down",
     "life_core_remove", "field_core_remove",
@@ -12881,6 +12976,9 @@
         settleBraveCapacity(state,cards,traceMark);
         return true;
       },
+      // 相手の効果が登録する期間つきのLv扱い(T17-LVの第3段)。
+      treat_level: (uids, treatAs, scope, allEffect = null, source = null) =>
+        registerLevelTreatment(state, cards, uids, treatAs, scope, allEffect, source),
       increase_level_cost: (uid, amount, opponent = null, allEffect = null) => {
         const uids = Array.isArray(uid) ? uid : [uid];
         const units = [...new Set(uids)].map(n => state.field.find(row => row.uid === n))
@@ -13024,6 +13122,7 @@
         }
         state.lifeProtections = state.lifeProtections.filter(
           (row) => row.scope !== "battle");
+        expireLevelTreatments(state, 'battle');
         syncLifeCapObservers(state, cards);
         settleBraveCapacity(state,cards);
       },
@@ -13033,6 +13132,7 @@
       end_turn_modifiers: () => {
         state.paymentRestrictions = [];
         state.timedLevelCostIncreases = [];
+        expireLevelTreatments(state);
         state.battleReplacements = {};
         state.mirageFlashUsed.clear();
         state.spiritLifeTaken = {};
@@ -13871,6 +13971,7 @@
         state.spiritLifeTaken = {};
         state.spiritLifeTakenAttack = {};
         state.lifeSourceCapStarts = {};
+        expireLevelTreatments(state);
       },
       field_entry_options: uid => {
         const unit=state.field.find(u=>u.uid===uid);
@@ -14360,6 +14461,8 @@
       lifeProtections: [],
       paymentRestrictions: [],
       timedLevelCostIncreases: [],
+      timedLevelTreatments: [],
+      levelTreatmentSeq: 0,
       battleReplacements: {},
       costPaymentOrigin: null,
       spiritLifeTaken: {},
@@ -14522,6 +14625,7 @@
         state.fieldFlashUsed.clear();
         state.mainActivatedUsed.clear();
         state.lifeReducedThisTurn = false;
+        expireLevelTreatments(state);
       }
       // 今がこの試行のターンか(v395)。Python `own_turn_active` と同一。
       state.ownTurnActive = true;
@@ -14755,6 +14859,8 @@
       if (state.combat) record(state, cards, "step_end");
       // 『自分のエンドステップ』は〔ターンに1回〕の数え直しより前(Python同一)。
       resolveOwnStepEffects(state, cards, targets, "end", options.going_first);
+      // 「このターンの間」のLv扱い(T17-LVの第3段)。エンドステップの効果の後で切れる(Python同一)。
+      expireLevelTreatments(state);
       state.fieldFlashUsed.clear();
       state.mainActivatedUsed.clear();
       state.blockTurnUsed.clear();
@@ -15140,7 +15246,7 @@
   // イベントで、`detail`を指定した棋譜だけが載せる。片方に足し忘れると
   // 詳細モードの棋譜がPython/Workerで食い違う。
   const MAIN_EVENT_TYPES = new Set([
-    "bp_changed", "level_cost_changed", "brave_remained", "brave_link_changed", "battle_unit_changed",
+    "bp_changed", "level_cost_changed", "level_treated", "brave_remained", "brave_link_changed", "battle_unit_changed",
     "branch_sampled", "burst_replaced", "burst_set", "card_entered", "card_moved",
     "cards_opened", "cards_returned_to_deck", "cards_selected", "core_moved",
     "cost_calculated", "cost_paid", "count_gained", "draw", "effect_complete",
