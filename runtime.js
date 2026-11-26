@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v311-v1";
-  const STAGE_VERSION = "v311";
+  const ENGINE_SLICE = "stage4-v316-v1";
+  const STAGE_VERSION = "v316";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v311-portable-v255";
+  const RUNTIME_VERSION = "stage4-v316-portable-v260";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -2684,6 +2684,11 @@
       if (hasLevels && !effect.levels.includes(level)) return false;
     }
     return countRequirementsMet(effect.count_requirements, state.count)
+      && (!effect.requires_count_soul || state.countHasSoul)
+      && (effect.kind !== "zone_summon" || !effect.requires_count_soul
+        || !zoneSummonChoices(state, cards, effect).next().done)
+      && (effect.kind !== "unit_core_remove" || !effect.ignore_turn_limit_with_count_soul
+        || combatTargetRows(state, cards, effect, sourceUid).length > 0)
       // 印字の対価（「〜することで」）。払えない節は撃てない。
       // ⚠️ ここは**判定だけ**。実際の支払いは`resolveEffectBody`が1回だけ行う。
       && paymentAffordable(state, cards, NO_PAYMENT_TARGETS, effect, sourceUid)
@@ -3736,16 +3741,30 @@
     return { origin: origin === "creator" ? "field" : origin, holder_uid: holder?.uid ?? null };
   }
 
-  function soulFlashSummonOptions(state, cards, targets, side) {
+  function flashSummonOpponentMet(requirement, opponent, attackerUid) {
+    if (!opponent) return false;
+    if (requirement === "kourin_this_turn") return Boolean(opponent.kourin_performed?.());
+    if (requirement === "attacking_kourin_spirit") {
+      return attackerUid !== null && opponent.units().some((row) => row.uid === attackerUid
+        && row.card_type.includes("スピリット") && row.policy_contract_base_nos?.length);
+    }
+    if (requirement === "tensei_spirit") {
+      return boardPresentUnits(opponent).some((row) => row.card_type.includes("スピリット")
+        && ["表", "裏"].includes(row.transform_side));
+    }
+    return false;
+  }
+
+  function soulFlashSummonOptions(state, cards, targets, side, opponent = null, attackerUid = null) {
     // 『自分のターン』の《超顕現》(T144-T)はアタックステップの窓でだけ開く。Python同一。
     const windows = { own: ["own_attack", "both_attack", "self_turn"],
       opponent: ["opponent_attack", "both_attack"] }[side] || [];
-    const sources = state.hand.map((cardNo, index) => [index, cardNo, "hand"])
-      .filter(([index, cardNo]) => state.hand.indexOf(cardNo) === index);
+    const sources = [["hand", state.hand], ["trash", state.trashCards]].flatMap(([zone, pool]) =>
+      pool.flatMap((cardNo, index) => pool.indexOf(cardNo) === index ? [[index, cardNo, zone]] : []));
     if (state.mirage) sources.push([-1, state.mirage, "mirage"]);
     const options = [];
     for (const [index, cardNo, zone] of sources) {
-      if (zone === "hand" && !handUseAllowed(state, cards, cardNo)) continue;
+      if (zone === "hand" && !handUseAllowed(state, cards, cardNo, opponent)) continue;
       const card = cards[cardNo];
       const route = (card?.soul_flash_summons || []).find((row) =>
         row.source_zone === zone && windows.includes(row.window));
@@ -3754,6 +3773,16 @@
           || (route.once_per_turn_same_name
             && state.blockTurnUsed.has(soulFlashOnceKey(route, card)))
           || !summonConditionsMet(card, state, cards)) continue;
+      if (route.pay !== undefined) {
+        const pay = route.pay;
+        if ((zone !== "trash" || trashEffectAllowed(state, cards, cardNo, opponent))
+            && (!route.requires_count_soul || state.countHasSoul)
+            && flashSummonOpponentMet(route.opponent_requirement, opponent, attackerUid)
+            && costAffordable(state, cards, pay, pay + entryMaintenance(state, cards, card), false)) {
+          options.push({ card_no: cardNo, hand_index: index, source_zone: zone });
+        }
+        continue;
+      }
       if (route.soul_to === "self") {
         if (soulTopPayable(state, cards, card, route)) {
           options.push({ card_no: cardNo, hand_index: index, source_zone: zone });
@@ -3772,9 +3801,10 @@
   }
 
   /** T144-S: 対価を払い、コスト0で召喚する。Python `_combat_play_soul_flash_summon`と同一。 */
-  function playSoulFlashSummon(state, cards, targets, cardNo, sourceZone, side, opponent = null) {
+  function playSoulFlashSummon(state, cards, targets, cardNo, sourceZone, side, opponent = null,
+    attackerUid = null) {
     if (sourceZone === "hand" && !handUseAllowed(state, cards, cardNo, opponent)) return null;
-    const option = soulFlashSummonOptions(state, cards, targets, side).find((row) =>
+    const option = soulFlashSummonOptions(state, cards, targets, side, opponent, attackerUid).find((row) =>
       row.card_no === cardNo && row.source_zone === sourceZone);
     if (!option) return null;
     const card = cards[cardNo];
@@ -3786,6 +3816,27 @@
     let uid;
     try {
       if (route.once_per_turn_same_name) state.blockTurnUsed.add(soulFlashOnceKey(route, card));
+      if (route.pay !== undefined) {
+        const completions = [];
+        const before = state.uid;
+        const maintenance = entryMaintenance(state, cards, card);
+        beginEffectFrame(state);
+        try {
+          play(state, cards, targets, { card_no: cardNo, pay: route.pay, total: route.pay + maintenance,
+            maintenance, mode: "soul_flash_summon", allow_sacrifice: false, brave_mode: null,
+            by_own_effect: true, completion_sink: completions,
+            ...(sourceZone === "trash" ? { source_zone_name: "trash" } : {}) });
+          uid = state.field.find((unit) => unit.uid > before && unit.card_no === cardNo)?.uid ?? null;
+          if (uid !== null && route.after_summon && state.countHasSoul) {
+            resolveEffect(state, cards, targets, route.after_summon, uid);
+          }
+          for (const complete of completions) complete();
+        } finally {
+          endEffectFrame(state);
+        }
+        if (!state.effectFrameDepth) flushCountReactions(state, cards, targets);
+        return { card_no: cardNo, uid, source_zone: sourceZone, payment: "cores" };
+      }
       // 対価の誘発(【契約域】のカウント+2)を先に解いてから召喚する(Q29274の同型、
       // `creator_core_summon`と同じ順)。Python同一。
       beginEffectFrame(state);
@@ -8774,28 +8825,30 @@
     }
   }
 
-  function resolveZoneSummonCards(state, cards, targets, effect, sourceUid) {
+  function* zoneSummonChoices(state, cards, effect) {
     const zones = { hand: state.hand, side: state.sideCards, trash: state.trashCards };
+    const pay = Number(effect.pay || 0);
+    for (const [zoneRank, zoneName] of (effect.zones || []).entries()) {
+      for (const [index, cardNo] of zones[zoneName].entries()) {
+        if (zoneName === "trash" && !trashTargetAllowed(state, cards, cardNo, effect.source_card_no)) continue;
+        const candidate = zoneName === "hand" ? handCostInfo(state, cards, cards[cardNo], "hand") : cards[cardNo];
+        if (!candidate || cardMatchesSlot(candidate, effect.slot) !== true) continue;
+        const plan = effectSummonPlan(state, cards, cardNo, pay);
+        if (plan) yield { cardNo, zoneName, zoneRank, index, mode: plan.mode, pay,
+          total: plan.total, cost: candidate.cost || 0 };
+      }
+    }
+  }
+
+  function resolveZoneSummonCards(state, cards, targets, effect, sourceUid) {
     let amount = effect.amount ?? 1;
     if (effect.amount_from_u_hit_cost) amount *= (state.uTriggerHits.get(`${effect.requires_u_hit}@${sourceUid}`) || [])
       .reduce((sum, row) => sum + row.cost, 0);
     if (amount !== "any" && amount <= 0) return false;
     let summoned = 0;
     for (;;) {
-      const choices = [];
-      (effect.zones || []).forEach((zoneName, zoneRank) => {
-        zones[zoneName].forEach((cardNo, index) => {
-          if (zoneName === "trash" && !trashTargetAllowed(state, cards, cardNo, effect.source_card_no)) return;
-          const candidate = zoneName === "hand" ? handCostInfo(state, cards, cards[cardNo], "hand") : cards[cardNo];
-          if (!candidate || cardMatchesSlot(candidate, effect.slot) !== true) return;
-          const pay = Number(effect.pay || 0);
-          const plan = effectSummonPlan(state, cards, cardNo, pay);
-          if (!plan) return;
-          choices.push({ cardNo, zoneName, zoneRank, index, mode: plan.mode, pay,
-            total: plan.total, tier: accessTier(cardNo, cards, targets),
-            cost: candidate.cost || 0 });
-        });
-      });
+      const choices = Array.from(zoneSummonChoices(state, cards, effect),
+        (choice) => ({ ...choice, tier: accessTier(choice.cardNo, cards, targets) }));
       if (!choices.length) break;
       choices.sort((left, right) => left.tier - right.tier || right.cost - left.cost
         || left.zoneRank - right.zoneRank || left.index - right.index);
@@ -9123,7 +9176,7 @@
   }
 
   // 印字効果の〔ターンに1回〕キー。同名縛りはカード名、裸はその1枚(uid)ごと。
-  function clauseTurnLimitKey(instance, clause, cards, used) {
+  function clauseTurnLimitKey(instance, clause, cards, state) {
     const limit = clause.block_turn_limit;
     const block = clause.effect_block_id;
     if (!limit || !block) return null;
@@ -9131,23 +9184,26 @@
       return `name\u0000${cards[instance.source_card_no]?.name || instance.source_card_no}`
         + `\u0000${nameLimitedBlock(block)}`;
     }
+    if (limit === "once_per_turn_card" && clause.ignore_turn_limit_with_count_soul && state.countHasSoul) {
+      return null;
+    }
     const key = `card\u0000${instance.source_uid}\u0000${block}${instance.imagin_limit_host != null ? `\u0000${instance.imagin_limit_host}` : ''}`;
     // 「ターンにN回まで」(【強襲：N】、T17-KW)。まだ使っていない回の鍵、全部使ったら最後の回の鍵。
     // Python `_clause_turn_limit_key`と同一。
     const times = clause.turn_use_limit || 1;
     if (times > 1) {
       for (let index = 0; index < times; index += 1) {
-        if (!used?.has(`${key}\u0000use${index}`)) return `${key}\u0000use${index}`;
+        if (!state.blockTurnUsed.has(`${key}\u0000use${index}`)) return `${key}\u0000use${index}`;
       }
       return `${key}\u0000use${times - 1}`;
     }
     return key;
   }
 
-  function instanceTurnLimitKeys(instance, cards, used) {
+  function instanceTurnLimitKeys(instance, cards, state) {
     const keys = [];
     for (const clause of instance.clauses) {
-      const key = clauseTurnLimitKey(instance, clause, cards, used);
+      const key = clauseTurnLimitKey(instance, clause, cards, state);
       if (key !== null && !keys.includes(key)) keys.push(key);
     }
     return keys;
@@ -9160,7 +9216,7 @@
   function turnLimitAvailable(state, cards, instance) {
     const gameKeys = instanceGameLimitKeys(instance, cards);
     if (gameKeys.length && !state.combatOpponent && instance.clauses.some(clause => clause.kind === "u_trigger")) return false;
-    return instanceTurnLimitKeys(instance, cards, state.blockTurnUsed).every((key) => !state.blockTurnUsed.has(key))
+    return instanceTurnLimitKeys(instance, cards, state).every((key) => !state.blockTurnUsed.has(key))
       && gameKeys.every(key => !state.blockGameUsed.has(key));
   }
 
@@ -9168,7 +9224,7 @@
   // 裁定Q11229・Q23398)。縛りを使い終えた節を外し、前の節は毎回発揮する。
   // 効果全体が縛られているときはそのまま返す。Python `_trim_used_turn_limited`と同一。
   function trimUsedTurnLimited(state, cards, instance) {
-    const keys = instance.clauses.map((clause) => clauseTurnLimitKey(instance, clause, cards, state.blockTurnUsed));
+    const keys = instance.clauses.map((clause) => clauseTurnLimitKey(instance, clause, cards, state));
     if (keys.every((key) => key !== null)) return instance;
     const clauses = instance.clauses.filter((_clause, index) =>
       keys[index] === null || !state.blockTurnUsed.has(keys[index]));
@@ -9543,7 +9599,7 @@
       }
       // Consume hit-gated limits only after this U roll has actually hit.
       for (const clause of selected.clauses) {
-        const key = clauseTurnLimitKey(selected, clause, cards, state.blockTurnUsed);
+        const key = clauseTurnLimitKey(selected, clause, cards, state);
         if (key !== null && !clause.requires_u_hit) state.blockTurnUsed.add(key);
       }
       for (const key of instanceGameLimitKeys(selected, cards)) state.blockGameUsed.add(key);
@@ -9569,7 +9625,7 @@
         runSelected)) || [])];
       if (options.stop?.()) return;
       for (const clause of selected.clauses) {
-        const key = clauseTurnLimitKey(selected, clause, cards, state.blockTurnUsed);
+        const key = clauseTurnLimitKey(selected, clause, cards, state);
         if (key !== null && clause.requires_u_hit && uHitGateMet(clause,
           state.uTriggerHits.get(`${clause.requires_u_hit}@${selected.source_uid}`) || [])) state.blockTurnUsed.add(key);
       }
@@ -10043,6 +10099,7 @@
     }
     // 魂状態から出たので、そのカードはもう魂状態ではない。
     state.soulCards.splice(state.soulCards.indexOf(soulCardNo), 1);
+    state.blockTurnUsed.add("kourin_performed");
     record(state, cards, "card_entered", { card_no: candidate.card_no, uid,
       destination: "field", ...traceDetails });
     record(state, cards, "soul_state_left", { card_no: soulCardNo, uid, reason: "kourin" });
@@ -10137,6 +10194,7 @@
     record(state, cards, "card_entered", { card_no: candidate.card_no, uid: host.uid,
       destination: "kourin_stack", ...traceDetails });
     if (faraFKourin && !fundFaraKourinMaintenance(state, cards, host)) return false;
+    state.blockTurnUsed.add("kourin_performed");
     state.played.add(candidate.card_no);
     state.playCounts[state.turn] = (state.playCounts[state.turn] || 0) + 1;
     let basiliskBonus = false;
@@ -11683,6 +11741,7 @@
       uid: unit.uid,
       card_no: unit.card_no,
       card_type: card.card_type,
+      ...(card.transform_side ? { transform_side: card.transform_side } : {}),
       ...(effectsSuppressed(state, unit) ? {effects_suppressed:true} : {}),
       // 現在のコスト(合体中のBrave込み)。Pythonの対象行と同じ値。
       ...combatCostRow(state, cards, unit, card),
@@ -14092,11 +14151,13 @@
       flash_kourin_options: (side) => flashKourinOptions(state, cards, side),
       flash_manifestation_options: side => flashManifestationOptions(state,cards,side),
       // T144-S: ソウルコアを創界神へ置いて手札/セット中から召喚する口(Python同一)。
-      soul_flash_summon_options: side => soulFlashSummonOptions(state, cards, targets, side),
+      soul_flash_summon_options: (side, opponent, attackerUid) =>
+        soulFlashSummonOptions(state, cards, targets, side, opponent, attackerUid),
+      kourin_performed: () => state.blockTurnUsed.has("kourin_performed"),
       // 相手が自分のライフを削ってよいかの判断に使う、アタック時のライフ減少の合計(T144-T)。
       visible_attack_life_burn: () => visibleAttackLifeBurn(state, cards),
-      play_soul_flash_summon: (cardNo, sourceZone, side, opponent = null) =>
-        playSoulFlashSummon(state, cards, targets, cardNo, sourceZone, side, opponent),
+      play_soul_flash_summon: (cardNo, sourceZone, side, opponent, attackerUid) =>
+        playSoulFlashSummon(state, cards, targets, cardNo, sourceZone, side, opponent, attackerUid),
       play_flash_manifestation: (cardNo,creatorUid,side,opponent=null,soulPayment=null,sourceZone=null) => {
         if (!cardUseAllowed(state, cards, cardNo, "manifestation", opponent)) return null;
         const option=flashManifestationOptions(state,cards,side).find(row =>
@@ -16679,7 +16740,7 @@
   }
 
   function flashManifestation(emit, actor, defenderId, boards, step, threatened, order = null,
-    outlook = null) {
+    outlook = null, attackerUid = null) {
     const played = [];
     for (const [owner, side] of [[actor,"own"],[defenderId,"opponent"]]) {
       // 守り側は失うものがあれば撃つ。無ければ返しのターンが良くなるときだけ(T147)。
@@ -16700,26 +16761,28 @@
         if (owner === actor && order && !order.includes(result.uid)) order.push(result.uid);
       }
     }
-    played.push(...flashSelfSummon(emit, actor, defenderId, boards, step, threatened, order, outlook));
+    played.push(...flashSelfSummon(emit, actor, defenderId, boards, step, threatened, order,
+      outlook, attackerUid));
     return played;
   }
 
   /** 顕現と同じ窓で、ソウルコアを創界神へ置いて手札/セット中から自分を召喚する(T144-S)。
    *  Python `_flash_self_summon`と同一。 */
   function flashSelfSummon(emit, actor, defenderId, boards, step, threatened, order = null,
-    outlook = null) {
+    outlook = null, attackerUid = null) {
     const played = [];
     for (const [owner, side] of [[actor, "own"], [defenderId, "opponent"]]) {
       const quiet = owner === defenderId && !threatened();
       if (quiet && !outlook) continue;
       const board = boards[owner];
-      const options = board.soul_flash_summon_options?.(side) || [];
+      const other = boards[owner === actor ? defenderId : actor];
+      const options = board.soul_flash_summon_options?.(side, other, attackerUid) || [];
       if (!options.length) continue;
       options.sort((a, b) => a.card_no < b.card_no ? -1 : a.card_no > b.card_no ? 1
         : a.hand_index - b.hand_index);
       const option = options[0];
-      const other = boards[owner === actor ? defenderId : actor];
-      const play = () => board.play_soul_flash_summon(option.card_no, option.source_zone, side, other);
+      const play = () => board.play_soul_flash_summon(option.card_no, option.source_zone, side, other,
+        attackerUid);
       if (quiet && !defenderFiresForOutlook(board, other, play, outlook)) continue;
       const lifeBefore = board.life();
       const result = play();
@@ -16767,7 +16830,7 @@
       emit("flash_kourin_played", owner, { ...result, side, ...(quiet ? { motive: "next_turn" } : {}) });
       played.push(result);
     }
-    played.push(...flashManifestation(emit,actor,defenderId,boards,4,threatened,order,outlook));
+    played.push(...flashManifestation(emit,actor,defenderId,boards,4,threatened,order,outlook,attackerUid));
     return played;
   }
 
@@ -17096,7 +17159,7 @@
       const designated = designatedBlocker(emit, actor, attackerBoard, defenderBoard, uid);
       if (!designated && flashManifestation(emit,actor,defenderId,boards,2,
         () => attacker.symbol_count > 0 && defenderBoard.life() > 0,order,
-        defenderOutlook(profiles, () => uid, "pending", false)).length) {
+        defenderOutlook(profiles, () => uid, "pending", false), uid).length) {
         if (battleLeft(emit,actor,defenderId,boards,attacker,null)) continue;
         attacker = overlayRow(attacker,attackerBoard);
         uid = attacker.uid;
