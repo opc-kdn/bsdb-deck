@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v317-v1";
-  const STAGE_VERSION = "v317";
+  const ENGINE_SLICE = "stage4-v318-v1";
+  const STAGE_VERSION = "v318";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v317-portable-v261";
+  const RUNTIME_VERSION = "stage4-v318-portable-v262";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -2875,6 +2875,29 @@
     return (!unit || unit.waiting) ? null : unit;
   }
 
+  /** 相手の創界神ネクサスから対価のコアを取る計画`[[uid, 個数]]`(「自分か相手の」、
+   *  2026-11-27)。耐性は見ない(Q24064)、通常コアだけ。Python
+   *  `_opponent_creator_payment_plan` と同一。 */
+  function opponentCreatorPaymentPlan(state, payment, amount) {
+    const board = state.combatOpponent;
+    if (!board || typeof board.field !== "function") return [];
+    const exact = payment.colors_exact;
+    const spec = payment.target_spec || "";
+    const rows = [];
+    for (const row of board.field()) {
+      const ordinary = row.cores - Number(Boolean(row.soul_core));
+      if (!row.creator_nexus || ordinary < 1) continue;
+      const colors = [...(row.colors || [])].sort();
+      if (exact && exact.length && (colors.length !== exact.length
+        || colors.some((value, index) => value !== exact[index]))) continue;
+      if (spec && !specMatchesUnit({card_type: row.card_type, colors,
+        lineages: row.lineages || [], name: null}, spec)) continue;
+      rows.push({...row, cores: ordinary});
+    }
+    if (rows.reduce((sum, row) => sum + row.cores, 0) < amount) return [];
+    return planCreatorCoreRemoval(rows, amount, "split");
+  }
+
   function creatorCorePlan(state, cards, donors, amount, ordinaryOnly = false) {
     const plan = [];
     let remaining = amount;
@@ -2950,6 +2973,11 @@
     if (kind === "flag_core_void" || kind === "flag_core_move") {
       const amount = Number(payment.amount || 1);
       if (kind === "flag_core_move" && !paymentSourceUnit(state, sourceUid)) return null;
+      // 「自分か相手の」は相手の創界神から先に払う(2026-11-27、Python同一)。
+      if (kind === "flag_core_void" && payment.either_side) {
+        const opponent = opponentCreatorPaymentPlan(state, payment, amount);
+        if (opponent.length) return {opponentDonors: opponent};
+      }
       const donors = creatorCorePlan(state, cards, paymentCoreDonors(state, cards, payment, 1), amount, true);
       return donors ? {donors} : null;
     }
@@ -3134,6 +3162,10 @@
     if (kind === "hand_discard") {
       discardHandCards(state, cards, targets, plan.cards || [],
         discardSourceCardNo(state, effect, sourceUid));
+    }
+    // 相手の創界神ネクサスから払う(「自分か相手の」、Python同一)。
+    for (const [uid, amount] of plan.opponentDonors || []) {
+      if (!state.combatOpponent.remove_cores(uid, amount, "void")) return false;
     }
     for (const {donor, amount} of plan.donors || []) {
       donor.cores -= amount;
@@ -11901,7 +11933,9 @@
           ...(isCreatorNexus(cards, unit)
             ? { creator_nexus: true, core_thresholds: creatorCoreThresholds(card),
               // 系統(公開情報)。起幻の除外が読む。Python同一。
-              lineages: [...(card.lineages || [])].sort() } : {}),
+              lineages: [...(card.lineages || [])].sort(),
+              // 今の色(公開情報)。「自分か相手の」創界神の対価が読む。Python同一。
+              colors: [...(card.colors || [])].sort() } : {}),
         };
       });
   }
