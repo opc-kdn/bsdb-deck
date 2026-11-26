@@ -285,6 +285,84 @@ body[data-workspace="builder"] #deck-panel .pseudo-card{min-height:5.2rem}
 @media(max-width:760px){.known-head{display:none}.known-toggle{display:flex;width:100%;justify-content:space-between;align-items:center;text-align:left}.known-body{display:none}.known-pane.open .known-body{display:block;margin-top:.5rem}}
 /* 読み込み中表示（T95、PWAのheader帯と同じ扱い）。起動の展開中だけ`busy`が付き、完了・失敗の`status()`が付け替えるので必ず消える。 */
 .notice.busy{display:flex;align-items:center;gap:.45rem}.notice.busy::before{content:"";flex:0 0 .8rem;width:.8rem;height:.8rem;border-radius:50%;border:2px solid color-mix(in srgb,var(--accent) 30%,transparent);border-top-color:var(--accent);animation:bsdb-busy-spin .8s linear infinite}@keyframes bsdb-busy-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.notice.busy::before{animation-duration:2.4s}}
+.effect-tag-list { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; }
+.effect-tag-list > .effect-tag {
+  padding: .35rem .65rem;
+  min-height: 2rem;
+  border: 1px solid var(--border, #56667d);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent, #b6d8ff) 15%, var(--panel, #182332));
+  color: var(--text, #eef3f8);
+  font: inherit;
+  font-size: .85rem;
+  cursor: pointer;
+}
+.effect-tag-list > .is-parent { background: transparent; border-style: dashed; }
+.effect-tag-list > .effect-tag[aria-expanded="true"] { border-color: var(--accent, #b6d8ff); }
+.effect-tag-popover {
+  position: fixed;
+  inset: auto;
+  box-sizing: border-box;
+  margin: 0;
+  width: min(21rem, calc(100vw - 16px));
+  padding: 0;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--accent, #b6d8ff);
+  border-radius: .65rem;
+  background: var(--panel, #182332);
+  color: var(--text, #eef3f8);
+  box-shadow: 0 .4rem 1.2rem #0006;
+  font-size: .86rem;
+}
+.effect-tag-popover::before {
+  content: "";
+  position: absolute;
+  top: -6px;
+  left: calc(var(--tag-pointer) - 5px);
+  width: 10px;
+  height: 10px;
+  transform: rotate(45deg);
+  background: var(--panel, #182332);
+  border-top: 1px solid var(--accent, #b6d8ff);
+  border-left: 1px solid var(--accent, #b6d8ff);
+}
+.effect-tag-popover.above::before { top: auto; bottom: -6px; transform: rotate(225deg); }
+.effect-tag-content { box-sizing: border-box; padding: .65rem .8rem; overflow: auto; overscroll-behavior: contain; }
+.effect-tag-popover ul { margin: .45rem 0 0; padding: 0; list-style: none; }
+.effect-tag-popover li + li { margin-top: .45rem; padding-top: .45rem; border-top: 1px solid var(--border, #56667d); }
+.effect-tag-popover dl { display: grid; grid-template-columns: auto 1fr; gap: .1rem .65rem; margin: .2rem 0 0; }
+.effect-tag-popover dt { color: var(--muted, #c1cddd); }
+.effect-tag-popover dd { margin: 0; }
+
+.add-quantity-dialog {
+  box-sizing: border-box;
+  width: min(22rem, calc(100% - 2rem));
+  padding: 1rem;
+  border: 1px solid var(--border, #56667d);
+  border-radius: .75rem;
+  background: var(--panel, #182332);
+  color: var(--text, #eef3f8);
+  overflow-wrap: anywhere;
+}
+.add-quantity-dialog::backdrop { background: #0009; }
+.add-quantity-dialog h2 { font-size: 1.15rem; margin: 0; }
+.add-quantity-dialog p { margin: .5rem 0 .75rem; }
+.add-quantity-dialog label { display: flex; align-items: center; gap: .55rem; }
+.add-quantity-dialog input {
+  width: 8rem;
+  box-sizing: border-box;
+  padding: .5rem;
+  border: 1px solid var(--border, #56667d);
+  border-radius: .35rem;
+  background: var(--bg, #101721);
+  color: inherit;
+  font: inherit;
+  font-size: max(1rem, 16px);
+}
+.add-quantity-dialog .add-quantity-actions { display: flex; justify-content: flex-end; gap: .5rem; margin: .9rem 0 0; }
+.add-quantity-dialog button { min-height: 44px; padding: .45rem .75rem; }
+
 </style>
 <style>
 .orb{background-image:radial-gradient(circle at 50% 48%,#d8f2ff 0 23%,transparent 25%),conic-gradient(from 30deg,#2b7fb8,#4ea9e0,#a9e2ff,#4ea9e0,#2b7fb8,#4ea9e0,#2b7fb8);clip-path:polygon(50% 2%,91% 25%,91% 75%,50% 98%,9% 75%,9% 25%);filter:drop-shadow(0 0 1px #123f6b)}
@@ -318,7 +396,7 @@ body[data-workspace="builder"] #deck-panel .pseudo-card{min-height:5.2rem}
 </main>
 <nav class="mobile-nav" aria-label="共有デッキの操作"><button type="button" data-workspace="builder" aria-pressed="true">デッキ構築</button><button type="button" data-workspace="analysis" aria-pressed="false">分析</button></nav>
 <div id="share-dialog" class="utility-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="share-title"><section class="utility-sheet"><div class="dialog-head"><div><span class="eyebrow">LINEへ戻る</span><h2 id="share-title">共有・保存</h2></div><button id="share-close" type="button" aria-label="共有・保存を閉じる">×</button></div><p id="share-summary" class="dialog-lead"></p><div class="share-link-actions"><button id="share-url-copy" class="primary dialog-primary" type="button">編集リンクをコピー</button><button id="share-native" type="button">LINEなどへ共有</button><button id="deck-image-save" type="button">デッキ画像を保存</button></div><input id="share-url-result" class="share-link-result hidden" type="text" readonly aria-label="共有リンク"><p id="share-url-note" class="static-only-note">リンクにはデッキ内容が含まれ、URLを知る人は読めます。サーバーへデッキを保存しません。</p><div class="share-image-actions"><button id="deck-image-share" type="button">デッキ画像を共有</button></div><details class="advanced file-fallback"><summary>URLが長い場合・オフライン用</summary><div class="advanced-actions"><button id="export-html" type="button">このデッキをHTMLで保存</button><button id="copy-save" type="button">名前を変えてHTMLを保存</button><button id="export-json" type="button">共有JSONを保存</button><button id="import-json" type="button">共有JSONを開く</button><input id="import-file" type="file" accept="application/json,.json,.bsdeck.json" class="hidden"></div><p class="file-note">URL上限を超えた場合は、画像・個人情報を含まないHTMLまたはJSONへ戻します。</p></details></section></div>
-<div id="options-dialog" class="utility-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="options-title"><section class="utility-sheet"><div class="dialog-head"><div><span class="eyebrow">必要なときだけ変更</span><h2 id="options-title">表示・画像</h2></div><button id="options-close" type="button" aria-label="表示・画像を閉じる">×</button></div><label class="field-stack">共有時のサムネイル<select id="thumbnail" class="thumb-select" aria-label="サムネイルカード"></select></label><div id="receiver-image-tools" class="image-toolbar hidden" aria-label="端末内カード画像"><label class="field-stack image-target-entry">追加で取得するカード番号（任意）<textarea id="image-extra-nos" rows="3" spellcheck="false" autocapitalize="characters" placeholder="BS76-035&#10;BS76-CX03"></textarea><small>空白・改行・カンマ区切り。共有リンクには追加されず、この端末だけに保存します。</small></label><button id="image-fetch" type="button">画像を取得する</button><button id="image-notify" type="button">完了通知を許可</button><span id="image-fetch-note" class="image-note"></span></div><div class="image-toolbar" aria-label="任意のローカルカード画像"><button id="image-open" type="button">手元のカード画像を選ぶ</button><input id="image-files" class="hidden" type="file" accept="image/webp,image/png,image/jpeg,image/gif,.webp,.png,.jpg,.jpeg,.gif" multiple><button id="image-clear" type="button" disabled>画像を外す</button><span id="image-note" class="image-note">画像なし。カード番号のファイル名（例 BS76-035.webp）だけ対応づけ、共有データには含めません。</span></div><details class="advanced"><summary>この共有について</summary><div class="unofficial"><strong>非公式データ表示</strong><span>公式カード画像・公式カード面・逐語効果文ではありません。カード番号と、人手確認した構造タグから独自生成した要約です。</span></div><p id="runtime-info" class="file-note">画像なし静的Web／単一HTML / 構造表示 profile v2 / 構築UI v7 / 疑似カードUI v5 / 画像 session-only / 盤面UI v5 / <span id="version">Stage4 v308</span> / <span id="catalog-info">カタログ読込中</span></p><p class="file-note">共有リンクには画像本体・画像URL・所持枚数・個人DBを含みません。画像取得は受信者が明示的に開始し、本人の端末内だけへ保存します。取得元の利用条件を確認し、取得画像を再共有しないでください。</p></details></section></div>
+<div id="options-dialog" class="utility-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="options-title"><section class="utility-sheet"><div class="dialog-head"><div><span class="eyebrow">必要なときだけ変更</span><h2 id="options-title">表示・画像</h2></div><button id="options-close" type="button" aria-label="表示・画像を閉じる">×</button></div><label class="field-stack">共有時のサムネイル<select id="thumbnail" class="thumb-select" aria-label="サムネイルカード"></select></label><div id="receiver-image-tools" class="image-toolbar hidden" aria-label="端末内カード画像"><label class="field-stack image-target-entry">追加で取得するカード番号（任意）<textarea id="image-extra-nos" rows="3" spellcheck="false" autocapitalize="characters" placeholder="BS76-035&#10;BS76-CX03"></textarea><small>空白・改行・カンマ区切り。共有リンクには追加されず、この端末だけに保存します。</small></label><button id="image-fetch" type="button">画像を取得する</button><button id="image-notify" type="button">完了通知を許可</button><span id="image-fetch-note" class="image-note"></span></div><div class="image-toolbar" aria-label="任意のローカルカード画像"><button id="image-open" type="button">手元のカード画像を選ぶ</button><input id="image-files" class="hidden" type="file" accept="image/webp,image/png,image/jpeg,image/gif,.webp,.png,.jpg,.jpeg,.gif" multiple><button id="image-clear" type="button" disabled>画像を外す</button><span id="image-note" class="image-note">画像なし。カード番号のファイル名（例 BS76-035.webp）だけ対応づけ、共有データには含めません。</span></div><details class="advanced"><summary>この共有について</summary><div class="unofficial"><strong>非公式データ表示</strong><span>公式カード画像・公式カード面・逐語効果文ではありません。カード番号と、人手確認した構造タグから独自生成した要約です。</span></div><p id="runtime-info" class="file-note">画像なし静的Web／単一HTML / 構造表示 profile v2 / 構築UI v7 / 疑似カードUI v5 / 画像 session-only / 盤面UI v5 / <span id="version">Stage4 v311</span> / <span id="catalog-info">カタログ読込中</span></p><p class="file-note">共有リンクには画像本体・画像URL・所持枚数・個人DBを含みません。画像取得は受信者が明示的に開始し、本人の端末内だけへ保存します。取得元の利用条件を確認し、取得画像を再共有しないでください。</p></details></section></div>
 <div id="image-ready" class="utility-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="image-ready-title"><section class="utility-sheet"><div class="dialog-head"><div><span class="eyebrow">画像の準備完了</span><h2 id="image-ready-title">表示を更新してよいですか？</h2></div></div><p id="image-ready-copy" class="dialog-lead"></p><div class="share-link-actions"><button id="image-apply" class="primary" type="button">はい、差し替える</button><button id="image-discard" type="button">いいえ</button></div></section></div>
 <div id="card-zoom" class="card-zoom hidden" role="dialog" aria-modal="true"></div>
 <div id="card-detail" class="card-detail hidden" role="dialog" aria-modal="true" aria-labelledby="card-detail-title"><article id="card-detail-panel" class="card-detail-panel"><div id="card-detail-body"></div></article></div>
@@ -753,6 +831,201 @@ function renderBattleField(field, renderUnit, renderBrave) {
   }).join("");
 }
 </script>
+<script>(() => {
+  let quantityDialog;
+  let commitQuantity;
+  let positionCurrentPopover;
+
+  window.addEventListener("scroll", (event) => positionCurrentPopover?.(event), true);
+  window.addEventListener("resize", () => positionCurrentPopover?.());
+
+  function askAddQuantity(cardName, maximum, onAdd) {
+    if (maximum < 1) return;
+    if (!quantityDialog) {
+      quantityDialog = document.createElement("dialog");
+      quantityDialog.className = "add-quantity-dialog";
+      quantityDialog.setAttribute("aria-labelledby", "add-quantity-title");
+      quantityDialog.innerHTML = `
+        <form>
+          <h2 id="add-quantity-title">追加枚数</h2>
+          <p class="add-quantity-card"></p>
+          <label>枚数 <input name="quantity" type="number" inputmode="numeric"
+            min="1" step="1" required autofocus></label>
+          <div class="add-quantity-actions">
+            <button type="button">キャンセル</button>
+            <button type="submit">追加</button>
+          </div>
+        </form>`;
+      document.body.append(quantityDialog);
+      quantityDialog.querySelector('button[type="button"]').onclick = () => quantityDialog.close();
+      quantityDialog.querySelector("form").onsubmit = (event) => {
+        event.preventDefault();
+        const quantity = event.currentTarget.elements.quantity.valueAsNumber;
+        quantityDialog.close();
+        commitQuantity(quantity);
+      };
+    }
+    if (quantityDialog.open) return;
+    commitQuantity = onAdd;
+    quantityDialog.querySelector(".add-quantity-card").textContent = cardName;
+    const input = quantityDialog.querySelector("input");
+    input.max = maximum;
+    input.value = "1";
+    quantityDialog.showModal();
+    input.select();
+  }
+
+  function actionDetails(action) {
+    const quantity = action.quantity_unbounded ? "任意"
+      : action.quantity != null && action.quantity_max != null && action.quantity !== action.quantity_max
+        ? `${action.quantity}〜${action.quantity_max}`
+        : action.quantity ?? (action.quantity_max != null ? `最大${action.quantity_max}` : null);
+    const target = [...new Set([action.target_side, action.target_object].filter(Boolean))].join("・");
+    const route = (action.source_zone || action.dest_zone) && !target.includes("→")
+      ? `${action.source_zone || "対象領域"} → ${action.dest_zone || "対象領域"}` : null;
+    return [
+      ["タイミング", action.timing], ["必要Lv", action.required_level],
+      ["対象", target], ["数量", quantity], ["移動", route], ["資源", action.resource],
+    ].filter(([, value]) => value != null && value !== "");
+  }
+
+  function appendDetails(list, title, fields) {
+    const row = document.createElement("li");
+    const name = document.createElement("strong");
+    name.textContent = title;
+    row.append(name);
+    if (fields.length) {
+      const details = document.createElement("dl");
+      for (const [label, value] of fields) {
+        const term = document.createElement("dt");
+        const description = document.createElement("dd");
+        term.textContent = label;
+        description.textContent = value;
+        details.append(term, description);
+      }
+      row.append(details);
+    }
+    list.append(row);
+  }
+
+  function renderEffectTags(box, { actions = [], keywords = [], parentKeywords = [], noEffect = false }) {
+    const tags = new Map();
+    function tag(name) {
+      if (!tags.has(name)) tags.set(name, { keywords: [], actions: [], parent: false });
+      return tags.get(name);
+    }
+    if (noEffect) tag("効果無記述");
+    for (const keyword of keywords) {
+      const entry = typeof keyword === "string" ? { name: keyword } : keyword;
+      if (entry.name) tag(entry.name).keywords.push(entry);
+    }
+    for (const name of parentKeywords) {
+      if (name && !tags.has(name)) tag(name).parent = true;
+    }
+    for (const action of actions) {
+      for (const name of new Set([action.category, action.action].filter(Boolean))) {
+        tag(name).actions.push(action);
+      }
+    }
+    if (!tags.size) {
+      box.textContent = "タグなし";
+      return;
+    }
+
+    const popover = document.createElement("div");
+    popover.className = "effect-tag-popover";
+    popover.popover = "auto";
+    popover.setAttribute("role", "region");
+    popover.setAttribute("aria-label", "詳細アクション");
+    const content = document.createElement("div");
+    content.className = "effect-tag-content";
+    popover.append(content);
+    let active;
+    function position(event) {
+      if (!popover.matches(":popover-open")
+          || (event?.target instanceof Node && popover.contains(event.target))) return;
+      const anchor = active.getBoundingClientRect();
+      const viewport = document.documentElement;
+      if (anchor.bottom <= 0 || anchor.top >= viewport.clientHeight) {
+        popover.hidePopover();
+        return;
+      }
+      const width = popover.offsetWidth;
+      const center = anchor.left + anchor.width / 2;
+      const left = Math.max(8, Math.min(center - width / 2, viewport.clientWidth - width - 8));
+      const below = viewport.clientHeight - anchor.bottom;
+      const above = below < content.scrollHeight + 10 && anchor.top > below;
+      const available = Math.max(0, (above ? anchor.top : below) - 16);
+      popover.classList.toggle("above", above);
+      content.style.maxHeight = `${available}px`;
+      popover.style.left = `${left}px`;
+      popover.style.top = `${above ? anchor.top - 8 - popover.offsetHeight : anchor.bottom + 8}px`;
+      popover.style.setProperty("--tag-pointer", `${Math.max(10, Math.min(width - 10, center - left))}px`);
+    }
+    for (const [name, entry] of tags) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = entry.parent ? "effect-tag is-parent" : "effect-tag";
+      button.textContent = name;
+      button.popoverTargetElement = popover;
+      button.setAttribute("aria-expanded", "false");
+      button.onclick = (event) => {
+        event.preventDefault();
+        const open = popover.matches(":popover-open");
+        if (open && active === button) {
+          popover.hidePopover();
+          return;
+        }
+        active?.setAttribute("aria-expanded", "false");
+        active = button;
+        button.setAttribute("aria-expanded", "true");
+        const heading = document.createElement("strong");
+        heading.textContent = `${name} · 詳細アクション`;
+        const list = document.createElement("ul");
+        for (const keyword of entry.keywords) {
+          appendDetails(list, "キーワード", [["分類", keyword.category], ["値", keyword.value]]
+            .filter(([, value]) => value != null && value !== ""));
+        }
+        const seen = new Set();
+        for (const action of entry.actions) {
+          const fields = actionDetails(action);
+          const title = action.action || action.category;
+          const key = JSON.stringify([title, fields]);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          appendDetails(list, title, fields);
+        }
+        if (!list.childElementCount) {
+          const row = document.createElement("li");
+          row.textContent = noEffect && name === "効果無記述" ? "効果欄に記述がありません。" : "上位のキーワード分類";
+          list.append(row);
+        }
+        content.replaceChildren(heading, list);
+        content.style.maxHeight = "";
+        if (!open) popover.showPopover({ source: button });
+        positionCurrentPopover = position;
+        position();
+      };
+      box.append(button);
+    }
+    popover.addEventListener("toggle", () => {
+      if (popover.matches(":popover-open")) return;
+      if (positionCurrentPopover === position) positionCurrentPopover = null;
+      active?.setAttribute("aria-expanded", "false");
+      active = null;
+    });
+    box.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape" || !popover.matches(":popover-open")) return;
+      event.preventDefault();
+      event.stopPropagation();
+      popover.hidePopover();
+    });
+    box.append(popover);
+  }
+
+  globalThis.BSDBCardControls = { askAddQuantity, renderEffectTags };
+})();
+</script>
 <script src="portable_images.js"></script>
 <script>
 (()=>{"use strict";
@@ -791,14 +1064,12 @@ function cardColors(card){const named=unique([...(card?.border_colors||[]),...(c
 function cardStyle(card){const colors=cardColors(card).map(c=>CARD_COLORS[c]||"#667085"),band=colors.length===1?colors[0]:`linear-gradient(90deg,${colors.map((c,i)=>`${c} ${Math.round(i/colors.length*100)}%,${c} ${Math.round((i+1)/colors.length*100)}%`).join(",")})`;return`--card-color:${colors[0]};--card-glow:${colors[0]};--card-band:${band}`}
 function sessionImage(cardNo,kind="pseudo"){const url=imageCache.get(cardNo);return url?`<span class="session-image ${kind}-session-image" data-session-image="${esc(cardNo)}"><img src="${esc(url)}" alt="" loading="lazy"></span>`:""}
 function bpLabel(card){const rows=(card?.levels||[]).filter(r=>r.bp!=null);return rows.length?rows.map(r=>`Lv${r.level} ${Number(r.bp).toLocaleString()}BP`).join(" / "):"BP —"}
-function quantityLabel(action){if(action.quantity_unbounded)return"任意数";const min=action.quantity,max=action.quantity_max;if(min!=null&&max!=null&&min!==max)return`${min}〜${max}`;if(min!=null)return String(min);if(max!=null)return`最大${max}`;return""}
-function functionalSummary(action){const context=[];if(action.required_level!=null)context.push(`Lv${action.required_level}以上`);if(action.timing&&action.timing!=="常時")context.push(action.timing);const target=unique([action.target_side,action.target_object]).join("・"),amount=quantityLabel(action),label=action.action||action.category||"構造化効果",hasRoute=String(action.target_object||"").includes("→"),zones=!hasRoute&&(action.source_zone||action.dest_zone)?`${action.source_zone||"対象領域"}→${action.dest_zone||"対象領域"}`:"",resource=action.resource?`資源:${action.resource}`:"";return`${context.length?context.join(" / ")+"｜":""}${target?target+"へ ":""}${label}${amount?` ${amount}`:""}${zones?`（${zones}）`:""}${resource?` / ${resource}`:""}`}
 function conditionSummary(condition,compiled={}){const requirements=[];const value=(key)=>condition[key]??compiled[key];if(value("required_color"))requirements.push(`色:${value("required_color")}`);if(condition.required_lineage)requirements.push(`系統:${condition.required_lineage}`);if(value("min_cost")!=null)requirements.push(`コスト${value("min_cost")}以上`);if(value("required_card_name"))requirements.push(`カード名:${value("required_card_name")}`);if(value("required_card_type"))requirements.push(`種類:${value("required_card_type")}`);if(condition.timing)requirements.push(`時点:${condition.timing}`);const state=compiled.state_requirement;if(state==="life_at_least")requirements.push(`ライフ${compiled.state_value}以上`);else if(state==="count_at_least")requirements.push(`カウント${compiled.state_value}以上`);else if(state==="no_spirit_on_field_or_in_trash")requirements.push("場・トラッシュにスピリットなし");else if(state==="unsupported")requirements.push("条件詳細は端末内判定未対応");return`${condition.condition_type||"特殊条件"}${condition.side?`(${condition.side})`:""}${requirements.length?`｜${requirements.join(" / ")}`:""}`}
 function chipLabels(card){return unique([...(card?.stage4?.has_no_effect_text?["効果無記述"]:[]),...(card?.keywords||[]).map(k=>k.name),...(card?.effect_actions||[]).map(a=>a.action||a.category)])}
 function searchText(card){return[card.card_no,card.name,card.name_en,card.card_type,...(card.lineages||[]),...chipLabels(card)].filter(Boolean).join(" ").toLocaleLowerCase("ja")}
 function quantityBadge(card,quantity){return`<span class="count-badge" aria-label="${esc(card.name)}はデッキ内${quantity}枚">${quantity}</span>`}
-function pseudoCard(card,kind,quantity){const chips=chipLabels(card),lineages=(card.lineages||[]).join(" / ")||"系統なし",minus=`<button data-dec="${esc(card.card_no)}" aria-label="${esc(card.name)}を1枚減らす"${quantity?"":" disabled"}>－</button>`,plus=kind==="deck"?`<button data-inc="${esc(card.card_no)}" aria-label="${esc(card.name)}を1枚増やす">＋</button>`:`<button data-add="${esc(card.card_no)}" aria-label="${esc(card.name)}を1枚追加">＋</button>`,actions=kind==="deck"?`${minus}${quantityBadge(card,quantity)}${plus}<button class="danger" data-del="${esc(card.card_no)}" aria-label="${esc(card.name)}をすべて抜く">×</button>`:`${minus}${quantityBadge(card,quantity)}${plus}`,action=kind==="deck"?"remove":"add",direction=kind==="deck"?"カード一覧へ戻して1枚減らす":"構築へ追加",drag=` data-drag-card="${esc(card.card_no)}" data-drag-action="${action}" aria-roledescription="${direction}ことができる疑似カード"`;return`<li><article class="pseudo-card" style="${cardStyle(card)}"${drag}><button type="button" class="pseudo-open" data-detail="${esc(card.card_no)}" aria-label="${esc(card.name)}の非公式データ詳細"><span class="pseudo-head"><span class="pseudo-cost" aria-label="コスト${card.cost??"不明"}">${card.cost??"—"}</span><span class="pseudo-title">${esc(card.name)}</span></span><span class="pseudo-code">${esc(card.card_no)} / ${esc(card.card_type||"種類不明")}</span>${sessionImage(card.card_no)}<span class="pseudo-stats">${esc(bpLabel(card))}</span><span class="pseudo-lineage">${esc(lineages)}</span><span class="pseudo-tags">${chips.slice(0,2).map(v=>`<span class="tag-chip">${esc(v)}</span>`).join("")||'<span class="tag-chip">タグなし</span>'}${chips.length>2?`<span class="tag-chip">ほか${chips.length-2}</span>`:""}</span></button><span class="pseudo-actions">${actions}</span></article></li>`}
-function compactCard(card,kind,quantity){const minus=`<button data-dec="${esc(card.card_no)}" aria-label="${esc(card.name)}を1枚減らす"${quantity?"":" disabled"}>－</button>`,plus=kind==="deck"?`<button data-inc="${esc(card.card_no)}" aria-label="${esc(card.name)}を1枚増やす">＋</button>`:`<button data-add="${esc(card.card_no)}" aria-label="${esc(card.name)}を1枚追加">＋</button>`,actions=kind==="deck"?`${minus}${quantityBadge(card,quantity)}${plus}<button class="danger" data-del="${esc(card.card_no)}" aria-label="${esc(card.name)}をすべて抜く">×</button>`:`${minus}${quantityBadge(card,quantity)}${plus}`;return`<li><span><button type="button" data-detail="${esc(card.card_no)}" class="name">${esc(card.name)}</button><span class="meta">${esc(card.card_no)} / ${esc(card.card_type||"-")} / コスト${card.cost??"-"}${card.is_contract_card?" / 契約":""}</span></span><span class="qty">${actions}</span></li>`}
+function pseudoCard(card,kind,quantity){const chips=chipLabels(card),lineages=(card.lineages||[]).join(" / ")||"系統なし",minus=`<button data-dec="${esc(card.card_no)}" aria-label="${esc(card.name)}を1枚減らす"${quantity?"":" disabled"}>－</button>`,plus=kind==="deck"?`<button data-inc="${esc(card.card_no)}" aria-label="${esc(card.name)}の追加枚数を入力">＋</button>`:`<button data-add="${esc(card.card_no)}" aria-label="${esc(card.name)}の追加枚数を入力">＋</button>`,actions=kind==="deck"?`${minus}${quantityBadge(card,quantity)}${plus}<button class="danger" data-del="${esc(card.card_no)}" aria-label="${esc(card.name)}をすべて抜く">×</button>`:`${minus}${quantityBadge(card,quantity)}${plus}`,action=kind==="deck"?"remove":"add",direction=kind==="deck"?"カード一覧へ戻して1枚減らす":"構築へ追加",drag=` data-drag-card="${esc(card.card_no)}" data-drag-action="${action}" aria-roledescription="${direction}ことができる疑似カード"`;return`<li><article class="pseudo-card" style="${cardStyle(card)}"${drag}><button type="button" class="pseudo-open" data-detail="${esc(card.card_no)}" aria-label="${esc(card.name)}の非公式データ詳細"><span class="pseudo-head"><span class="pseudo-cost" aria-label="コスト${card.cost??"不明"}">${card.cost??"—"}</span><span class="pseudo-title">${esc(card.name)}</span></span><span class="pseudo-code">${esc(card.card_no)} / ${esc(card.card_type||"種類不明")}</span>${sessionImage(card.card_no)}<span class="pseudo-stats">${esc(bpLabel(card))}</span><span class="pseudo-lineage">${esc(lineages)}</span><span class="pseudo-tags">${chips.slice(0,2).map(v=>`<span class="tag-chip">${esc(v)}</span>`).join("")||'<span class="tag-chip">タグなし</span>'}${chips.length>2?`<span class="tag-chip">ほか${chips.length-2}</span>`:""}</span></button><span class="pseudo-actions">${actions}</span></article></li>`}
+function compactCard(card,kind,quantity){const minus=`<button data-dec="${esc(card.card_no)}" aria-label="${esc(card.name)}を1枚減らす"${quantity?"":" disabled"}>－</button>`,plus=kind==="deck"?`<button data-inc="${esc(card.card_no)}" aria-label="${esc(card.name)}の追加枚数を入力">＋</button>`:`<button data-add="${esc(card.card_no)}" aria-label="${esc(card.name)}の追加枚数を入力">＋</button>`,actions=kind==="deck"?`${minus}${quantityBadge(card,quantity)}${plus}<button class="danger" data-del="${esc(card.card_no)}" aria-label="${esc(card.name)}をすべて抜く">×</button>`:`${minus}${quantityBadge(card,quantity)}${plus}`;return`<li><span><button type="button" data-detail="${esc(card.card_no)}" class="name">${esc(card.name)}</button><span class="meta">${esc(card.card_no)} / ${esc(card.card_type||"-")} / コスト${card.cost??"-"}${card.is_contract_card?" / 契約":""}</span></span><span class="qty">${actions}</span></li>`}
 function restoreActionFocus(containerId,attribute,cardNo){const container=$(containerId),same=[...container.querySelectorAll(`[${attribute}]`)].find(node=>node.getAttribute(attribute)===cardNo&&!node.disabled),alternate=[...container.querySelectorAll("[data-add],[data-inc],[data-dec]")].find(node=>!node.disabled&&[node.dataset.add,node.dataset.inc,node.dataset.dec].includes(cardNo));(same||alternate||container.closest(".panel"))?.focus?.()}
 function changeFromButton(button,attribute,quantity){const cardNo=button.getAttribute(attribute),containerId=button.closest(".list")?.id;setQuantity(cardNo,quantity);if(containerId)restoreActionFocus(containerId,attribute,cardNo)}
 function dragTargetPanel(action){return $(action==="remove"?"search-panel":"deck-panel")}
@@ -820,9 +1091,27 @@ function dragLandingPoint(drag,landed){const element=landed?$(drag.action==="rem
 function beginCardDrag(event){if(event.button!=null&&event.button!==0)return;if(event.target.closest(".pseudo-actions button"))return;const surface=event.currentTarget,cardNo=surface.dataset.dragCard,action=surface.dataset.dragAction,card=byNo.get(cardNo),touch=event.pointerType!=="mouse";if(!card||!["add","remove"].includes(action))return;pointerDrag={pointerId:event.pointerId,cardNo,action,surface,touch,startX:event.clientX,startY:event.clientY,lastX:event.clientX,lastY:event.clientY,active:false,ghost:null,holdTimer:0};if(!touch)return;document.addEventListener("contextmenu",blockDragContextMenu);pointerDrag.holdTimer=setTimeout(activateCardDrag,DRAG_HOLD_MS)}
 function moveCardDrag(event){if(!pointerDrag||event.pointerId!==pointerDrag.pointerId)return;pointerDrag.lastX=event.clientX;pointerDrag.lastY=event.clientY;const moved=Math.hypot(event.clientX-pointerDrag.startX,event.clientY-pointerDrag.startY);if(!pointerDrag.active){if(pointerDrag.touch){if(moved>=DRAG_HOLD_SLOP)cancelDragCandidate();return}if(moved<6)return;activateCardDrag()}if(pointerDrag?.active){event.preventDefault();updateDragTarget(event)}}
 function bindDragSurface(surface){surface.onpointerdown=beginCardDrag;surface.addEventListener("click",event=>{if(!surface.dataset.suppressClick)return;delete surface.dataset.suppressClick;event.preventDefault();event.stopPropagation()},true)}
-function bindCardActions(container){container.querySelectorAll("[data-detail]").forEach(b=>b.onclick=()=>openCardDetail(b.dataset.detail,b));container.querySelectorAll("[data-add]").forEach(b=>b.onclick=()=>changeFromButton(b,"data-add",(counts.get(b.dataset.add)||0)+1));container.querySelectorAll("[data-dec]").forEach(b=>b.onclick=()=>changeFromButton(b,"data-dec",(counts.get(b.dataset.dec)||0)-1));container.querySelectorAll("[data-inc]").forEach(b=>b.onclick=()=>changeFromButton(b,"data-inc",(counts.get(b.dataset.inc)||0)+1));container.querySelectorAll("[data-del]").forEach(b=>b.onclick=()=>changeFromButton(b,"data-del",0));container.querySelectorAll("[data-drag-card]").forEach(bindDragSurface)}
+function askPortableAddQuantity(button, attribute) {
+  const cardNo = button.getAttribute(attribute);
+  const card = byNo.get(cardNo);
+  const current = counts.get(cardNo) || 0;
+  if (current >= 99) {
+    status(`${card.name}はこのデッキに99枚入っています。`, "error");
+    return;
+  }
+  BSDBCardControls.askAddQuantity(`${card.name}（${cardNo}）`, 99 - current, (quantity) => {
+    changeFromButton(button, attribute, current + quantity);
+  });
+}
+function bindCardActions(container){container.querySelectorAll("[data-detail]").forEach(b=>b.onclick=()=>openCardDetail(b.dataset.detail,b));container.querySelectorAll("[data-add]").forEach(b=>b.onclick=()=>askPortableAddQuantity(b,"data-add"));container.querySelectorAll("[data-dec]").forEach(b=>b.onclick=()=>changeFromButton(b,"data-dec",(counts.get(b.dataset.dec)||0)-1));container.querySelectorAll("[data-inc]").forEach(b=>b.onclick=()=>askPortableAddQuantity(b,"data-inc"));container.querySelectorAll("[data-del]").forEach(b=>b.onclick=()=>changeFromButton(b,"data-del",0));container.querySelectorAll("[data-drag-card]").forEach(bindDragSurface)}
 function setViewMode(mode){viewMode=mode==="list"?"list":"grid";$("view-grid").setAttribute("aria-pressed",String(viewMode==="grid"));$("view-list").setAttribute("aria-pressed",String(viewMode==="list"));renderSearch();renderDeck()}
-function openCardDetail(cardNo,source,under){const card=byNo.get(cardNo);if(!card)return;detailReturnFocus=source||document.activeElement;const navItems=source?.dataset?.detail?[...(source.closest("ul,ol")?.querySelectorAll("[data-detail]")||[])]:[],navIndex=navItems.indexOf(source),nav=navItems.length>1&&navIndex>=0?`<span class="card-detail-nav"><button type="button" data-detail-step="-1" aria-label="前のカード"${navIndex===0?" disabled":""}>‹</button><span class="meta">${navIndex+1} / ${navItems.length}</span><button type="button" data-detail-step="1" aria-label="次のカード"${navIndex===navItems.length-1?" disabled":""}>›</button></span>`:"";detailNavSource=nav?source:null;const image=sessionImage(cardNo,"detail"),keywords=unique([...(card.stage4?.has_no_effect_text?["効果無記述"]:[]),...(card.keywords||[]).map(k=>k.name)]),summaries=unique((card.effect_actions||[]).map(functionalSummary)),compiledConditions=[...(card.stage4?.summon_conditions||[])],conditions=(card.special_conditions||[]).map(c=>conditionSummary(c,c.condition_type==="召喚条件"?(compiledConditions.shift()||{}):{})),reductions=(card.reductions||[]).map(r=>`${r.color}${r.count}`).join(" / ")||"なし",symbols=(card.symbols||[]).map(r=>`${r.color}${r.count}`).join(" / ")||"なし",lineages=(card.lineages||[]).join(" / ")||"なし",linkages=unique((card.linkage_effects||[]).map(r=>`${r.linkage_type}${r.level!=null?` Lv${r.level}`:""}`)).join(" / ")||"なし";$("card-detail-panel").style.cssText=cardStyle(card);$("card-detail-body").innerHTML=`<header class="card-detail-head"><div class="card-detail-headline"><div><div class="meta">非公式データ詳細</div><h2 id="card-detail-title">${esc(card.name)}</h2><span class="meta">${esc(card.card_no)}${card.name_en?` / ${esc(card.name_en)}`:""}</span></div>${nav}<button id="card-detail-close" type="button" class="card-detail-close" aria-label="詳細を閉じる">×</button></div></header><div class="card-detail-body">${image}${(under||[]).length?`<button type="button" class="card-detail-under" data-under-open="1">下のカードを見る（${(under||[]).length}枚）</button>`:""}<section class="detail-section"><h3>カード情報</h3><div class="detail-facts"><div class="detail-fact"><b>種類 / コスト</b>${esc(card.card_type||"—")} / ${card.cost??"—"}</div><div class="detail-fact"><b>BP</b>${esc(bpLabel(card))}</div><div class="detail-fact"><b>系統</b>${esc(lineages)}</div><div class="detail-fact"><b>軽減 / シンボル</b>${esc(reductions)} / ${esc(symbols)}</div><div class="detail-fact"><b>構築制限</b>${esc(card.restriction_status||`同名最大${maxCopies(card)}枚`)}</div><div class="detail-fact"><b>カード連結</b>${esc(linkages)}</div></div></section><section class="detail-section"><h3>効果タグ</h3>${keywords.length?`<div class="detail-tags">${keywords.map(v=>`<span class="tag-chip">${esc(v)}</span>`).join("")}</div>`:""}${summaries.length?`<ul class="detail-summary-list">${summaries.map(v=>`<li>${esc(v)}</li>`).join("")}</ul>`:""}${keywords.length||summaries.length?"":'<span class="meta">タグなし</span>'}</section>${conditions.length?`<section class="detail-section"><h3>構造化された特殊条件</h3><ul class="detail-summary-list">${conditions.map(v=>`<li>${esc(v)}</li>`).join("")}</ul></section>`:""}<div class="detail-disclaimer">機能要約は非公式データ表示です。手元画像を選んだ場合も現在セッションだけに留め、共有HTML／JSONへ含めません。実際のプレイ時は公式カードと最新ルールを確認してください。</div></div>`;$("card-detail").classList.remove("hidden");$("card-detail-panel").scrollTop=0;$("card-detail-close").onclick=closeCardDetail;$("card-detail-body").querySelectorAll("[data-detail-step]").forEach(b=>b.onclick=()=>stepCardDetail(Number(b.dataset.detailStep)));const underButton=$("card-detail-body").querySelector("[data-under-open]");if(underButton)underButton.onclick=()=>{closeCardDetail();openZoom(cardNo,under)};$("card-detail-close").focus()}
+function openCardDetail(cardNo,source,under){const card=byNo.get(cardNo);if(!card)return;detailReturnFocus=source||document.activeElement;const navItems=source?.dataset?.detail?[...(source.closest("ul,ol")?.querySelectorAll("[data-detail]")||[])]:[],navIndex=navItems.indexOf(source),nav=navItems.length>1&&navIndex>=0?`<span class="card-detail-nav"><button type="button" data-detail-step="-1" aria-label="前のカード"${navIndex===0?" disabled":""}>‹</button><span class="meta">${navIndex+1} / ${navItems.length}</span><button type="button" data-detail-step="1" aria-label="次のカード"${navIndex===navItems.length-1?" disabled":""}>›</button></span>`:"";detailNavSource=nav?source:null;const image=sessionImage(cardNo,"detail"),compiledConditions=[...(card.stage4?.summon_conditions||[])],conditions=(card.special_conditions||[]).map(c=>conditionSummary(c,c.condition_type==="召喚条件"?(compiledConditions.shift()||{}):{})),reductions=(card.reductions||[]).map(r=>`${r.color}${r.count}`).join(" / ")||"なし",symbols=(card.symbols||[]).map(r=>`${r.color}${r.count}`).join(" / ")||"なし",lineages=(card.lineages||[]).join(" / ")||"なし",linkages=unique((card.linkage_effects||[]).map(r=>`${r.linkage_type}${r.level!=null?` Lv${r.level}`:""}`)).join(" / ")||"なし";$("card-detail-panel").style.cssText=cardStyle(card);$("card-detail-body").innerHTML=`<header class="card-detail-head"><div class="card-detail-headline"><div><div class="meta">非公式データ詳細</div><h2 id="card-detail-title">${esc(card.name)}</h2><span class="meta">${esc(card.card_no)}${card.name_en?` / ${esc(card.name_en)}`:""}</span></div>${nav}<button id="card-detail-close" type="button" class="card-detail-close" aria-label="詳細を閉じる">×</button></div></header><div class="card-detail-body">${image}${(under||[]).length?`<button type="button" class="card-detail-under" data-under-open="1">下のカードを見る（${(under||[]).length}枚）</button>`:""}<section class="detail-section"><h3>カード情報</h3><div class="detail-facts"><div class="detail-fact"><b>種類 / コスト</b>${esc(card.card_type||"—")} / ${card.cost??"—"}</div><div class="detail-fact"><b>BP</b>${esc(bpLabel(card))}</div><div class="detail-fact"><b>系統</b>${esc(lineages)}</div><div class="detail-fact"><b>軽減 / シンボル</b>${esc(reductions)} / ${esc(symbols)}</div><div class="detail-fact"><b>構築制限</b>${esc(card.restriction_status||`同名最大${maxCopies(card)}枚`)}</div><div class="detail-fact"><b>カード連結</b>${esc(linkages)}</div></div></section><section class="detail-section"><h3>効果タグ</h3><div class="effect-tag-list"></div></section>${conditions.length?`<section class="detail-section"><h3>構造化された特殊条件</h3><ul class="detail-summary-list">${conditions.map(v=>`<li>${esc(v)}</li>`).join("")}</ul></section>`:""}<div class="detail-disclaimer">機能要約は非公式データ表示です。手元画像を選んだ場合も現在セッションだけに留め、共有HTML／JSONへ含めません。実際のプレイ時は公式カードと最新ルールを確認してください。</div></div>`;
+  BSDBCardControls.renderEffectTags($("card-detail-body").querySelector(".effect-tag-list"), {
+    actions: card.effect_actions,
+    keywords: card.keywords,
+    noEffect: card.stage4?.has_no_effect_text,
+  });
+  $("card-detail").classList.remove("hidden");$("card-detail-panel").scrollTop=0;$("card-detail-close").onclick=closeCardDetail;$("card-detail-body").querySelectorAll("[data-detail-step]").forEach(b=>b.onclick=()=>stepCardDetail(Number(b.dataset.detailStep)));const underButton=$("card-detail-body").querySelector("[data-under-open]");if(underButton)underButton.onclick=()=>{closeCardDetail();openZoom(cardNo,under)};$("card-detail-close").focus()}
 function closeCardDetail(){$("card-detail").classList.add("hidden");$("card-detail-body").textContent="";detailReturnFocus?.focus?.();detailReturnFocus=null;detailNavSource=null}
 // 拡大表示の左右送り。開いた元の並び(デッキ・検索結果)を送るたびにDOMから読み直す。背後の一覧は動かさず、閉じたときのfocus返しで今の札まで寄せる。
 function stepCardDetail(delta){const source=detailNavSource;if(!source?.isConnected)return;const items=[...source.closest("ul,ol").querySelectorAll("[data-detail]")],target=items[items.indexOf(source)+delta];if(!target)return;openCardDetail(target.dataset.detail,target);const button=$("card-detail-body").querySelector(`[data-detail-step="${delta}"]`);if(button&&!button.disabled)button.focus()}
@@ -1058,7 +1347,7 @@ function wrapCanvasText(ctx,value,x,y,width,lineHeight,maxLines=2){const chars=[
 async function deckImageBlob(){const cards=normalizedCards();if(!cards.length)throw new Error("カードを1枚以上入れてください");const columns=5,rows=Math.ceil(cards.length/columns),width=1200,pad=54,gap=18,cardW=(width-pad*2-gap*(columns-1))/columns,cardH=176,height=178+rows*(cardH+gap)+62,canvas=document.createElement("canvas");canvas.width=width;canvas.height=height;const ctx=canvas.getContext("2d");ctx.fillStyle="#10131b";ctx.fillRect(0,0,width,height);ctx.fillStyle="#f3f5fa";ctx.font='700 38px "Yu Gothic UI","Segoe UI",sans-serif';ctx.fillText($("deck-name").value||"共有デッキ",pad,62);ctx.fillStyle="#aab2c3";ctx.font='22px "Yu Gothic UI","Segoe UI",sans-serif';ctx.fillText(`${cards.reduce((sum,row)=>sum+row.quantity,0)}枚 / BattleSpiritsDB 非公式・画像なし構築`,pad,104);ctx.fillStyle="#6fa0ff";ctx.fillRect(pad,126,width-pad*2,4);cards.forEach((row,index)=>{const card=byNo.get(row.card_no)||{},x=pad+(index%columns)*(cardW+gap),y=158+Math.floor(index/columns)*(cardH+gap),color=CARD_COLORS[cardColors(card)[0]]||"#667085";ctx.fillStyle="#1e2430";ctx.fillRect(x,y,cardW,cardH);ctx.fillStyle=color;ctx.fillRect(x,y,10,cardH);ctx.fillStyle="#f7f8fb";ctx.font='700 21px "Yu Gothic UI","Segoe UI",sans-serif';wrapCanvasText(ctx,card.name||row.card_no,x+24,y+34,cardW-72,27,2);ctx.fillStyle="#b9c1d1";ctx.font='16px "Yu Gothic UI","Segoe UI",sans-serif';ctx.fillText(`${row.card_no} / ${card.card_type||"種類不明"}`,x+24,y+101);ctx.fillText(`コスト ${card.cost??"—"}`,x+24,y+132);ctx.fillStyle=color;ctx.beginPath();ctx.arc(x+cardW-34,y+34,25,0,Math.PI*2);ctx.fill();ctx.fillStyle="#fff";ctx.font='700 22px "Segoe UI",sans-serif';ctx.textAlign="center";ctx.fillText(`×${row.quantity}`,x+cardW-34,y+42);ctx.textAlign="left"});ctx.fillStyle="#7f899e";ctx.font='16px "Yu Gothic UI","Segoe UI",sans-serif';ctx.fillText("公式カード画像・逐語効果文・所持情報は含みません",pad,height-24);return new Promise((resolve,reject)=>canvas.toBlob(blob=>blob?resolve(blob):reject(new Error("デッキ画像を作成できません")),"image/png"))}
 async function saveDeckImage(){downloadBlob(await deckImageBlob(),safeName(".deck.png"));status("画像なしのデッキ一覧を保存しました。","ok")}
 async function shareDeckImage(){const blob=await deckImageBlob(),file=new File([blob],safeName(".deck.png"),{type:"image/png"});if(navigator.share&&navigator.canShare?.({files:[file]})){await navigator.share({title:$("deck-name").value||"共有デッキ",files:[file]});return}downloadBlob(blob,file.name);status("画像共有に未対応のため、デッキ画像を保存しました。","ok")}
-async function exportHtml(nameOverride){const next=await currentBundle(true);if(nameOverride)next.deck.name=nameOverride;const node=$("bsdb-bootstrap"),old=node.textContent,oldName=$("deck-name").value;$("deck-name").value=next.deck.name;node.textContent=JSON.stringify(next).replaceAll("<","\\u003c");try{const clone=document.documentElement.cloneNode(true),q=id=>clone.querySelector(`#${id}`);q("status").textContent="デッキを読み込んでいます…";q("status").className="notice compact busy";q("scenarios").textContent="";q("timeline").textContent="";q("event").textContent="";q("board").textContent="";q("trace").classList.add("hidden");q("progress").classList.add("hidden");q("perf").textContent="カタログ展開中";q("image-note").textContent=NO_IMAGE_NOTE;q("image-clear").disabled=true;q("image-files").value="";q("image-extra-nos").value="";q("image-extra-nos").textContent="";q("card-zoom").textContent="";q("card-zoom").classList.add("hidden");q("card-detail-body").textContent="";q("card-detail").classList.add("hidden");q("share-dialog").classList.add("hidden");q("options-dialog").classList.add("hidden");q("image-ready").classList.add("hidden");q("receiver-image-tools").classList.add("hidden");q("deck-edit-live").textContent="";q("search-panel").classList.remove("drag-over");q("deck-panel").classList.remove("drag-over");q("editor-workspace").classList.remove("search-split");clone.querySelectorAll("[data-workspace-panel]").forEach(panel=>panel.classList.toggle("hidden",panel.dataset.workspacePanel!=="deck"));clone.querySelectorAll("[data-workspace]").forEach(button=>button.setAttribute("aria-pressed",String(button.dataset.workspace==="deck")));clone.querySelectorAll(".drag-ghost,.session-image").forEach(node=>node.remove());clone.querySelectorAll('img[src^="blob:"]').forEach(img=>img.remove());const html="<!doctype html>\n"+clone.outerHTML;if(/(?:src|href)="blob:[^"]+"/i.test(html))throw new Error("セッション画像の分離に失敗しました");download(html,safeName(".bsdeck.html"),"text/html;charset=utf-8")}finally{node.textContent=old;$("deck-name").value=oldName}bundle=next;$("deck-name").value=next.deck.name;deckHistory=[];render();status("共有用HTMLを保存しました。この1ファイルを相手へ渡せます。","ok")}
+async function exportHtml(nameOverride){const next=await currentBundle(true);if(nameOverride)next.deck.name=nameOverride;const node=$("bsdb-bootstrap"),old=node.textContent,oldName=$("deck-name").value;$("deck-name").value=next.deck.name;node.textContent=JSON.stringify(next).replaceAll("<","\\u003c");try{const clone=document.documentElement.cloneNode(true),q=id=>clone.querySelector(`#${id}`);q("status").textContent="デッキを読み込んでいます…";q("status").className="notice compact busy";q("scenarios").textContent="";q("timeline").textContent="";q("event").textContent="";q("board").textContent="";q("trace").classList.add("hidden");q("progress").classList.add("hidden");q("perf").textContent="カタログ展開中";q("image-note").textContent=NO_IMAGE_NOTE;q("image-clear").disabled=true;q("image-files").value="";q("image-extra-nos").value="";q("image-extra-nos").textContent="";q("card-zoom").textContent="";q("card-zoom").classList.add("hidden");q("card-detail-body").textContent="";q("card-detail").classList.add("hidden");q("share-dialog").classList.add("hidden");q("options-dialog").classList.add("hidden");q("image-ready").classList.add("hidden");q("receiver-image-tools").classList.add("hidden");q("deck-edit-live").textContent="";q("search-panel").classList.remove("drag-over");q("deck-panel").classList.remove("drag-over");q("editor-workspace").classList.remove("search-split");clone.querySelectorAll("[data-workspace-panel]").forEach(panel=>panel.classList.toggle("hidden",panel.dataset.workspacePanel!=="deck"));clone.querySelectorAll("[data-workspace]").forEach(button=>button.setAttribute("aria-pressed",String(button.dataset.workspace==="deck")));clone.querySelectorAll(".add-quantity-dialog,.drag-ghost,.session-image").forEach(node=>node.remove());clone.querySelectorAll('img[src^="blob:"]').forEach(img=>img.remove());const html="<!doctype html>\n"+clone.outerHTML;if(/(?:src|href)="blob:[^"]+"/i.test(html))throw new Error("セッション画像の分離に失敗しました");download(html,safeName(".bsdeck.html"),"text/html;charset=utf-8")}finally{node.textContent=old;$("deck-name").value=oldName}bundle=next;$("deck-name").value=next.deck.name;deckHistory=[];render();status("共有用HTMLを保存しました。この1ファイルを相手へ渡せます。","ok")}
 async function importBundle(value){await BSDBPortableURL.validateBundle(value);const reconciled=reconcileBundleCatalog(value,catalog);value=reconciled.value;bundle={...value,opponent_decks:value.opponent_decks||[]};counts=new Map(value.deck.cards.map(r=>[r.card_no,r.quantity]));deckHistory=[];$("deck-name").value=value.deck.name||"";$("trials").value=value.analysis?.trials||500;$("turns").value=value.analysis?.turns||3;$("analysis-mode").value=value.analysis?.mode||"stage4";$("stage6-first-player").value=value.analysis?.stage6?.first_player||"self";$("stage6-rounds").value=value.analysis?.stage6?.max_rounds||5;$("stage6-seed").value=value.analysis?.seed||12345;populateOpponents();lastResult=null;render();setWorkspace("deck");status(reconciled.upgraded?"カードデータベース更新後のため現在版で読み込みました。分析は再計算してください。":"共有JSONを読み込みました。原案との差分を保持したまま編集できます。","ok")}
 for(const input of [$("search"),$("search-type"),$("search-color"),$("search-cost"),$("search-set")])input.oninput=renderSearch;
 $("search-clear").onclick=()=>{$("search").value="";$("search-type").value="";$("search-color").value="";$("search-cost").value="";$("search-set").value="";renderSearch();$("search").focus()};
@@ -1071,7 +1360,7 @@ for(const id of ["share-dialog","options-dialog"])$(id).onclick=e=>{if(e.target=
 $("trace-pos").onclick=()=>toggleTimeline();addEventListener("keydown",event=>{if(event.key==="Escape"&&$("trace").classList.contains("timeline-open"))toggleTimeline(false)});$("trace-nav-min").onclick=()=>minimizeTraceNav(true);$("trace-nav-open").onclick=()=>minimizeTraceNav(false);addEventListener("resize",()=>{positionTraceNav();if(!timelineIsPopover()){scrollTimelineToSelected();return}if($("trace").classList.contains("timeline-open"))positionTimelinePopover()});$("analysis-mode").onchange=analysisModeChanged;$("stage6-seed-random").onclick=()=>{const words=new Uint32Array(2);crypto.getRandomValues(words);$("stage6-seed").value=words[0]*0x200000+(words[1]>>>11)};$("analyze").onclick=analyze;$("prev").onclick=()=>{traceIndex--;renderTrace()};$("next").onclick=()=>{traceIndex++;renderTrace()};$("prev-jump").onclick=()=>jumpTrace(-1);$("next-jump").onclick=()=>jumpTrace(1);$("image-open").onclick=()=>$("image-files").click();$("image-clear").onclick=clearImages;$("image-files").onchange=e=>{loadImages(e.target.files);e.target.value=""};$("board").onclick=e=>{if(e.target.closest(".cores-open")){renderTrace();return}const mark=e.target.closest(".orb-many");if(mark){expandCores(mark);return}/* コア置き場と上段(コスト・Lv・BP)はカードの兄弟なので、そこを押すと`.pm-card`が
    祖先に無く、札の中央を押しても何も開かなかった(2026-09-16の指摘)。札のどこを
    押しても、その札のカードとして扱う。 */
-const card=e.target.closest(".pm-card")||e.target.closest(".pm-unit")?.querySelector(".pm-card"),no=card?.dataset.cardNo;if(!no)return;const under=card.dataset.under?card.dataset.under.split(","):[];if(byNo.has(no))openCardDetail(no,card,under);else openZoom(no,under);};$("card-zoom").onclick=()=>$("card-zoom").classList.add("hidden");$("card-detail").onclick=e=>{if(e.target===$("card-detail"))closeCardDetail()};$("card-detail").onkeydown=e=>{if((e.key!=="ArrowLeft"&&e.key!=="ArrowRight")||e.altKey||e.ctrlKey||e.metaKey||e.shiftKey||!detailNavSource)return;e.preventDefault();stepCardDetail(e.key==="ArrowLeft"?-1:1)};document.addEventListener("pointermove",moveCardDrag,{passive:false});document.addEventListener("touchmove",blockTouchScroll,{passive:false});document.addEventListener("pointerup",e=>finishCardDrag(e));document.addEventListener("pointercancel",e=>finishCardDrag(e,true));document.addEventListener("keydown",e=>{if(e.key!=="Escape")return;if(pointerDrag)finishCardDrag({pointerId:pointerDrag.pointerId,clientX:0,clientY:0},true);else if(!$("share-dialog").classList.contains("hidden"))closeUtility("share-dialog");else if(!$("options-dialog").classList.contains("hidden"))closeUtility("options-dialog");else if(!$("card-detail").classList.contains("hidden"))closeCardDetail();else $("card-zoom").classList.add("hidden")});window.addEventListener("resize",()=>setWorkspace(activeWorkspace,false));
+const card=e.target.closest(".pm-card")||e.target.closest(".pm-unit")?.querySelector(".pm-card"),no=card?.dataset.cardNo;if(!no)return;const under=card.dataset.under?card.dataset.under.split(","):[];if(byNo.has(no))openCardDetail(no,card,under);else openZoom(no,under);};$("card-zoom").onclick=()=>$("card-zoom").classList.add("hidden");$("card-detail").onclick=e=>{if(e.target===$("card-detail"))closeCardDetail()};$("card-detail").onkeydown=e=>{if((e.key!=="ArrowLeft"&&e.key!=="ArrowRight")||e.altKey||e.ctrlKey||e.metaKey||e.shiftKey||!detailNavSource)return;e.preventDefault();stepCardDetail(e.key==="ArrowLeft"?-1:1)};document.addEventListener("pointermove",moveCardDrag,{passive:false});document.addEventListener("touchmove",blockTouchScroll,{passive:false});document.addEventListener("pointerup",e=>finishCardDrag(e));document.addEventListener("pointercancel",e=>finishCardDrag(e,true));document.addEventListener("keydown",e=>{if(e.key!=="Escape"||e.defaultPrevented||document.querySelector(".add-quantity-dialog[open]"))return;if(pointerDrag)finishCardDrag({pointerId:pointerDrag.pointerId,clientX:0,clientY:0},true);else if(!$("share-dialog").classList.contains("hidden"))closeUtility("share-dialog");else if(!$("options-dialog").classList.contains("hidden"))closeUtility("options-dialog");else if(!$("card-detail").classList.contains("hidden"))closeCardDetail();else $("card-zoom").classList.add("hidden")});window.addEventListener("resize",()=>setWorkspace(activeWorkspace,false));
 $("image-extra-nos").onchange=()=>{try{readManualImageNos()}catch(error){status(`追加するカード番号を確認してください: ${error.message}`,"error")}};$("image-fetch").onclick=async()=>{try{await fetchReceiverImages()}catch(error){status(`画像を取得できません: ${error.message}`,"error")}};$("image-notify").onclick=async()=>{$("image-fetch-note").textContent=await BSDBReceiverImages.enableNotifications()==="granted"?"完了時に端末通知します":"通知は使わず画面内で確認します"};$("image-apply").onclick=()=>decideImages(true);$("image-discard").onclick=()=>decideImages(false);navigator.serviceWorker?.addEventListener("message",event=>{if(event.data?.type==="BSDB_IMAGE_DECISION"&&event.data.decision==="apply"&&pendingImageSet?.id===event.data.setId)decideImages(true)});
 $("export-json").onclick=async()=>download(JSON.stringify(await currentBundle(true),null,2)+"\n",safeName(".bsdeck.json"),"application/json");$("export-html").onclick=async()=>{await exportHtml();closeUtility("share-dialog")};$("copy-save").onclick=async()=>{const name=prompt("保存するデッキ名",`${$("deck-name").value} 改`);if(name?.trim()){await exportHtml(name.trim());closeUtility("share-dialog")}};$("import-json").onclick=()=>$("import-file").click();$("import-file").onchange=async e=>{try{await importBundle(JSON.parse(await e.target.files[0].text()));closeUtility("share-dialog")}catch(error){status(`読み込めません: ${error.message}`,"error")}finally{e.target.value=""}};
 (async()=>{try{if(!("DecompressionStream"in globalThis))throw new Error("このブラウザはgzip展開に未対応です");if(DELIVERY==="static-web"&&"serviceWorker"in navigator)await navigator.serviceWorker.register("portable_sw.js");const loadedBundle=await loadBundle(),assets=await Promise.all([loadCatalog(),loadRuntime()]);catalog=assets[0];bundle=loadedBundle||await emptyBundle(catalog);if(catalog.format!==CATALOG_FORMAT||catalog.format_version!==CATALOG_VERSION||catalog.display_profile!==DISPLAY_PROFILE)throw new Error("配布用表示profile v2ではないカタログです");if(loadedBundle)await BSDBPortableURL.validateBundle(bundle);const reconciled=reconcileBundleCatalog(bundle,catalog);bundle=reconciled.value;$("bsdb-catalog").textContent=catalogPayload;$("bsdb-runtime").textContent=runtimeSource;byNo=new Map(catalog.cards.map(c=>[c.card_no,c]));imageNoByStem.clear();for(const no of byNo.keys()){imageNoByStem.set(no.toUpperCase(),no);imageNoByStem.set(no.toUpperCase().replace("(B)","_B"),no)}counts=new Map(bundle.deck.cards.map(r=>[r.card_no,r.quantity]));$("deck-name").value=bundle.deck.name||"";$("trials").value=bundle.analysis?.trials||500;$("turns").value=bundle.analysis?.turns||3;$("analysis-mode").value=bundle.analysis?.mode||"stage4";$("stage6-first-player").value=bundle.analysis?.stage6?.first_player||"self";$("stage6-rounds").value=bundle.analysis?.stage6?.max_rounds||5;$("stage6-seed").value=bundle.analysis?.seed||12345;populateOpponents();render();setWorkspace("deck",false);if(DELIVERY==="static-web"&&bundle.image_targets?.card_nos?.length){$("receiver-image-tools").classList.remove("hidden");restoreManualImageNos();await loadActiveReceiverImages()}catalogMs=Math.round(performance.now()-bootStarted);$("perf").textContent=`展開 ${catalogMs}ms ／ 棋譜未計算`;$("catalog-info").textContent=`カードデータベース${catalog.cards.length}件・schema v${catalog.schema_version}・展開${catalogMs}ms`;status(reconciled.upgraded?"カードデータベース更新後のため現在版で開きました。分析は再計算してください。":DELIVERY==="single-html"?"オフラインで確認・編集できます。右上の「共有・保存」からリンクまたは新しいHTMLを作れます。":loadedBundle?"共有リンクを読み込みました。編集後は右上の「共有・保存」から新しいリンクを作れます。":"カードを追加して共有リンクを作成できます。","ok")}catch(error){const breakdown=document.getElementById("deck-breakdown");if(breakdown)breakdown.textContent="読み込めませんでした";status(`起動できません: ${error.message}`,"error")}})();

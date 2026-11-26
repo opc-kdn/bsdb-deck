@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v308-v1";
-  const STAGE_VERSION = "v308";
+  const ENGINE_SLICE = "stage4-v311-v1";
+  const STAGE_VERSION = "v311";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v308-portable-v252";
+  const RUNTIME_VERSION = "stage4-v311-portable-v255";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -968,6 +968,7 @@
   }
   const BASIC_COLORS = ["赤", "紫", "緑", "白", "黄", "青"];
   const SUPPORTED_EFFECTS = new Set([
+    "discard_set_burst", "unit_block_ban",
     "brave_attack_borrow",
     "self_chosen_hand_discard",
     "self_remain",
@@ -998,6 +999,7 @@
   const SUPPORTED_BURST_EFFECTS = new Set([
     "opponent_deck_discard",
     "self_chosen_hand_discard",
+    "discard_set_burst", "unit_block_ban",
     "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_level_treat", "unit_suppress",
     "draw", "coreboost", "core_to_trash", "field_coreboost", "count_gain",
     "burst_free_play_self", "burst_return_self_to_hand", "burst_pay_own_effect",
@@ -3463,6 +3465,11 @@
         && (!color || (host.colors || []).includes(color));
     }
     if (BASIC_COLORS.includes(value)) return (host.colors || []).includes(value);
+    match = value.match(/^([赤紫緑白黄青])[1１]色$/u);
+    if (match) {
+      const colors = host.colors || [];
+      return colors.length === 1 && colors[0] === match[1];
+    }
     return (host.lineages || []).includes(value);
   }
 
@@ -4779,12 +4786,44 @@
   }
 
   function doubleDriveHostsMatch(state, cards, brave, slot, continuous = false) {
-    return (continuous || !brave.waiting) && brave.brave_mode === "combine" && ["left", "right"].every(side => {
-      const host = state.field.find(unit => unit.uid === brave.combined_sides?.[side]
-        && (continuous || !unit.waiting && !unit.battle_destroy_pending));
-      const card = host && unitInfo(state, cards, host);
-      return card?.card_type.includes("スピリット") && cardMatchesSlot(card, slot);
-    });
+    return (continuous || !brave.waiting) && brave.brave_mode === "combine"
+      && ["left", "right"].every(side =>
+        doubleDriveHostMatches(state, cards, brave.combined_sides?.[side], slot, continuous));
+  }
+
+  function doubleDriveHostMatches(state, cards, uid, slot, continuous = false) {
+    const host = state.field.find(unit => unit.uid === uid
+      && (continuous || !unit.waiting && !unit.battle_destroy_pending));
+    const card = host && unitInfo(state, cards, host);
+    return card?.card_type.includes("スピリット") && cardMatchesSlot(card, slot);
+  }
+
+  function completeDoubleDriveLinks(state, cards, targets) {
+    const braveUids = state.field.filter(unit => cards[unit.card_no]?.double_drive_followup)
+      .map(unit => unit.uid).sort((a, b) => a - b);
+    for (const uid of braveUids) {
+      const brave = state.field.find(unit => unit.uid === uid);
+      if (!brave || brave.waiting) continue;
+      const effect = unitInfo(state, cards, brave)?.double_drive_followup;
+      if (!effect) continue;
+      const slot = effect.double_drive_host_slot;
+      if (doubleDriveHostsMatch(state, cards, brave, slot)) continue;
+      const actions = mainBraveOptions(state, cards).filter(action =>
+        action.brave_uid === brave.uid && ["combine", "exchange"].includes(action.kind)
+        && !("other_uid" in action) && doubleDriveHostMatches(state, cards, action.host_uid, slot));
+      const [left, right] = ["left", "right"].map(side => {
+        const current = brave.combined_sides?.[side];
+        return doubleDriveHostMatches(state, cards, current, slot)
+          ? [[current, null]]
+          : actions.filter(action => action.side === side).map(action => [action.host_uid, action]);
+      });
+      const first = left.find(([uid]) => right.some(([other]) => uid !== other));
+      if (!first) continue;
+      const second = right.find(([uid]) => uid !== first[0]);
+      for (const [, action] of [first, second]) {
+        if (action && !playMainBrave(state, cards, targets, action)) break;
+      }
+    }
   }
 
   function handUseLocks(state, cards) {
@@ -5147,6 +5186,7 @@
   function clearBraveReceivedEffects(unit) {
     for(const key of ['effects_suppressed_this_turn','level_cost_bonus','attack_forbidden_this_turn',
       'timed_symbol_fixes','forced_block_effect','block_restriction_effect','battle_blocker_types',
+      'block_forbidden_this_battle',
       'designation','bp_penalties','timed_symbol_grants','skip_next_refresh','u_reflected_battle'])delete unit[key];
   }
 
@@ -6108,6 +6148,7 @@
    *  相手の体を落とせるならそのためにセットする価値がある。 */
   // `zone_summon`(自分の別の札を出す、2026-10-11)はPython `_USEFUL_BURST_KINDS`同一。
   const USEFUL_BURST_KINDS = ["draw", "coreboost", "core_to_trash",
+    "discard_set_burst", "unit_block_ban",
     "opponent_deck_discard",
     "field_coreboost", "count_gain", "burst_free_play_self", "zone_summon",
     "unit_destroy", "unit_exhaust", "unit_core_remove", "unit_bounce",
@@ -6159,6 +6200,81 @@
     } else state.burst = cardNo;
     record(state, cards, "burst_set", { card_no: cardNo, source });
     resolveEventTriggers(state, cards, targets, "burst_set", { card_no: cardNo });
+    return true;
+  }
+
+  function burstWitnessCards(state, cards, field, zones) {
+    const results = [...field];
+    if (zones.includes("soul")) {
+      results.push(...state.soulCards.map(no => ({card: cards[no], cores: 0})));
+    }
+    if (zones.includes("kourin")) {
+      results.push(...state.field.flatMap(unit => (unit.kourin_stack || [])
+        .map(no => ({card: cards[no], cores: 0}))));
+    }
+    return results;
+  }
+
+  function burstWitnessMatches(state, cards, witness, field) {
+    const rows = witness.zone === "trash"
+      ? state.trashCards.map(no => ({card: cards[no], cores: 0}))
+      : burstWitnessCards(state, cards, field, witness.zones || []);
+    return rows.some(({card, cores}) => {
+      const type = card.card_type || "", colors = card.colors || [], lineages = card.lineages || [];
+      if (witness.creator_nexus && (!type.includes("ネクサス") || !lineages.includes("創界神"))) return false;
+      if (witness.card_type && !type.includes(witness.card_type)) return false;
+      if ((witness.min_cores || 0) > cores) return false;
+      if (witness.colors_exact && (colors.length !== witness.colors_exact.length
+          || !witness.colors_exact.every(color => colors.includes(color)))) return false;
+      if (witness.color && !colors.includes(witness.color)) return false;
+      if (witness.lineage_any && !witness.lineage_any.some(lineage => lineages.includes(lineage))) return false;
+      return !witness.name_contains_any || witness.name_contains_any.some(
+        name => normalizeCardName(card.name).includes(normalizeCardName(name)));
+    });
+  }
+
+  function discardSetBurst(state, cards, sourceCost, sourceNo) {
+    const cardNo = state.burst;
+    if (cardNo == null) return false;
+    const burst = cards[cardNo], field = [];
+    const protections = (burst.burst_discard_protections || []).filter(rule => rule.zone === "burst");
+    protections.push(...(cards[state.mirage]?.burst_discard_protections || [])
+      .filter(rule => rule.zone === "mirage"));
+    for (const unit of state.field) {
+      const card = unitInfo(state, cards, unit);
+      field.push({card, cores: unit.cores});
+      protections.push(...(card.burst_discard_protections || [])
+        .filter(rule => rule.zone === "field" && printedLevelMet(rule, state, cards, unit)));
+    }
+    let unknown = false;
+    for (const rule of protections) {
+      if (rule.unread) { unknown = true; continue; }
+      if (rule.source_cost_max != null && sourceCost > rule.source_cost_max) continue;
+      if ((rule.deck_min || 0) > state.deck.length) continue;
+      if (!stateConditionsMet(rule.state_conditions, state, cards)) continue;
+      if (rule.witness && !burstWitnessMatches(state, cards, rule.witness, field)) continue;
+      if (rule.lineage_any && !rule.lineage_any.some(key => (burst.lineages || []).includes(key))) continue;
+      if (rule.keyword && !(burst.keywords || []).includes(rule.keyword)) continue;
+      if (rule.attacker_names) {
+        const attacker = state.field.find(unit => unit.uid === state.attackingUid);
+        if (!state.ownAttackActive || !state.battleActive || !attacker) continue;
+        const name = normalizeCardName(unitInfo(state, cards, attacker).name);
+        if (!rule.attacker_names.some(value => name.includes(normalizeCardName(value)))) continue;
+      }
+      if (rule.same_contract_color && !burstWitnessCards(state, cards, field, ["soul", "kourin"]).some(({card}) =>
+        card.is_contract && (card.card_type.includes("スピリット")
+          || (card.card_type.includes("ネクサス") && (card.lineages || []).includes("創界神")))
+        && (burst.colors || []).some(color => (card.colors || []).includes(color)))) continue;
+      // Q7014: confirm the protection while keeping the Burst set.
+      record(state, cards, "cards_opened", {cards: [cardNo], source: "burst",
+        reason: "burst_discard_protection", source_card_no: sourceNo});
+      return false;
+    }
+    if (unknown) return null;
+    state.burst = null;
+    state.trashCards.push(cardNo);
+    record(state, cards, "card_moved", {card_no: cardNo, source: "burst", destination: "trash",
+      reason: "opponent_burst_discard", source_card_no: sourceNo});
     return true;
   }
 
@@ -6839,6 +6955,15 @@
       if (effect.scope === "battle") unit.battle_blocker_types = [...effect.blocker_types];
       else unit.block_restriction_effect = effect.effect_id;
       return true;
+    }
+    if (effect.kind === "unit_block_ban") {
+      const board = state.combatOpponent;
+      if (!board?.ban_block_for_battle) return false;
+      const rows = combatTargetRows(state, cards, effect, sourceUid)
+        .filter(row => !row.block_forbidden_this_battle);
+      const target = rows.find(row => !row.exhausted) || rows[0];
+      return Boolean(target && unguardedTargets(board, [target], effect).length
+        && board.ban_block_for_battle(target.uid));
     }
     if (effect.kind === "force_block") {
       if (state.uTargetContext?.reflected) return true;
@@ -7615,6 +7740,16 @@
           source_card_no: effect.source_card_no });
       }
       return chosen.length > 0;
+    }
+    if (effect.kind === "discard_set_burst") {
+      const board = state.combatOpponent;
+      if (!board || typeof board.discard_set_burst !== "function") return false;
+      const sourceNo = effect.source_card_no;
+      const unit = state.field.find(row => row.uid === sourceUid);
+      const cost = unit?.card_no === sourceNo ? combatSelfStat(state, cards, sourceUid, "cost") : null;
+      const discarded = board.discard_set_burst(cost ?? cards[sourceNo].cost, sourceNo);
+      return discarded === true || (discarded === false && Boolean(effect.on_failure)
+        && resolveEffect(state, cards, targets, effect.on_failure, sourceUid));
     }
     if (effect.kind === "core_to_trash") {
       if(!voidCoreGainAllowed(state,cards))return false;
@@ -11591,6 +11726,7 @@
         ? { can_attack: false } : {}),
       // 【毒刃】の下のカードの枚数(公開情報、あるときだけ。Python同一)。
       ...((unit.under_cards || []).length ? { under_count: unit.under_cards.length } : {}),
+      ...(unit.block_forbidden_this_battle ? {block_forbidden_this_battle: true} : {}),
     };
   }
 
@@ -11603,6 +11739,7 @@
   // 効いていなかった(実データで51窓が印字順のまま)。
   const OPPONENT_FACING_KINDS = new Set([
     "self_chosen_hand_discard",
+    "discard_set_burst", "unit_block_ban",
     "opponent_deck_discard",
     "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_level_treat", "unit_suppress",
     "unit_destroy", "unit_exhaust", "unit_core_remove",
@@ -12054,7 +12191,7 @@
     }
     const field = effect.mode === "on_destroy" && board.field_including_waiting
       ? board.field_including_waiting() : board.field();
-    const rows = field.filter((row) => {
+    let rows = field.filter((row) => {
       if (state.uTargetContext?.target_uid != null && state.uTargetContext.target_uid !== row.uid) return false;
       if (resisted(state, cards, row, effect, sourceUid)) return false;
       if (types.length && !types.some((word) => (row.card_type || "").endsWith(word)
@@ -12104,6 +12241,12 @@
     });
     const order = COMBAT_TARGET_ORDERS[effect.target_order || "bp_desc"];
     rows.sort((a, b) => order({...a,cost:targetCost(effect,a)}, {...b,cost:targetCost(effect,b)}));
+    if (rows.length && effect.target_extreme_stat) {
+      const extremeValue = (row) => effect.target_extreme_stat === "cost"
+        ? targetCost(effect, row) : row.bp;
+      const extreme = extremeValue(rows[0]);
+      rows = rows.filter((row) => extremeValue(row) === extreme);
+    }
     // 「…を相手が破壊する」(2026-10-12)は相手が選ぶ。こちらの狙いは効かない(Python同一)。
     if (effect.target_chooser === "opponent") {
       rows.sort(opponentChoiceOrder(effect.kind));
@@ -12168,6 +12311,7 @@
   }
 
   function blockerCanBlock(attacker, blocker) {
+    if (blocker.block_forbidden_this_battle) return false;
     const denied=attacker.block_restriction?.blocker_types || [], type=blocker.card_type || "";
     return !denied.some(kind=>type.includes(kind) || kind==="スピリット" && type.includes("ブレイヴ"));
   }
@@ -13048,6 +13192,12 @@
         settleBraveCapacity(state,cards,traceMark);
         return true;
       },
+      ban_block_for_battle: (uid) => {
+        const unit = state.field.find(row => row.uid === uid);
+        if (!unit || unit.waiting) return false;
+        unit.block_forbidden_this_battle = true;
+        return true;
+      },
       // 相手の効果が登録する期間つきのLv扱い(T17-LVの第3段)。
       treat_level: (uids, treatAs, scope, allEffect = null, source = null) =>
         registerLevelTreatment(state, cards, uids, treatAs, scope, allEffect, source),
@@ -13183,6 +13333,7 @@
           delete unit.u_reflected_battle;
           delete unit.forced_block_effect;
           delete unit.block_restriction_effect; delete unit.battle_blocker_types;
+          delete unit.block_forbidden_this_battle;
           delete unit.designation;
           if (unit.bp_penalties) {
             unit.bp_penalties = unit.bp_penalties.filter((row) => row.scope !== "battle");
@@ -13232,6 +13383,7 @@
         for (const unit of state.field) {
           delete unit.forced_block_effect;
           delete unit.block_restriction_effect; delete unit.battle_blocker_types;
+          delete unit.block_forbidden_this_battle;
           delete unit.designation;
           if (unit.bp_penalties) unit.bp_penalties = [];
           delete unit.effects_suppressed_this_turn;
@@ -13739,6 +13891,7 @@
       // 「窓を渡すと踏まれうる」の判断材料として真偽値だけ公開する。
       // ⚠️ card_noも`burst_conditions`も渡さない(守り手の伏せ札を覗かない)。
       burst_set: () => state.burst != null,
+      discard_set_burst: (sourceCost, sourceNo) => discardSetBurst(state, cards, sourceCost, sourceNo),
       // 手札の**枚数**は公開情報(中身は渡さない)。Python `hand_count` と同一。
       hand_count: () => state.hand.length,
       // 手元の**枚数**(公開ゾーン、2026-10-13)。Python `side_count` と同一。
@@ -14898,6 +15051,7 @@
         });
         if (position.moved) applySoulPosition(state, cards, position);
       }
+      if (state.combat) completeDoubleDriveLinks(state, cards, targets);
       let refreshedAfterAttack = false;
       // ⑥アタックステップ。先攻1ターン目には存在しない(公式 page05)。解決は
       // Stage6が行う——相手の盤面が要るのでこの試行の中では決められない。
