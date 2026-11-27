@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v321-v1";
-  const STAGE_VERSION = "v321";
+  const ENGINE_SLICE = "stage4-v323-v1";
+  const STAGE_VERSION = "v323";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v321-portable-v265";
+  const RUNTIME_VERSION = "stage4-v323-portable-v267";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -3906,17 +3906,18 @@
         if (!state.effectFrameDepth) flushCountReactions(state, cards, targets);
         return { card_no: cardNo, uid, source_zone: sourceZone, payment: "cores" };
       }
-      // 対価の誘発(【契約域】のカウント+2)を先に解いてから召喚する(Q29274の同型、
-      // `creator_core_summon`と同じ順)。Python同一。
-      beginEffectFrame(state);
-      try {
-        if (!payClausePayment(state, cards, targets,
-          { payment: soulFlashSummonPayment(route), source_card_no: cardNo }, null)) {
-          throw new Error("soul flash summon was offered without its payment");
+      // 対価の誘発(【契約域】のカウント+2)は召喚の窓の候補にする(Q29274の同型、
+      // `creator_core_summon`と同じ、T127-SUMMON)。Python同一。
+      const [paid, captured] = captureCostTriggers(state, () => {
+        beginEffectFrame(state);
+        try {
+          return payClausePayment(state, cards, targets,
+            { payment: soulFlashSummonPayment(route), source_card_no: cardNo }, null);
+        } finally {
+          endEffectFrame(state);
         }
-      } finally {
-        endEffectFrame(state);
-      }
+      });
+      if (!paid) throw new Error("soul flash summon was offered without its payment");
       if (!state.effectFrameDepth) flushCountReactions(state, cards, targets);
       if (sourceZone === "mirage") {
         // セット中のミラージュを召喚する。枠は空になり、セット中の効果の回数も消える。
@@ -3925,9 +3926,11 @@
       }
       const before = state.uid;
       const maintenance = entryMaintenance(state, cards, card);
-      play(state, cards, targets, { card_no: cardNo, pay: 0, total: maintenance, maintenance,
-        mode: "soul_flash_summon", allow_sacrifice: false, brave_mode: null,
-        ...(sourceZone === "mirage" ? { source_zone_name: "mirage" } : {}) });
+      if (!play(state, cards, targets, { card_no: cardNo, pay: 0, total: maintenance, maintenance,
+        mode: "soul_flash_summon", allow_sacrifice: false, brave_mode: null, cost_triggers: captured,
+        ...(sourceZone === "mirage" ? { source_zone_name: "mirage" } : {}) })) {
+        releaseCostTriggers(state, cards, targets, captured);
+      }
       uid = state.field.find((unit) => unit.uid > before && unit.card_no === cardNo)?.uid ?? null;
     } finally {
       state.combatOpponent = previous[0];
@@ -3946,19 +3949,23 @@
     let uid;
     try {
       if (route.once_per_turn_same_name) state.blockTurnUsed.add(soulFlashOnceKey(route, card));
-      let soul;
-      beginEffectFrame(state);
-      try {
-        soul = paySoulTop(state, cards, targets, cardNo, route);
-      } finally {
-        endEffectFrame(state);
-      }
+      // 創界神の上から外したときの誘発は召喚の窓の候補(T127-SUMMON、Python同一)。
+      const [soul, captured] = captureCostTriggers(state, () => {
+        beginEffectFrame(state);
+        try {
+          return paySoulTop(state, cards, targets, cardNo, route);
+        } finally {
+          endEffectFrame(state);
+        }
+      });
       if (!state.effectFrameDepth) flushCountReactions(state, cards, targets);
       const before = state.uid;
       const maintenance = entryMaintenance(state, cards, card);
-      play(state, cards, targets, { card_no: cardNo, pay: 0, total: maintenance - 1, maintenance,
+      if (!play(state, cards, targets, { card_no: cardNo, pay: 0, total: maintenance - 1, maintenance,
         mode: route.manifestation ? "super_manifestation" : "soul_top_summon",
-        allow_sacrifice: false, brave_mode: null, soul_on_top: soul });
+        allow_sacrifice: false, brave_mode: null, soul_on_top: soul, cost_triggers: captured })) {
+        releaseCostTriggers(state, cards, targets, captured);
+      }
       uid = state.field.find((unit) => unit.uid > before && unit.card_no === cardNo)?.uid ?? null;
     } finally {
       state.combatOpponent = previous[0];
@@ -4839,16 +4846,20 @@
   /** 指定アタックの出どころ＝アタックしている体(設計C4)。Python `_designation_source`同一。 */
   function designationSource(state, cards, unit, pierce) {
     const card = unitInfo(state, cards, unit) || {};
-    const colors = new Set(card.colors || []);
-    for (const brave of combinedBraves(state, unit.uid)) {
-      for (const color of (unitInfo(state, cards, brave) || {}).colors || []) colors.add(color);
-    }
-    return {source_type: card.card_type, source_colors: [...colors].sort(),
+    return {source_type: card.card_type, source_colors: combinedColors(state, cards, unit.uid, card),
       source_cost: card.cost || 0,
       context: {own_turn: state.ownTurnActive, source_level: levelFor(unit, cards, state),
         source_has_soul: Boolean(unit.soul_core),
         controller_symbol_colors: symbolColorsPresent(effectiveSymbols(state, cards))},
       pierce: pierce.map((row) => ({...row}))};
+  }
+
+  function combinedColors(state, cards, uid, card) {
+    const colors = new Set(card.colors || []);
+    for (const brave of combinedBraves(state, uid)) {
+      for (const color of (unitInfo(state, cards, brave) || {}).colors || []) colors.add(color);
+    }
+    return [...colors].sort();
   }
 
   /** 預かった指定アタックの節から1体を選ぶ(T28-TARGET TGT-1)。Python
@@ -7710,11 +7721,20 @@
           { ...effect, amount: effect.with_trash_exile, target_all: false }, sourceUid);
       }
       if (effect.kind === "unit_core_remove") {
-        // amountは**1体あたりのコア数**なので、対象は1体だけ選ぶ。
+        const destination = effect.core_destination || "reserve";
+        if (effect.core_remaining != null || effect.target_colors?.length) {
+          const keep = effect.core_remaining;
+          const eligible = rows.filter(row => row.cores > (keep ?? 0));
+          const selected = effect.target_all ? eligible : eligible.slice(0, 1);
+          const amounts = new Map(selected.map(row => [row.uid, keep == null ? amount : row.cores - keep]));
+          const moves = unguardedTargets(board, selected, effect, amounts)
+            .map(row => [row.uid, amounts.get(row.uid)]);
+          return moves.length > 0 && Boolean(board.remove_core_group(
+            moves, destination, combatBoard(state, cards, targets, effect, sourceUid)));
+        }
         const target = unguardedTargets(board, rows.slice(0, 1), effect);
         if (!target.length) return false;
         const uid = target[0].uid;
-        const destination = effect.core_destination || "reserve";
         if (effect.destroy_nexus_if_core_move_vanishes) {
           return Boolean(board.remove_cores(uid, amount, destination, () => {
             const followup = { ...effect, kind: "unit_destroy", target_types: ["ネクサス"], amount: 1 };
@@ -9360,6 +9380,10 @@
   }
 
   // 発揮元が自分自身の出来事でも撃つ誘発。Python `SELF_INCLUSIVE_EVENTS`と同一。
+  // 対価で誘発した効果を召喚の窓へ足すとき、節から外す回数の印(T127-SUMMON)。
+  // 回数は誘発した時点で`eventTriggerLimitKeys`が消費済み。Python同一。
+  const COST_TRIGGER_LIMIT_KEYS = new Set(["block_turn_limit", "block_game_limit",
+    "clause_turn_limit", "turn_use_limit"]);
   const SELF_INCLUSIVE_EVENTS = new Set(["ally_attacked", "u_trigger_hit", "u_trigger_guard", "u_trigger_after", "opponent_destroyed_by_effect", "own_removed_by_opponent_effect", "soul_core_placed", "creator_core_decreased"]);
 
   function notifyOwnRemovedByOpponentEffect(state,cards,targets,unit,opponent=null) {
@@ -9386,6 +9410,57 @@
       resolveEventTriggers(state, cards, targets, "creator_core_decreased",
         { uid: unit.uid, card_no: unit.card_no, amount });
     } finally { endEffectFrame(state); if (!state.effectFrameDepth) flushCountReactions(state, cards, targets); }
+  }
+
+  /** 召喚の対価`pay()`を払い、その間に誘発した場の効果を返す(T127-SUMMON、Q29274)。
+   *  捕まえた誘発は`play`の`cost_triggers`がその召喚の窓へ候補として足す。
+   *  Python `_capture_cost_triggers`と同一。 */
+  function captureCostTriggers(state, pay) {
+    state.costTriggerCapture.push([]);
+    let result, captured;
+    try {
+      result = pay();
+    } finally {
+      captured = state.costTriggerCapture.pop();
+    }
+    return [result, captured];
+  }
+
+  /** 召喚が成立しなかったとき、捕まえた誘発を従来どおり発揮待ちで解く(Python同一)。 */
+  function releaseCostTriggers(state, cards, targets, captured) {
+    if (!captured.length) return;
+    beginEffectFrame(state);
+    try {
+      for (const reaction of captured) {
+        state.pendingEffectReactions.push({...reaction,seq:state.derivedSeq++});
+      }
+    } finally { endEffectFrame(state); if (!state.effectFrameDepth) flushCountReactions(state, cards, targets); }
+  }
+
+  /** 対価で誘発した効果を召喚の窓の候補にする。Python `_add_cost_trigger_instances`と同一。 */
+  function costTriggerInstances(captured, triggerEventId, offset) {
+    return captured.map((reaction, index) => {
+      const first = reaction.branches[0];
+      return {
+        instance_id: `${triggerEventId}:cost-trigger:${reaction.sourceCardNo}#`
+          + `${reaction.sourceUid ?? "null"}:${index}`,
+        effect_block_id: first.effect_block_id || `${reaction.sourceCardNo}:event:${reaction.event}`,
+        source_card_no: reaction.sourceCardNo,
+        source_uid: reaction.sourceUid,
+        controller: "self",
+        timing: "cost_trigger",
+        trigger_event_id: triggerEventId,
+        clauses: reaction.branches.map((branch) => Object.fromEntries(Object.entries(branch)
+          .filter(([key]) => !COST_TRIGGER_LIMIT_KEYS.has(key)))),
+        effect_tag: first.effect_tag ?? null,
+        optional: Boolean(first.optional),
+        dependencies: [],
+        legacy_order: offset + index,
+        priority_depth: 0,
+        runtime_kind: "cost_trigger",
+        reaction,
+      };
+    });
   }
 
   function notifySoulCorePlaced(state, cards, targets, uid) {
@@ -9530,6 +9605,10 @@
         const reaction = {event,payload,branches,sourceUid,sourceCardNo};
         if (reactionOwner?.defer_opponent_effect_reaction?.({event,payload,branches,
             source_uid:sourceUid,source_card_no:sourceCardNo})) continue;
+        if (state.costTriggerCapture.length) {
+          state.costTriggerCapture.at(-1).push(reaction);
+          continue;
+        }
         if (["opponent_destroyed_by_effect", "soul_core_placed", "own_removed_by_opponent_effect", "creator_core_decreased"].includes(event)) {
           state.pendingEffectReactions.push({...reaction,seq:state.derivedSeq++});
         } else resolveEventTriggerChoice(state, cards, targets, reaction);
@@ -9844,10 +9923,11 @@
                                 soulCoreUsedForSummonCost = false,
                                 watcherUnits = [], watchEventKind = null,
                                 summonGroup = null, suppressOwnSummonEffects = false,
-                                playedAsManifestation = false, playResolution = null) {
+                                playedAsManifestation = false, playResolution = null,
+                                costTriggers = []) {
     const built = buildPlayedEffects(state, cards, targets, card, uid, braveMode,
       soulCoreUsedForSummonCost, watcherUnits, watchEventKind, summonGroup,
-      suppressOwnSummonEffects, playedAsManifestation, playResolution);
+      suppressOwnSummonEffects, playedAsManifestation, playResolution, costTriggers);
     // 窓が取り込めなかった分（Python`leftover`）だけをここで解く。窓より前から
     // 待っていたのは同時に出した兄弟の召喚なので、外側が出した順に解く。全部を
     // 空にすると兄弟を入れ子で解き、`play_complete`が逆順になっていた（T101）。
@@ -9867,15 +9947,17 @@
                               soulCoreUsedForSummonCost = false,
                               watcherUnits = [], watchEventKind = null,
                               summonGroup = null, suppressOwnSummonEffects = false,
-                              playedAsManifestation = false, playResolution = null) {
+                              playedAsManifestation = false, playResolution = null,
+                              costTriggers = []) {
     return executeDestroyEffect(state, () => buildPlayedEffectsImpl(state, cards, targets, card,
       uid, braveMode, soulCoreUsedForSummonCost, watcherUnits, watchEventKind,
-      summonGroup, suppressOwnSummonEffects, playedAsManifestation, playResolution));
+      summonGroup, suppressOwnSummonEffects, playedAsManifestation, playResolution, costTriggers));
   }
 
   function buildPlayedEffectsImpl(state, cards, targets, card, uid, braveMode,
                               soulCoreUsedForSummonCost, watcherUnits, watchEventKind,
-                              summonGroup, suppressOwnSummonEffects, playedAsManifestation, playResolution) {
+                              summonGroup, suppressOwnSummonEffects, playedAsManifestation, playResolution,
+                              costTriggers = []) {
     raiseLevelForOnPlay(state, cards, card, uid, playedAsManifestation);
     // 戦闘中の効果召喚は現在の窓の相手を使う(Python `entry_opponent`同一)。
     const opponent = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state) || null;
@@ -10022,8 +10104,14 @@
     }
     const instances = [...watcherInstances, ...groupEffectInstances(
       card.card_no, uid, "on_play", triggerEventId, active, watcherInstances.length, entryEvent)];
+    // 対価で誘発した効果(T127-SUMMON)は召喚時効果・神託と同じ窓の候補(Python同一)。
+    instances.push(...costTriggerInstances(costTriggers, triggerEventId, instances.length));
     const resolveInstance = (instance) => {
       state.derivedEffectBuffer = [];
+      if (instance.runtime_kind === "cost_trigger") {
+        resolveEventTriggerChoice(state, cards, targets, instance.reaction);
+        return [];
+      }
       if (instance.runtime_kind === "oracle_watch") {
         const effect = instance.clauses[0];
         if (instance.watcher.waiting || !state.field.includes(instance.watcher)) return [];
@@ -10144,6 +10232,8 @@
       if (instance.runtime_kind === "trash_reaction") {
         return state.trashCards.includes(instance.clauses[0].card_no);
       }
+      // 可否は誘発した時点で決まっている(Python `_add_cost_trigger_instances`)。
+      if (instance.runtime_kind === "cost_trigger") return true;
       if (!turnLimitAvailable(state, cards, instance)) return false;
       if (instance.runtime_kind === "oracle_watch") {
         return !instance.watcher.waiting && state.field.includes(instance.watcher);
@@ -10565,7 +10655,8 @@
     const playedArgs = () => [state, cards, targets, { ...card, card_no: candidate.card_no },
       uid, candidate.brave_mode, soulCoreUsedForSummonCost, watcherUnits,
       watchEvent(card, mode), summonGroup, Boolean(candidate.suppress_summon_effects),
-      ["manifestation", "super_manifestation"].includes(mode), playResolution];
+      ["manifestation", "super_manifestation"].includes(mode), playResolution,
+      candidate.cost_triggers || []];
     const postBody = () => {
         if (isMagic && staysOnField) {
           state.uid += 1;
@@ -11361,19 +11452,22 @@
         const total = pay + maintenance;
         if (!costAffordable(state, cards, pay, total, true)) continue;
         state.blockTurnUsed.add(limitKey);
-        donor.cores -= need;
-        recordCoreMove(state, cards, { amount: need, source: "field",
-          destination: "void", reason: "creator_core_summon_cost",
-          source_card_no: cardNo, source_uid: donor.uid });
-        // 【契約域】と召喚時効果は同時に誘発し、順はターンプレイヤーが決める(Q29274)。
-        // ここではコアが減った誘発を先に解いてから召喚する。
-        notifyCreatorCoreDecreased(state, cards, targets, donor, need);
+        // 【契約域】と召喚時効果は同時に発揮し、順はターンプレイヤーが決める(Q29274)。
+        // コアが減った誘発は召喚の窓の候補にする(T127-SUMMON、Python同一)。
+        const [, captured] = captureCostTriggers(state, () => {
+          donor.cores -= need;
+          recordCoreMove(state, cards, { amount: need, source: "field",
+            destination: "void", reason: "creator_core_summon_cost",
+            source_card_no: cardNo, source_uid: donor.uid });
+          notifyCreatorCoreDecreased(state, cards, targets, donor, need);
+        });
         if (zone === "trash") {
           state.trashCards.splice(state.trashCards.indexOf(cardNo), 1);
           state.hand.push(cardNo);
         }
-        play(state, cards, targets, { card_no: cardNo, pay, total, maintenance,
-          brave_mode: null, allow_sacrifice: true, mode: "creator_core_summon" });
+        if (!play(state, cards, targets, { card_no: cardNo, pay, total, maintenance,
+          brave_mode: null, allow_sacrifice: true, mode: "creator_core_summon",
+          cost_triggers: captured })) releaseCostTriggers(state, cards, targets, captured);
         return true;
       }
     }
@@ -12008,7 +12102,7 @@
             ? { creator_nexus: true, core_thresholds: creatorCoreThresholds(card),
               // 系統(公開情報)。起幻の除外が読む。Python同一。
               lineages: [...(card.lineages || [])].sort(),
-              // 今の色(公開情報)。「自分か相手の」創界神の対価が読む。Python同一。
+              // 今の色。自分か相手の創界神のコアを選ぶ対価が読む。
               colors: [...(card.colors || [])].sort() } : {}),
         };
       });
@@ -12365,6 +12459,8 @@
           || (word === "スピリット" && row.spirit_state))) {
         return false;
       }
+      if (effect.target_colors?.length
+          && !board.field_unit_colors(row.uid).some(color => effect.target_colors.includes(color))) return false;
       if (effect.target_levels?.length && !effect.target_levels.includes(row.level)) return false;
       if (bpMax !== null && bpMax !== undefined && row.bp > bpMax) return false;
       if (costMax !== null && costMax !== undefined && targetCost(effect, row) > costMax) return false;
@@ -12544,8 +12640,11 @@
     let sourceUnit = state.field.find((unit) => unit.uid === sourceUid) || null;
     if (sourceUnit && sourceUnit.card_no !== sourceNo) sourceUnit = null;
     // 効果の色は出どころの体の今の色(自身の枠色書換、T87の3)。Python同一。
-    if (sourceUnit && source?.color_recolors?.length)
+    if (sourceUnit && source && (effect.core_remaining != null || effect.target_colors?.length)) {
+      source = {...source, colors:combinedColors(state, cards, sourceUid, unitInfo(state, cards, sourceUnit))};
+    } else if (sourceUnit && source?.color_recolors?.length) {
       source = {...source, colors:unitInfo(state, cards, sourceUnit).colors};
+    }
     const symbols = effectiveSymbols(state, cards);
     const context = {
       own_turn: Boolean(state.ownTurnActive),
@@ -13274,6 +13373,22 @@
     return processed;
   }
 
+  function takeOpponentEffectCores(state, unit, amount, destination) {
+    if (!unit || amount <= 0) return 0;
+    const ordinary = unit.cores - Number(Boolean(unit.soul_core));
+    const taken = Math.min(amount, destination === "void" ? ordinary : unit.cores);
+    if (taken <= 0) return 0;
+    if (unit.soul_core && taken > ordinary) {
+      unit.soul_core = false;
+      if (destination === "reserve") state.reserveHasSoul = true;
+      else if (destination === "trash") state.trashHasSoul = true;
+    }
+    unit.cores -= taken;
+    if (destination === "reserve") state.reserve += taken;
+    else if (destination === "trash") state.spent += taken;
+    return taken;
+  }
+
   function combatBoard(state, cards, targets, effect = null, sourceUid = null) {
     const unit = state.field.find(row => row.uid === sourceUid);
     const no = effect?.source_card_no || unit?.card_no;
@@ -13452,6 +13567,8 @@
       // アタック/ブロックの候補なのでスピリット系しか並べないが、破壊の対象には
       // ネクサスも入る。Python `_combat_field_rows` と同一。
       field: () => combatFieldRows(state, cards),
+      field_unit_colors: uid => combinedColors(state, cards, uid,
+        unitInfo(state, cards, state.field.find(row => row.uid === uid))),
       field_including_waiting: () => combatFieldRows(state, cards, true),
       exhaust: (uid, skipNextRefresh = false) => {
         const unit = state.field.find((row) => row.uid === uid);
@@ -13469,25 +13586,9 @@
       // ソウルコアは通常コアを先に取ってから動かす(`damage_life`と同じ順)。
       remove_cores: (uid, amount, destination, onVanish = null) => {
         const unit = state.field.find((row) => row.uid === uid);
-        if (!unit || amount <= 0) return 0;
-        const ordinary = unit.cores - Number(Boolean(unit.soul_core));
-        // ソウルコアは効果でボイドに置かれない(Python同一)。
-        const taken = destination === "void"
-          ? Math.min(amount, unit.cores, ordinary) : Math.min(amount, unit.cores);
+        const traceMark = state.events.length;
+        const taken = takeOpponentEffectCores(state, unit, amount, destination);
         if (taken <= 0) return 0;
-        const traceMark=state.events.length;
-        if (unit.soul_core && taken > ordinary) {
-          unit.soul_core = false;
-          if (destination === "reserve") state.reserveHasSoul = true;
-          else if (destination === "trash") state.trashHasSoul = true;
-        }
-        unit.cores -= taken;
-        if (destination === "reserve") state.reserve += taken;
-        // トラッシュのコアは`state.spent`。`state.trash`という項目は**存在しない**
-        // ので、そこへ足していた版は毎回NaNを書き込むだけで、Pythonの`trash += taken`
-        // と食い違っていた(2026-08-21に発見。掃検の2デッキがどちらも「コアを
-        // トラッシュへ置く」除去を撃たなかったので表に出ていなかった)。
-        else if (destination === "trash") state.spent += taken;
         recordCoreMove(state, cards, { amount: taken, source: "field",
           destination, reason: "unit_core_remove", source_uid: uid });
         if (unit.cores < unitFloor(state, cards, unit)) {
@@ -13497,6 +13598,35 @@
         }
         settleBraveCapacity(state,cards,traceMark);
         return taken;
+      },
+      remove_core_group: (moves, destination, opponent) => {
+        // Apply all core moves before queuing any leave, at the same boundary as Python.
+        const traceMark = state.events.length;
+        const taken = [];
+        for (const [uid, amount] of moves) {
+          const unit = state.field.find(row => row.uid === uid);
+          const moved = takeOpponentEffectCores(state, unit, amount, destination);
+          if (moved) taken.push([unit, moved]);
+        }
+        const vanishing = taken.map(([unit]) => unit)
+          .filter(unit => unit.cores < unitFloor(state, cards, unit));
+        for (const unit of vanishing) unit.waiting = true;
+        for (const [unit, amount] of taken) {
+          recordCoreMove(state, cards, { amount, source: "field", destination,
+            reason: "unit_core_remove", source_uid: unit.uid });
+        }
+        for (const unit of vanishing) {
+          record(state, cards, "field_leave_queued",
+            { card_no: unit.card_no, uid: unit.uid, cause: "effect" });
+          opponent.defer_field_leave(() => {
+            const live = state.field.find(row => row.uid === unit.uid);
+            if (!live) return;
+            notifyOwnRemovedByOpponentEffect(state, cards, targets, live, opponent);
+            finalizeOpponentEffectLeave(state, cards, live, "vanish");
+          });
+        }
+        if (taken.length) settleBraveCapacity(state, cards, traceMark);
+        return taken.reduce((sum, [, amount]) => sum + amount, 0);
       },
       // 相手のユニットのBPを下げる(6B-3)。Python `_combat_bp_down` と同一。
       // 期間は印字どおり2種で、明記が無ければバトルの間(裁定)。
@@ -14967,6 +15097,8 @@
       // 「破棄されたとき」の発揮待ち(`discard_summons`)。Python `runtime.reserve`。
       pendingDiscardSummons: [],
       pendingEffectReactions: [], destroyEffectScopes: [],
+      // 召喚の対価を払う間に誘発した場の効果(T127-SUMMON、Python `cost_trigger_capture`)。
+      costTriggerCapture: [],
       openReactionNames: new Set(), trashReactionNames: new Set(),
       // 裸の〔ターンに1回〕は「そのカード1枚ごとに1回」。同名コピーを区別できないので
       // デッキの枚数(`deckCopies`)を上限に、使った回数を数える。
