@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v320-v1";
-  const STAGE_VERSION = "v320";
+  const ENGINE_SLICE = "stage4-v321-v1";
+  const STAGE_VERSION = "v321";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v320-portable-v264";
+  const RUNTIME_VERSION = "stage4-v321-portable-v265";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -738,6 +738,9 @@
   // A speculative state retains only public summon restrictions, without a
   // callable opponent board that could mutate the real opponent during search.
   const SUMMON_CONDITION_CONTEXTS = new WeakMap();
+  // 試行の`cards`/`targets`(T137)。枠の終わり(`endEffectFrame`)から『自分のメインステップ』
+  // の窓を撃つのに使う。先読みの写し(`clone`)へも同じ参照を引き継ぐ(中身は試行の間不変)。
+  const FRAME_CONTEXTS = new WeakMap();
   const FIELD_IDENTITY_KEYS = new Set([
     "ir_version", "card_no", "name", "card_type", "cost", "colors", "lineages",
     "maintenance", "base_bp", "level_bps", "combine_bp", "combine_ultimate_bp", "level_thresholds", "count_level_thresholds", "symbols", "reductions",
@@ -974,7 +977,7 @@
     "self_remain",
     "attack_step_end", "timed_attack_life_cap",
     "effect_text_grant", "register_effect_grant",
-    "draw", "coreboost", "self_coreboost", "self_core_move", "trash_core_return", "field_coreboost", "count_gain", "symbol_grant", "symbol_fix", "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_level_treat", "ally_level_treat", "unit_suppress", "life_core_gain", "u_trigger_invoke", "self_refresh", "ally_refresh", "guard_battle_refresh", "block_restriction", "force_block", "designate_attack", "attack_ban", "u_trigger_step", "attack_step_lock", "extra_refresh_step",
+    "draw", "coreboost", "self_coreboost", "self_core_move", "trash_core_return", "trash_core_to_field", "field_coreboost", "count_gain", "symbol_grant", "symbol_fix", "revealed_hand_discard", "blind_hand_discard", "hand_cost_increase", "level_cost_increase", "unit_level_treat", "ally_level_treat", "unit_suppress", "life_core_gain", "u_trigger_invoke", "self_refresh", "ally_refresh", "guard_battle_refresh", "block_restriction", "force_block", "designate_attack", "attack_ban", "u_trigger_step", "attack_step_lock", "extra_refresh_step",
     "search", "recover", "self_recover", "side_recover", "stash_top", "opponent_deck_discard",
     "oracle_mill", "oracle_pickup", "oracle_watch", "deck_discard_draw",
     "hand_filter", "core_to_trash", "life_core_move", "token_spawn",
@@ -1039,6 +1042,8 @@
     const context = opponent?.summon_condition_context?.() || SUMMON_CONDITION_CONTEXTS.get(value);
     const copied = structuredClone(value);
     if (context) SUMMON_CONDITION_CONTEXTS.set(copied, structuredClone(context));
+    const frame = value && typeof value === "object" ? FRAME_CONTEXTS.get(value) : undefined;
+    if (frame) FRAME_CONTEXTS.set(copied, frame);
     return copied;
   }
 
@@ -2490,6 +2495,24 @@
     });
   }
 
+  /** 場の体すべてが印字の系統・色を持つか(T137)。単独のブレイヴはスピリットとして、
+   *  合体中のブレイヴも1体として、創界神ネクサスもネクサスとして数える(どれも狭い側)。
+   *  系統は印字のどれか1つ。Python `own_units_all_match`と同一。 */
+  function ownUnitsAllMatch(condition, state, cards) {
+    const types = condition.types || [];
+    const wanted = condition.lineages || [];
+    const rows = state.field.map((unit) => unitInfo(state, cards, unit) || {})
+      .filter((card) => {
+        const type = String(card.card_type || "");
+        return types.some((word) => type.includes(word))
+          || (types.includes("スピリット") && type.includes("ブレイヴ"));
+      });
+    return rows.length > 0 && rows.every((card) =>
+      (!wanted.length || wanted.some((lineage) => (card.lineages || []).includes(lineage)))
+      && (condition.color === null || condition.color === undefined
+        || (card.colors || []).includes(condition.color)));
+  }
+
   function stateConditionsMet(conditions, state, cards, sourceUid = null) {
     if (!conditions || !conditions.length) return true;
     const symbols = effectiveSymbols(state, cards);
@@ -2574,6 +2597,9 @@
         return state.field.some((unit) =>
           (unitInfo(state, cards, unit)?.keywords || []).includes(condition.keyword));
       }
+      // 「自分のスピリット/ネクサスすべてが系統：「X」を持つ赤のとき」(T137)。待機中の体も
+      // 数え(Q31726)、1体も無ければ満たさない(Q31725)。Python `own_units_all_match`と同一。
+      if (condition.kind === "own_units_all_match") return ownUnitsAllMatch(condition, state, cards);
       // 相手の場にその色の体がいないか(v66)。盤面が結ばれていなければ満たさない。
       if (condition.kind === "opponent_color_unit_absent") {
         if (!board || typeof board.unit_colors !== "function") return false;
@@ -2672,6 +2698,9 @@
         && !(state.field.find((unit) => unit.uid === sourceUid)?.kourin_stack || []).length) return false;
     if (effect.kind === "oracle_mill"
         && !oracleMillDeclarable(effect, state, cards, sourceUid)) return false;
+    // トラッシュに置けるコアが無ければ宣言しない(T137、Python同一)。
+    if (effect.kind === "trash_core_to_field"
+        && state.spent - (state.trashHasSoul && effect.exclude_soul ? 1 : 0) <= 0) return false;
     // 印字のLv(下限`required_level`と見出しの並び`levels`、2026-10-02)。
     // Python `enabler_level_met` と同一。
     const hasLevels = Array.isArray(effect.levels) && effect.levels.length;
@@ -6392,6 +6421,12 @@
       if (play.run) play.run(); else play();
     }
     while (state.deferredFieldLeaves.length) state.deferredFieldLeaves.shift()();
+    // メイン中に場に出た札の『自分のメインステップ』の節(T137)。一番外側の枠を閉じ、
+    // 派生と場離れを確定した後。Python `EffectRuntime.after_outer`と同じ位置。
+    if (state.mainWindowOpen) {
+      const frame = FRAME_CONTEXTS.get(state);
+      if (frame) resolveMainWindowLate(state, frame.cards, frame.targets);
+    }
   }
 
   // 公開札自身の反応を宣言できる場面(T88の3、設計4b章。Python `scene_met`同一)。
@@ -6784,6 +6819,39 @@
         && (spec.target_state !== "exhausted" || row.exhausted)).length;
     } else return 0;
     return Math.floor(value / per);
+  }
+
+  /** フィールドへ置くコアの置き先(コアブーストとトラッシュからの回収で共有、T137)。
+   *  Python `choose_field_coreboost_target`と同一。 */
+  function fieldCoreboostTarget(state, cards, targets, effect, sourceUid) {
+    const targetMatches = (unit) => {
+      if (effect.kind === "self_coreboost") return unit.uid === sourceUid;
+      const card = unitInfo(state, cards, unit);
+      const spec = effect.target_spec || "";
+      if (!spec.includes("創界神") && (card.lineages || []).includes("創界神")) return false;
+      if (spec.includes("このスピリット以外") && unit.uid === sourceUid) return false;
+      const types = ["スピリット", "アルティメット", "ブレイヴ", "ネクサス"]
+        .filter((value) => spec.includes(value));
+      if (types.length && !types.some((value) => (card.card_type || "").includes(value))) return false;
+      const colors = BASIC_COLORS.filter((value) => spec.includes(value));
+      if (colors.length && !colors.some((value) => (card.colors || []).includes(value))) return false;
+      // 系統・名前はPython(`parse_condition`)が`系統:銀零`のような短縮記法から
+      // 解いてIRへ載せている。ここで生テキストを見ると「」が無い書き方を取り
+      // こぼし、「銀零のスピリットへ」が「どのスピリットでもよい」になる。
+      const lineages = effect.target_lineages || [];
+      if (lineages.length
+        && !lineages.some((value) => (card.lineages || []).includes(value))) return false;
+      if (effect.target_name
+        && !normalizedName(card.name).includes(normalizedName(effect.target_name))) return false;
+      const names = [...spec.matchAll(/「([^」]+)」/gu)].map((match) => match[1]);
+      return !names.length || spec.includes("系統")
+        || names.some((name) => normalizedName(card.name).includes(normalizedName(name)));
+    };
+    return [...state.field].filter((row) => !row.waiting && targetMatches(row))
+      .sort((left, right) => accessTier(left.card_no, cards, targets)
+        - accessTier(right.card_no, cards, targets)
+        || Number(left.uid !== sourceUid) - Number(right.uid !== sourceUid)
+        || right.cores - left.cores || left.uid - right.uid)[0];
   }
 
   /** Python `resolve_enabler` の入口と出口に合わせた薄い外側(2026-09-20)。
@@ -7215,6 +7283,19 @@
       }
       return amount>0;
     }
+    if (effect.kind === "trash_core_to_field") {
+      // 「自分のトラッシュの[ソウルコア]以外のコアN個をフィールドに置ける」(T137)。置き先は
+      // コアブーストと同じ選び方、ボイドの禁止は見ない。足りなければ置ける分だけ。Python同一。
+      const placed = Math.min(amount, state.spent - (state.trashHasSoul && effect.exclude_soul ? 1 : 0));
+      const unit = placed > 0 ? fieldCoreboostTarget(state, cards, targets, effect, sourceUid) : null;
+      if (!unit) return false;
+      state.spent -= placed;
+      unit.cores += placed;
+      recordCoreMove(state, cards, { amount: placed, source: "trash", destination: "field",
+        reason: "trash_core_to_field", source_card_no: effect.source_card_no,
+        source_uid: sourceUid, target_uid: unit.uid });
+      return true;
+    }
     if (effect.kind === "self_core_move") {
       const unit = state.field.find(row => row.uid === sourceUid && !row.waiting);
       if (!unit || effect.core_source !== "trash" || !effect.move_all || state.spent <= 0) return false;
@@ -7230,34 +7311,7 @@
       return true;
     }
     if (effect.kind === "self_coreboost" || effect.kind === "field_coreboost") {
-      const targetMatches = (unit) => {
-        if (effect.kind === "self_coreboost") return unit.uid === sourceUid;
-        const card = unitInfo(state, cards, unit);
-        const spec = effect.target_spec || "";
-        if (!spec.includes("創界神") && (card.lineages || []).includes("創界神")) return false;
-        if (spec.includes("このスピリット以外") && unit.uid === sourceUid) return false;
-        const types = ["スピリット", "アルティメット", "ブレイヴ", "ネクサス"]
-          .filter((value) => spec.includes(value));
-        if (types.length && !types.some((value) => (card.card_type || "").includes(value))) return false;
-        const colors = BASIC_COLORS.filter((value) => spec.includes(value));
-        if (colors.length && !colors.some((value) => (card.colors || []).includes(value))) return false;
-        // 系統・名前はPython(`parse_condition`)が`系統:銀零`のような短縮記法から
-        // 解いてIRへ載せている。ここで生テキストを見ると「」が無い書き方を取り
-        // こぼし、「銀零のスピリットへ」が「どのスピリットでもよい」になる。
-        const lineages = effect.target_lineages || [];
-        if (lineages.length
-          && !lineages.some((value) => (card.lineages || []).includes(value))) return false;
-        if (effect.target_name
-          && !normalizedName(card.name).includes(normalizedName(effect.target_name))) return false;
-        const names = [...spec.matchAll(/「([^」]+)」/gu)].map((match) => match[1]);
-        return !names.length || spec.includes("系統")
-          || names.some((name) => normalizedName(card.name).includes(normalizedName(name)));
-      };
-      const unit = [...state.field].filter((row) => !row.waiting && targetMatches(row))
-        .sort((left, right) => accessTier(left.card_no, cards, targets)
-          - accessTier(right.card_no, cards, targets)
-          || Number(left.uid !== sourceUid) - Number(right.uid !== sourceUid)
-          || right.cores - left.cores || left.uid - right.uid)[0];
+      const unit = fieldCoreboostTarget(state, cards, targets, effect, sourceUid);
       if (!unit) return false;
       if(!voidCoreGainAllowed(state,cards,unit.uid))return false;
       const placed = effect.kind === "self_coreboost" && effect.amount_per_source_symbol
@@ -12717,9 +12771,32 @@
       state.combat ? (MAIN_STEP_OPPONENTS.get(state) || null) : null);
   }
 
+  /** 『自分のメインステップ』の窓の1回を数える鍵(T137)。場の札はuidごと(煌臨は重ねた先の
+   *  uidを引き継ぐ)、魂状態の札は札名ごと。単位は印字の効果ブロック。Python
+   *  `_main_window_key`と同一。 */
+  function mainWindowKey(uid, effect, fromCard) {
+    const owner = uid === null || uid === undefined
+      ? `soul\u0000${fromCard || effect.source_card_no || ""}` : `uid\u0000${uid}`;
+    return `main_window\u0000${owner}\u0000${effect.effect_block_id || effect.effect_id || ""}`;
+  }
+
+  /** メイン中に場に出た札の『自分のメインステップ』の節を撃つ(T137)。入口の一巡で撃った
+   *  節は鍵で飛ばす。トラッシュの発揮元は入口の一巡だけ。Python `_resolve_main_window_late`と同一。 */
+  function resolveMainWindowLate(state, cards, targets) {
+    if (state.mainWindowLateActive || !state.mainWindowOpen || !state.ownMainActive
+      || state.ownAttackActive) return;
+    state.mainWindowLateActive = true;
+    try {
+      resolveStepSources(state, cards, targets, ["main", "both_main"], "main",
+        state.combat ? (MAIN_STEP_OPPONENTS.get(state) || null) : null, true);
+    } finally {
+      state.mainWindowLateActive = false;
+    }
+  }
+
   /** `own_step`が`ownSteps`のどれかの節を撃ち、撃った節を返す。自分のターンと
    *  相手のターンの共通の芯。Python `_resolve_step_sources` と同一。 */
-  function resolveStepSources(state, cards, targets, ownSteps, recordStep, opponent) {
+  function resolveStepSources(state, cards, targets, ownSteps, recordStep, opponent, late = false) {
     const unitOf = (uid) => state.field.find((unit) => unit.uid === uid);
     const present = (uid) => uid === null || uid === undefined
       || Boolean(unitOf(uid) && !unitOf(uid).waiting);
@@ -12755,13 +12832,17 @@
     }
     // トラッシュの実カード(T19、Python同一)。ステップに入った時点の札を1枚ずつ。
     const trashSources = [];
-    for (const trashNo of [...state.trashCards]) {
+    for (const trashNo of late ? [] : [...state.trashCards]) {
       for (const effect of cards[trashNo]?.trash_effects || []) {
         if (wanted(effect, null)) trashSources.push([trashNo, effect]);
       }
     }
     const stacked = new Set();
     const chosen = new Set();
+    const openedHere = new Set();
+    // 窓の鍵は自分のターンの『自分のメインステップ』だけ(T137、Python同一)。相手のターンは
+    // `recordStep`が`opp_`で始まる。
+    const keyed = recordStep === "main";
     const decidedAlternatives = new Map();
     const resolved = [];
     const previous = state.combatOpponent || null;
@@ -12778,6 +12859,10 @@
     try {
       for (const [uid, effect, fromCard, onField] of sources) {
         if (!present(uid)) continue;
+        // 『自分のメインステップ』の窓(T137)。効果ブロック単位で1回、同じ一巡の続きは通す。
+        const windowKey = keyed ? mainWindowKey(uid, effect, fromCard) : null;
+        if (windowKey !== null && state.mainActivatedUsed.has(windowKey)
+          && !openedHere.has(windowKey)) continue;
         state.stepSourceOnField = onField;
         let cardNo;
         try {
@@ -12805,6 +12890,10 @@
           record(state, cards, "step_effect", {
             step: recordStep, card_no: cardNo, uid: uid ?? null, effect_kind: effect.kind,
           });
+          if (windowKey !== null) {
+            state.mainActivatedUsed.add(windowKey);
+            openedHere.add(windowKey);
+          }
           resolveEffect(state, cards, targets, effect, uid);
         } finally {
           state.stepSourceOnField = true;
@@ -14797,6 +14886,8 @@
       fieldFlashUsed: new Set(), mirageFlashUsed: new Set(),
       mainActivatedUsed: new Set(),
       ownMainActive: false,
+      // 『自分のメインステップ』の窓が開いている間(T137)。Python `main_window_open`と同一。
+      mainWindowOpen: false,
       trashMainSummonNamesUsed: new Set(),
       // トラッシュから使ったフラッシュ(〔ゲームに1回：同名〕)のカード名。
       // Python `trash_flash_names_used` と同一。
@@ -14937,6 +15028,7 @@
       effectOrderScript: [...(options.effect_order_script || [])],
       derivedEffectBuffer: [],
     };
+    FRAME_CONTEXTS.set(state, { cards, targets });
     if (state.branchSampling) {
       // 分岐は山札のstreamを一切消費しない専用streamから引く。
       for (const kind of BRANCH_KEYS) {
@@ -15015,6 +15107,8 @@
       for (const ownStep of ["main_start", "main", "turn"]) {
         resolveOwnStepEffects(state, cards, targets, ownStep, options.going_first);
       }
+      // ここから終了時の前まで、場に出た札の窓の節も撃てる(T137、Python同一)。
+      state.mainWindowOpen = true;
       // 相手の『相手のメインステップ開始時』はここ(戦闘モードだけ、Python同一)。
       if (state.combat) {
         yield { turn, step: "main_start", board: combatBoard(state, cards, targets) };
@@ -15167,6 +15261,11 @@
         if (position.moved) applySoulPosition(state, cards, position);
       }
       if (state.combat) completeDoubleDriveLinks(state, cards, targets);
+      // 窓の取りこぼしを閉じる前に1回だけ試し、『自分のメインステップ終了時』へ(T137)。
+      // メインの手・Lv配分・ソウルコアの置き場所を決め終えた後、アタックステップの前。Python同一。
+      resolveMainWindowLate(state, cards, targets);
+      state.mainWindowOpen = false;
+      resolveOwnStepEffects(state, cards, targets, "main_end", options.going_first);
       let refreshedAfterAttack = false;
       // ⑥アタックステップ。先攻1ターン目には存在しない(公式 page05)。解決は
       // Stage6が行う——相手の盤面が要るのでこの試行の中では決められない。
