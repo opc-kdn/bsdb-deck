@@ -553,8 +553,8 @@
 
   const PACKET_FORMAT = "BattleSpiritsDB.stage4-engine-packet";
   const PACKET_FORMAT_VERSION = 1;
-  const ENGINE_SLICE = "stage4-v318-v1";
-  const STAGE_VERSION = "v318";
+  const ENGINE_SLICE = "stage4-v320-v1";
+  const STAGE_VERSION = "v320";
   const MAX_DECK_CARDS = 200;
 
   async function sha256Hex(text) {
@@ -724,7 +724,7 @@
 (() => {
   "use strict";
 
-  const RUNTIME_VERSION = "stage4-v318-portable-v262";
+  const RUNTIME_VERSION = "stage4-v320-portable-v264";
   // Python `stage4_sim._DEBUG` に対応する開発用トレース。Workerのスクリプト
   // URLへ `?lookahead_debug=1` を付けると、先読みのrankを`console.log`へ出す
   // ——Python側と同じ書式なので、乖離の突き合わせでそのまま並べられる。
@@ -2834,6 +2834,7 @@
       if (colors.length !== exact.length
         || colors.some((value, index) => value !== exact[index])) return false;
     }
+    if (payment.name_exact && normalizeCardName(card.name) !== payment.name_exact) return false;
     const spec = payment.target_spec || "";
     if (!spec) return true;
     return specMatchesUnit(card, spec);
@@ -2876,9 +2877,9 @@
   }
 
   /** 相手の創界神ネクサスから対価のコアを取る計画`[[uid, 個数]]`(「自分か相手の」、
-   *  2026-11-27)。耐性は見ない(Q24064)、通常コアだけ。Python
-   *  `_opponent_creator_payment_plan` と同一。 */
-  function opponentCreatorPaymentPlan(state, payment, amount) {
+   *  2026-11-27)。この効果を受けない相手の創界神からは取らない(`resisted`、創界神の
+   *  コア除去と同じ)。通常コアだけ。Python `_opponent_creator_payment_plan` と同一。 */
+  function opponentCreatorPaymentPlan(state, cards, effect, sourceUid, payment, amount) {
     const board = state.combatOpponent;
     if (!board || typeof board.field !== "function") return [];
     const exact = payment.colors_exact;
@@ -2886,7 +2887,9 @@
     const rows = [];
     for (const row of board.field()) {
       const ordinary = row.cores - Number(Boolean(row.soul_core));
-      if (!row.creator_nexus || ordinary < 1) continue;
+      if (!row.creator_nexus || ordinary < 1 || resisted(state, cards, row,
+        {kind: "creator_core_remove", target_creator: true,
+          source_card_no: effect.source_card_no}, sourceUid)) continue;
       const colors = [...(row.colors || [])].sort();
       if (exact && exact.length && (colors.length !== exact.length
         || colors.some((value, index) => value !== exact[index]))) continue;
@@ -2975,8 +2978,13 @@
       if (kind === "flag_core_move" && !paymentSourceUnit(state, sourceUid)) return null;
       // 「自分か相手の」は相手の創界神から先に払う(2026-11-27、Python同一)。
       if (kind === "flag_core_void" && payment.either_side) {
-        const opponent = opponentCreatorPaymentPlan(state, payment, amount);
+        const opponent = opponentCreatorPaymentPlan(state, cards, effect, sourceUid, payment, amount);
         if (opponent.length) return {opponentDonors: opponent};
+      }
+      if (payment.scope === "one") {
+        const donor = paymentCoreDonors(state, cards, payment, amount)
+          .find(unit => isCreatorNexus(cards, unit));
+        return donor ? {donors: [{donor, amount}]} : null;
       }
       const donors = creatorCorePlan(state, cards, paymentCoreDonors(state, cards, payment, 1), amount, true);
       return donors ? {donors} : null;
@@ -6954,7 +6962,7 @@
   }
 
   function resolveEffectBody(state, cards, targets, effect, sourceUid) {
-    if (!effectActive(effect, state, cards, sourceUid)) return false;
+    if (effect.returns_resolving_magic || !effectActive(effect, state, cards, sourceUid)) return false;
     if (effect.kind === "timed_attack_life_cap") {
       const source = state.field.find(unit => unit.uid === sourceUid);
       protectLife(state, cards, {protection: "attack_total", amount: effect.amount,
@@ -9782,10 +9790,10 @@
                                 soulCoreUsedForSummonCost = false,
                                 watcherUnits = [], watchEventKind = null,
                                 summonGroup = null, suppressOwnSummonEffects = false,
-                                playedAsManifestation = false) {
+                                playedAsManifestation = false, playResolution = null) {
     const built = buildPlayedEffects(state, cards, targets, card, uid, braveMode,
       soulCoreUsedForSummonCost, watcherUnits, watchEventKind, summonGroup,
-      suppressOwnSummonEffects, playedAsManifestation);
+      suppressOwnSummonEffects, playedAsManifestation, playResolution);
     // 窓が取り込めなかった分（Python`leftover`）だけをここで解く。窓より前から
     // 待っていたのは同時に出した兄弟の召喚なので、外側が出した順に解く。全部を
     // 空にすると兄弟を入れ子で解き、`play_complete`が逆順になっていた（T101）。
@@ -9805,15 +9813,15 @@
                               soulCoreUsedForSummonCost = false,
                               watcherUnits = [], watchEventKind = null,
                               summonGroup = null, suppressOwnSummonEffects = false,
-                              playedAsManifestation = false) {
+                              playedAsManifestation = false, playResolution = null) {
     return executeDestroyEffect(state, () => buildPlayedEffectsImpl(state, cards, targets, card,
       uid, braveMode, soulCoreUsedForSummonCost, watcherUnits, watchEventKind,
-      summonGroup, suppressOwnSummonEffects, playedAsManifestation));
+      summonGroup, suppressOwnSummonEffects, playedAsManifestation, playResolution));
   }
 
   function buildPlayedEffectsImpl(state, cards, targets, card, uid, braveMode,
                               soulCoreUsedForSummonCost, watcherUnits, watchEventKind,
-                              summonGroup, suppressOwnSummonEffects, playedAsManifestation) {
+                              summonGroup, suppressOwnSummonEffects, playedAsManifestation, playResolution) {
     raiseLevelForOnPlay(state, cards, card, uid, playedAsManifestation);
     // 戦闘中の効果召喚は現在の窓の相手を使う(Python `entry_opponent`同一)。
     const opponent = state.combatOpponent || MAIN_STEP_OPPONENTS.get(state) || null;
@@ -9918,6 +9926,7 @@
       - (b.entry_grouped ? b.clause_order || 0 : 0));
     // 相手側の節の可否は、解くときと同じ相手の盤面で読む(Python `clause_can_resolve`)。
     const clauseActive = (effect) => {
+      if (effect.returns_resolving_magic && (!playResolution || playResolution.returnedToHand)) return false;
       if (!groupedOpponentEffects.has(effect)) return effectActive(effect, state, cards, uid);
       const previous = state.combatOpponent || null;
       state.combatOpponent = opponent;
@@ -9978,6 +9987,16 @@
         return [];
       }
       const resolveClause = effect => {
+        if (effect.returns_resolving_magic) {
+          if (!clauseActive(effect) || !payClausePayment(state, cards, targets, effect, uid)) return false;
+          playResolution.returnedToHand = true;
+          state.hand.push(card.card_no);
+          state.seen.add(card.card_no);
+          state.handGain += 1;
+          record(state, cards, "card_moved", { card_no: card.card_no, uid, source: "resolution",
+            destination: "hand", reason: "resolved_self_return" });
+          return true;
+        }
         if (groupedOpponentEffects.has(effect)) return resolveOpponentEffect(effect);
         const previous = state.combatOpponent || null;
         state.combatOpponent = opponent;
@@ -10426,6 +10445,7 @@
     // 印字の「その後」を守って効果解決後に採番・配置する。
     const isMagic = card.card_type === "マジック";
     const staysOnField = !isMagic || Boolean(card.stays_on_field);
+    const playResolution = isMagic && !staysOnField ? { returnedToHand: false } : null;
     // 合体先は**場に出す前**に決める(出してから探すと自分自身が候補に混じる)。
     const combinedHost = candidate.brave_mode === "combine"
       ? braveCombineHosts(card, state, cards).find(unit => unit.uid === combinePlan.host.uid) : null;
@@ -10491,7 +10511,7 @@
     const playedArgs = () => [state, cards, targets, { ...card, card_no: candidate.card_no },
       uid, candidate.brave_mode, soulCoreUsedForSummonCost, watcherUnits,
       watchEvent(card, mode), summonGroup, Boolean(candidate.suppress_summon_effects),
-      ["manifestation", "super_manifestation"].includes(mode)];
+      ["manifestation", "super_manifestation"].includes(mode), playResolution];
     const postBody = () => {
         if (isMagic && staysOnField) {
           state.uid += 1;
@@ -10504,7 +10524,7 @@
           record(state, cards, "card_moved", { card_no: candidate.card_no, uid,
             source: "resolution", destination: "field",
             reason: "resolved_self_placement", ...traceDetails });
-        } else if (isMagic) {
+        } else if (isMagic && !playResolution.returnedToHand) {
           state.trashCards.push(candidate.card_no);
           record(state, cards, "card_moved", { card_no: candidate.card_no, uid,
             destination: "trash", ...traceDetails });
@@ -11417,7 +11437,7 @@
         amount: effect.amount ?? null,
         core_destination: effect.core_destination ?? null,
         source_type: card.card_type ?? null,
-        source_colors: [...(card.colors || [])].sort(),
+        source_colors: effect.source_colorless ? [] : [...(card.colors || [])].sort(),
         source_cost: card.cost ?? null,
         bounce_destination: effect.bounce_destination ?? null,
         pierce: [...(effect.pierce || [])] };
@@ -12483,7 +12503,7 @@
     };
     return resistanceBlocks(row.resist, resistanceEffectKind(effect),
       source ? (source.card_type ?? null) : null,
-      source ? [...(source.colors || [])].sort() : null,
+      effect.source_colorless ? [] : source ? [...(source.colors || [])].sort() : null,
       source ? (source.cost ?? null) : null, context,
       activePierces(state, cards, effect, sourceUnit));
   }
